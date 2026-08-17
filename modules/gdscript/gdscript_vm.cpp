@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "gdscript.h"
+#include "gdscript_ct_trace.h" // CodeTracer G2: per-line step emit
 #include "gdscript_function.h"
 #include "gdscript_lambda_callable.h"
 
@@ -661,6 +662,8 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 	GDScriptLanguage::CallLevel call_level;
 	GDScriptLanguage::get_singleton()->enter_function(&call_level, p_instance, this, stack, &ip, &line);
+
+	gdscript_ct_trace_call(name, source, _initial_line); // CodeTracer G3: call entry
 
 #ifdef DEBUG_ENABLED
 #define GD_ERR_BREAK(m_cond)                                                                                           \
@@ -3903,6 +3906,8 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				line = _code_ptr[ip + 1];
 				ip += 2;
 
+				gdscript_ct_trace_step(source, line); // CodeTracer G2: per-line step
+
 				if (EngineDebugger::is_active()) {
 					// line
 					bool do_break = false;
@@ -3998,6 +4003,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 	// If that is the case then we exit the function as normal. Otherwise we postpone it until the last `await` is completed.
 	// This ensures the call stack can be properly shown when using `await`, showing what resumed the function.
 	if (!p_state || awaited) {
+		gdscript_ct_trace_return(); // CodeTracer G3: return (normal / yield-suspend exit)
 		GDScriptLanguage::get_singleton()->exit_function();
 
 		// Free stack, except reserved addresses.
@@ -4021,6 +4027,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 		p_state->completed.emit(args, 1);
 
 		// Exit function only after executing the remaining function states to preserve async call stack.
+		gdscript_ct_trace_return(); // CodeTracer G3: return (await-resume completion exit)
 		GDScriptLanguage::get_singleton()->exit_function();
 	}
 

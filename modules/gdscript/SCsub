@@ -6,6 +6,21 @@ Import("env_modules")
 
 env_gdscript = env_modules.Clone()
 
+# --- CodeTracer G2: link the CTFS writer static lib ---------------------
+# The C-ABI header (compile-time) and libcodetracer_trace_writer.a
+# (link-time) come from codetracer-trace-format-nim, vendored under
+# modules/gdscript/ct_writer/ (header in ct_writer/include/). The glue TU
+# gdscript_ct_trace.cpp is picked up by the "*.cpp" glob below.
+env_gdscript.Prepend(CPPPATH=[Dir("ct_writer/include").srcnode()])
+env.Append(LIBPATH=[Dir("ct_writer").srcnode()])
+env.Append(LIBS=["codetracer_trace_writer"])
+# Runtime deps the Nim/arc static lib pulls in:
+if env["platform"] in ["linuxbsd", "android"]:
+    env.Append(LIBS=["zstd", "m", "pthread"])
+elif env["platform"] == "macos":
+    env.Append(LIBS=["zstd"])
+    env.Append(LINKFLAGS=["-framework", "Security", "-framework", "CoreFoundation"])
+
 env_gdscript.add_source_files(env.modules_sources, "*.cpp")
 
 if env.editor_build:
