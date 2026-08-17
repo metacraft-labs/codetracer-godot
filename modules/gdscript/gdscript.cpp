@@ -31,6 +31,7 @@
 #include "gdscript.h"
 
 #include "gdscript_analyzer.h"
+#include "gdscript_ct_trace.h" // CodeTracer G4: force local tracking when recording
 #include "gdscript_cache.h"
 #include "gdscript_compiler.h"
 #include "gdscript_parser.h"
@@ -2825,6 +2826,13 @@ GDScriptLanguage::GDScriptLanguage() {
 #ifdef DEBUG_ENABLED
 	track_call_stack = true;
 	track_locals = track_locals || EngineDebugger::is_active();
+	// CodeTracer G4: the recorder maps written stack slots to declared local
+	// names through GDScriptFunction::stack_debug, which is only populated when
+	// local tracking is on (normally just with a remote debugger attached).
+	// Force it on when CT_GDSCRIPT_TRACE is set so value capture has a slot->name
+	// table. This runs in the GDScriptLanguage constructor, before any script is
+	// compiled, so every compiled function gets its stack_debug table.
+	track_locals = track_locals || gdscript_ct_trace_active();
 
 	GLOBAL_DEF("debug/gdscript/warnings/enable", true);
 

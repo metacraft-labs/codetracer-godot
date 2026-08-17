@@ -1,9 +1,11 @@
 /**************************************************************************/
-/*  gdscript_ct_trace.h — CodeTracer GDScript recorder (G2 steps, G3 calls)*/
+/*  gdscript_ct_trace.h — CodeTracer GDScript recorder (G2 steps, G3 calls,*/
+/*  G4 values)                                                            */
 /**************************************************************************/
 // Minimal glue between the GDScript VM and the CTFS writer
 // (libcodetracer_trace_writer.a, C ABI). G2 emits per-line steps; G3 adds
-// call/return events at the GDScriptFunction::call frame boundary.
+// call/return events at the GDScriptFunction::call frame boundary; G4 adds
+// captured local/argument values for written stack slots.
 // Activated when the env var CT_GDSCRIPT_TRACE=<output-dir> is set; the
 // trace lands at <output-dir>/gdscript_trace.ct.
 #ifndef GDSCRIPT_CT_TRACE_H
@@ -12,6 +14,15 @@
 #include "core/string/string_name.h"
 
 #include <cstdint>
+
+class GDScriptFunction;
+class Variant;
+
+// True when CT_GDSCRIPT_TRACE is set (i.e. the recorder is active for this
+// process). Cheap and cached; safe to call before the writer exists. Used by
+// GDScriptLanguage to force local-variable tracking (stack_debug population) so
+// the G4 slot->name mapping has data to work with.
+bool gdscript_ct_trace_active();
 
 // Called from the OPCODE_LINE handler in gdscript_vm.cpp for every executed
 // source line. Lazily creates the writer on first call (no-op / cheap when
@@ -36,5 +47,20 @@ void gdscript_ct_trace_call(const StringName &name, const StringName &source, in
 // frames rather than one spanning frame — full await-continuation semantics
 // are GF10; non-coroutine nesting is exact).
 void gdscript_ct_trace_return();
+
+// G4: called from the write opcodes (OPCODE_ASSIGN* / OPCODE_OPERATOR* /
+// typed-assign variants) in gdscript_vm.cpp right AFTER the result Variant is
+// stored to its destination slot. `dest_address` is the raw 24-bit-encoded
+// address operand for the destination (`_code_ptr[ip + 1 + dst_ofs]`); `value`
+// is the freshly written Variant (`*dst`); `line` is the VM's current source
+// line. Only STACK-slot writes that resolve to a NAMED local/argument at the
+// current line are recorded — compiler temporaries (which either never enter
+// GDScriptFunction::stack_debug or carry an `@`-prefixed synthetic name) are
+// skipped, mirroring codetracer-nim's resolveTracedSlotSym. The value is
+// encoded to CBOR with the writer's streaming ct_value_* encoder and attached
+// to the current step via trace_writer_register_variable_cbor, so values stay
+// parallel-indexed to steps. No-op (cheap) when tracing is inactive.
+void gdscript_ct_trace_assign(const GDScriptFunction *func, int dest_address,
+		const Variant &value, int line);
 
 #endif // GDSCRIPT_CT_TRACE_H

@@ -715,6 +715,14 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 #endif // DEBUG_ENABLED
 
+// CodeTracer G4: capture the Variant just written to destination operand
+// `m_code_ofs` (whose raw 24-bit-encoded address is _code_ptr[ip + 1 +
+// m_code_ofs]) as the value of the named local at the current `line`. `m_dst`
+// is the already-decoded destination Variant*. The glue no-ops cheaply when
+// tracing is inactive and skips slots that are not named source-level locals.
+#define CT_TRACE_ASSIGN(m_dst, m_code_ofs) \
+	gdscript_ct_trace_assign(this, _code_ptr[ip + 1 + (m_code_ofs)], *(m_dst), line)
+
 #define LOAD_INSTRUCTION_ARGS                   \
 	int instr_arg_count = _code_ptr[ip + 1];    \
 	for (int i = 0; i < instr_arg_count; i++) { \
@@ -834,6 +842,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					*dst = ret;
 #endif
 				}
+				CT_TRACE_ASSIGN(dst, 2); // CodeTracer G4: operator result value
 				ip += 7 + _pointer_size;
 			}
 			DISPATCH_OPCODE;
@@ -851,6 +860,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				operator_func(a, b, dst);
 
+				CT_TRACE_ASSIGN(dst, 2); // CodeTracer G4: operator result value
 				ip += 5;
 			}
 			DISPATCH_OPCODE;
@@ -1381,6 +1391,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				*dst = *src;
 
+				CT_TRACE_ASSIGN(dst, 0); // CodeTracer G4
 				ip += 3;
 			}
 			DISPATCH_OPCODE;
@@ -1391,6 +1402,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				*dst = Variant();
 
+				CT_TRACE_ASSIGN(dst, 0); // CodeTracer G4: null assignment
 				ip += 2;
 			}
 			DISPATCH_OPCODE;
@@ -1401,6 +1413,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				*dst = true;
 
+				CT_TRACE_ASSIGN(dst, 0); // CodeTracer G4
 				ip += 2;
 			}
 			DISPATCH_OPCODE;
@@ -1411,6 +1424,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				*dst = false;
 
+				CT_TRACE_ASSIGN(dst, 0); // CodeTracer G4
 				ip += 2;
 			}
 			DISPATCH_OPCODE;
@@ -1440,6 +1454,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					*dst = *src;
 				}
 
+				CT_TRACE_ASSIGN(dst, 0); // CodeTracer G4: typed-builtin assignment
 				ip += 4;
 			}
 			DISPATCH_OPCODE;
@@ -1475,6 +1490,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				*dst = *src;
 
+				CT_TRACE_ASSIGN(dst, 0); // CodeTracer G4: typed-array assignment
 				ip += 6;
 			}
 			DISPATCH_OPCODE;
@@ -1519,6 +1535,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				*dst = *src;
 
+				CT_TRACE_ASSIGN(dst, 0); // CodeTracer G4: typed-dictionary assignment
 				ip += 9;
 			}
 			DISPATCH_OPCODE;
@@ -1555,6 +1572,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 #endif // DEBUG_ENABLED
 				*dst = *src;
 
+				CT_TRACE_ASSIGN(dst, 0); // CodeTracer G4: typed-native assignment
 				ip += 4;
 			}
 			DISPATCH_OPCODE;
@@ -1613,6 +1631,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				*dst = *src;
 
+				CT_TRACE_ASSIGN(dst, 0); // CodeTracer G4: typed-script assignment
 				ip += 4;
 			}
 			DISPATCH_OPCODE;
