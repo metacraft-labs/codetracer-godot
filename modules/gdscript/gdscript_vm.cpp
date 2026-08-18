@@ -1257,6 +1257,19 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				const Variant::ValidatedSetter setter = _setters_ptr[index_setter];
 
 				setter(dst, value);
+#ifdef DEBUG_ENABLED
+				// CodeTracer GF8 follow-up: typed-base in-place named write
+				// (e.g. `var vt: Vector2; vt.y = 8`). Unlike OPCODE_SET_NAMED,
+				// this opcode carries only a validated setter pointer + its
+				// index — no StringName operand. The member NAME is recovered
+				// from the DEBUG-only setter_names table the codegen populated
+				// in parallel with the setters vector (add_debug_name in
+				// write_set_named). The written field value is *value (the
+				// source Variant), mirroring the OPCODE_SET_NAMED hook.
+				if (index_setter < setter_names.size()) {
+					gdscript_ct_trace_member_assign(StringName(setter_names[index_setter]), *value);
+				}
+#endif
 				ip += 4;
 			}
 			DISPATCH_OPCODE;

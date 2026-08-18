@@ -28,6 +28,35 @@ GF8 closes it in `modules/gdscript/`:
 - **`OPCODE_SET_MEMBER`** (self native/registered property write) and
   **`OPCODE_SET_NAMED`** (in-place named write on a base Variant): the opcode
   already holds the member `StringName`, passed straight through.
+- **`OPCODE_SET_NAMED_VALIDATED`** (GF8 follow-up — the previously silently
+  dropped case): the typed-base variant of `SET_NAMED`, emitted when the base's
+  *static* type has a validated setter for the member (e.g.
+  `var vt: Vector2; vt.y = 8`). Unlike `SET_NAMED` this opcode carries only a
+  validated setter pointer + its index — **no `StringName` operand** — so the
+  original GF8 hook set could not reach it and the member write was dropped. The
+  name is recovered from the DEBUG-only `setter_names` table the codegen
+  populates in parallel with the setters vector
+  (`write_set_named` → `add_debug_name(setter_names, get_setter_pos(setter),
+  p_name)`), indexed by the same `index_setter` operand the handler already
+  reads: `gdscript_ct_trace_member_assign(setter_names[index_setter], *value)`.
+  The written field value is `*value` (the source Variant), mirroring
+  `SET_NAMED`.
+
+### The full `OPCODE_SET*` survey
+
+| opcode | writes a named member? | status |
+| --- | --- | --- |
+| `OPCODE_SET_NAMED` | yes (untyped base, `.x = …`) | hooked in GF8 |
+| `OPCODE_SET_NAMED_VALIDATED` | yes (typed base, `.y = …`) | **newly hooked (this follow-up)** |
+| `OPCODE_SET_MEMBER` | yes (native self property) | hooked in GF8 |
+| `OPCODE_SET_STATIC_VARIABLE` | yes (`static var`) | hooked in GF8 |
+| `OPCODE_SET_KEYED` / `OPCODE_SET_KEYED_VALIDATED` | no — `dict[k] = v` | out of scope (not a named member) |
+| `OPCODE_SET_INDEXED_VALIDATED` | no — `arr[i] = v` | out of scope (not a named member) |
+
+Index/keyed sets (`arr[i]=x`, `dict[k]=v`) are deliberately NOT hooked: their
+"name" is a runtime key/index, not a statically-known member name, so they do
+not belong to the member-write coverage. Capturing element writes into container
+locals is a separate future item.
 
 All go through the SAME recursive `ct_value_*` encoder and
 `trace_writer_register_variable_cbor`, so member values stay parallel-indexed to
@@ -50,6 +79,28 @@ child, the only way to drive `@onready`). It defines an inner class
 | `@onready var ready_mark := 42` | ASSIGN→MEMBER in `@implicit_ready` | `ready_mark` = 42 (Int) |
 | property `temp` set: `var got := v; _t = clamp(got,0,100)` | stack `got` + member `_t` | `got` = 150.0, `_t` = 100.0 (Float) |
 | property `temp` get: `return _t` | return value (GF5) | getter frame returns 100.0 (Float) |
+| `uv.x = 9.0` in `member_ops` (untyped base) | `OPCODE_SET_NAMED` | `x` = 9.0 (Float) |
+| `tv.y = 8.0` in `member_ops` (typed base) | `OPCODE_SET_NAMED_VALIDATED` | `y` = 8.0 (Float) |
+| `name = "gadget1"` in `member_ops` (native prop) | `OPCODE_SET_MEMBER` | `name` = "gadget1" (String) |
+
+### member_ops() — the three named-member-write opcodes, exercised directly
+
+The original GF8 fixture drove `ADDR_TYPE_MEMBER` / `SET_STATIC_VARIABLE` writes,
+but `SET_MEMBER` / `SET_NAMED` / `SET_NAMED_VALIDATED` were only *manually*
+verified by the reviewer — none was locked into the committed test, and
+`SET_NAMED_VALIDATED` was in fact **dropped**. `Gadget.member_ops()` now drives
+all three deterministically:
+
+- `var uv = Vector2(1.0, 2.0)` — an **untyped** local base, so `uv.x = 9.0`
+  compiles to `OPCODE_SET_NAMED` (name operand `"x"`).
+- `var tv: Vector2 = Vector2(3.0, 4.0)` — a **typed** local base, so `tv.y = 8.0`
+  compiles to `OPCODE_SET_NAMED_VALIDATED` (validated setter for `Vector2.y`),
+  the case that was previously silently dropped.
+- `name = "gadget1"` — resolves to the native `Node.name` property, compiling to
+  `OPCODE_SET_MEMBER`.
+
+`uv`/`tv` are themselves captured as `Struct("Vector2")` stack locals, which is
+why the types table now gains `Vector2` (see below).
 
 ### Property get/set are FRAMES
 
@@ -94,11 +145,12 @@ stdout: `CT_GF8_RESULT=208` and `CT_GF8_TOTAL=7`.
 ## Asserted facts (verify_gf8.py literals)
 
 Types table (Object appears because the `g := Gadget.new()` stack local is an
-Object — a Node — captured via the GF4 shallow-Object encoder; the member
-captures themselves are all scalars):
+Object — a Node — captured via the GF4 shallow-Object encoder; `Vector2` appears
+because `member_ops`'s `uv`/`tv` base locals are captured as `Struct("Vector2")`;
+the member captures themselves are all scalars):
 
 ```
-[None, Int, Float, Bool, String, Variant, Object]
+[None, Int, Float, Bool, String, Variant, Object, Vector2]
 ```
 
 Value captures — each on the step whose (function, line) match, proving
@@ -115,10 +167,15 @@ values.dat stays parallel-indexed to steps.dat:
 | `@temp_setter` | 71 | `_t` | Float | 100.0 |
 | `@implicit_ready` | 64 | `ready_mark` | Int | 42 |
 | `run` | 80 | `read_back` | Float | 100.0 |
+| `member_ops` | 98 | `x` | Float | 9.0 | (`OPCODE_SET_NAMED`) |
+| `member_ops` | 100 | `y` | Float | 8.0 | (`OPCODE_SET_NAMED_VALIDATED`) |
+| `member_ops` | 101 | `name` | String | "gadget1" | (`OPCODE_SET_MEMBER`) |
 
 (`read_back` lands on line 80, not 79: the getter CALL on line 79 defers the
 read_back ASSIGN to the next emitted source line — the known G4 parallel-index
-detail that a write opcode runs after its line's `OPCODE_LINE`.)
+detail that a write opcode runs after its line's `OPCODE_LINE`. The three
+`member_ops` writes are plain in-place named writes with no intervening call, so
+each lands on its own source line.)
 
 Additionally: `total == 0` is captured on the `@static_initializer` frame (the
 static-var initializer), proving the static-var path, and `total == 7` is the
@@ -139,6 +196,9 @@ Frames:
   misses.
 - `missingsetter` — drop the `@temp_setter` call_entry/exit so the setter-frame
   assertion fails.
+- `validatedvalue` — flip the captured `y` (line 100) from 8.0 to 999.0 on the
+  **newly-covered `OPCODE_SET_NAMED_VALIDATED`** write, proving the typed-member
+  write is actually asserted (not vacuously accepted).
 
 ## Regression — prior member-absence expectations this closes
 

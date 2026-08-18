@@ -136,7 +136,7 @@ python3 "$REPO/scripts/verify_gf8.py" verify "$GF8_FULL" \
 
 # --- 4. prove the verifier has teeth (tamper runs MUST be rejected) --------
 log "tamper runs (each MUST be rejected by verify_gf8.py)"
-for mode in value membername missingsetter; do
+for mode in value membername missingsetter validatedvalue; do
 	python3 "$REPO/scripts/verify_gf8.py" tamper "$GF8_FULL" "$mode" \
 		|| die "tamper($mode) was NOT rejected — verifier is vacuous"
 done

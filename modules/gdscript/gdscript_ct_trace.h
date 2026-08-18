@@ -83,6 +83,12 @@ void gdscript_ct_trace_assign(const GDScriptFunction *func, int dest_address,
 //     StringName the opcode already holds (_global_names_ptr[indexname]).
 //   - OPCODE_SET_NAMED — an in-place named write on a base Variant (e.g.
 //     `vec.x = 1`); `name` is the mutated field's StringName.
+//   - OPCODE_SET_NAMED_VALIDATED — the typed-base variant of the above (e.g.
+//     `var vt: Vector2; vt.y = 8`), emitted when the base's static type has a
+//     validated setter for the member. The opcode carries only a setter
+//     pointer + index, so the caller recovers `name` from the DEBUG-only
+//     setter_names table (GDScriptFunction::setter_names[index]) the codegen
+//     populated alongside the setters vector.
 // `value` is the freshly written Variant. The value is encoded with the SAME
 // recursive ct_value_* encoder the G4/GF3/GF4 stack path uses and attached to
 // the current step via trace_writer_register_variable_cbor, so member values

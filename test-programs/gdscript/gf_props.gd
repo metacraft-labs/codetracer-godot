@@ -80,11 +80,32 @@ class Gadget:
 		var sum := int(read_back) + hp + x + level
 		return sum
 
+	# GF8 follow-up: exercise the three NAMED member-write opcodes DIRECTLY so the
+	# committed test locks them in (previously only manually verified by the
+	# reviewer). Each named-member write is captured by NAME on its own step:
+	#  - OPCODE_SET_NAMED           — in-place write on an UNTYPED base (`uv.x`);
+	#    the base has no static type, so codegen falls back to the name-carrying
+	#    opcode. Captured as `x == 9.0`.
+	#  - OPCODE_SET_NAMED_VALIDATED — in-place write on a TYPED base (`tv.y`);
+	#    the base's Vector2 static type has a validated setter for `y`, so codegen
+	#    emits the validated variant (no StringName operand — the name is
+	#    recovered from the DEBUG setter_names table). This is the GF8 gap that
+	#    was previously SILENTLY DROPPED. Captured as `y == 8.0`.
+	#  - OPCODE_SET_MEMBER          — a native self property write (`name = ...`
+	#    resolves to Node.name). Captured as `name == "gadget1"`.
+	func member_ops() -> void:
+		var uv = Vector2(1.0, 2.0)            # untyped local (Variant) base
+		uv.x = 9.0                            # OPCODE_SET_NAMED           -> x == 9.0
+		var tv: Vector2 = Vector2(3.0, 4.0)   # typed local base
+		tv.y = 8.0                            # OPCODE_SET_NAMED_VALIDATED -> y == 8.0
+		name = "gadget1"                      # OPCODE_SET_MEMBER (native Node.name)
+
 
 func _initialize() -> void:
 	var g := Gadget.new()      # implicit init: hp=100, level=3, _t=0.0; _init: x=5, total=7
 	root.add_child(g)          # schedules _ready -> @implicit_ready (ready_mark=42) runs later
 	var r := g.run()           # property setter/getter frames + backing writes
+	g.member_ops()             # GF8 follow-up: drive SET_NAMED / SET_NAMED_VALIDATED / SET_MEMBER
 	print("CT_GF8_RESULT=%d" % r)
 	print("CT_GF8_TOTAL=%d" % Gadget.total)
 	g.queue_free()

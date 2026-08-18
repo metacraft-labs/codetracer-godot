@@ -25,7 +25,8 @@ Usage:
   verify_gf8.py verify <full.json>          # assert all GF8 facts (exit 0 = pass)
   verify_gf8.py tamper <full.json> <mode>   # corrupt the doc, expect the same
                                             # assertions to FAIL. mode is one of
-                                            # value|membername|missingsetter.
+                                            # value|membername|missingsetter|
+                                            # validatedvalue.
                                             # exit 0 iff the tamper was caught.
 """
 import json
@@ -82,9 +83,21 @@ EXPECTED = [
     ("@implicit_ready", 64, "ready_mark", "Int", 42),
     # getter result read into a local (stack) — the getter frame ran.
     ("run", 80, "read_back", "Float", 100.0),
+    # GF8 follow-up: the three NAMED member-write opcodes exercised DIRECTLY in
+    # member_ops(), each captured by NAME on its own step (previously only
+    # manually verified by the reviewer — now locked into the committed test):
+    #   line 98  `uv.x = 9.0`   -> OPCODE_SET_NAMED            (untyped base)
+    #   line 100 `tv.y = 8.0`   -> OPCODE_SET_NAMED_VALIDATED  (typed base — the
+    #            previously SILENTLY DROPPED write, now hooked)
+    #   line 101 `name = ...`   -> OPCODE_SET_MEMBER           (native Node.name)
+    ("member_ops", 98, "x", "Float", 9.0),
+    ("member_ops", 100, "y", "Float", 8.0),
+    ("member_ops", 101, "name", "String", "gadget1"),
 ]
 
-EXPECTED_TYPES = ["None", "Int", "Float", "Bool", "String", "Variant", "Object"]
+# GF8 follow-up: `Vector2` is now present — the member_ops() untyped/typed bases
+# (uv/tv) are captured as Struct("Vector2") locals, interned after Object.
+EXPECTED_TYPES = ["None", "Int", "Float", "Bool", "String", "Variant", "Object", "Vector2"]
 
 
 def value_scalar(val):
@@ -212,9 +225,11 @@ def assert_facts(doc):
             "own steps (hp=100,level=3 @export; _t=0.0 init; x=5 plain member; "
             "total 0->7 static var; got=150.0/_t=100.0 in @temp_setter backing "
             "write; ready_mark=42 @onready in @implicit_ready; read_back=100.0 via "
-            "getter); property accessors are FRAMES (@temp_setter void / "
-            "@temp_getter -> 100.0), both children of run; types=%s; call/return "
-            "balanced. %s" % (len(EXPECTED), types, observed))
+            "getter; member_ops: x=9.0 SET_NAMED, y=8.0 SET_NAMED_VALIDATED "
+            "[typed-base, previously dropped], name='gadget1' SET_MEMBER); property "
+            "accessors are FRAMES (@temp_setter void / @temp_getter -> 100.0), both "
+            "children of run; types=%s; call/return balanced. %s"
+            % (len(EXPECTED), types, observed))
 
 
 def tamper(doc, mode):
@@ -246,6 +261,13 @@ def tamper(doc, mode):
             if not (e.get("kind") == "call_entry" and e.get("function") == "@temp_setter")
             and not (e.get("kind") == "call_exit" and e.get("call_key") in setter_keys)
         ]
+    elif mode == "validatedvalue":
+        # GF8 follow-up: wrong value on the NEWLY-COVERED OPCODE_SET_NAMED_VALIDATED
+        # write (typed-base `tv.y = 8.0`). Flip y from 8.0 to 999.0; the verifier
+        # MUST reject it (proving the validated-member write is actually asserted,
+        # not vacuously accepted). This is the write that was silently dropped
+        # before the SET_NAMED_VALIDATED hook was added.
+        var_at("member_ops", 100, "y")["value"]["f"] = 999.0
     else:
         print("unknown tamper mode %r" % mode, file=sys.stderr)
         sys.exit(2)
@@ -268,7 +290,8 @@ def main():
 
     if cmd == "tamper":
         if len(sys.argv) != 4:
-            print("usage: verify_gf8.py tamper <full.json> <value|membername|missingsetter>",
+            print("usage: verify_gf8.py tamper <full.json> "
+                  "<value|membername|missingsetter|validatedvalue>",
                   file=sys.stderr)
             sys.exit(2)
         mode = sys.argv[3]
