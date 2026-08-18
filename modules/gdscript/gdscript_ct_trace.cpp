@@ -222,13 +222,44 @@ void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source
 	trace_writer_register_call(g_ct_writer, fid);
 }
 
-void gdscript_ct_trace_return() {
+// GF5: forward declarations — the return hook (below) reuses the recursive
+// value encoder defined further down (shared with the G4 assign hook).
+static void gdscript_ct_encode_variant(const Variant &value);
+
+void gdscript_ct_trace_return(const Variant &p_return_value) {
 	// Never create the writer from a return: a return only makes sense after a
 	// matching call (which already created it). Guard on the live handle.
 	if (g_ct_disabled || !g_ct_writer) {
 		return;
 	}
-	trace_writer_register_return(g_ct_writer);
+
+	// GF5: capture the return VALUE. Encode it with the same recursive
+	// ct_value_* encoder G4/GF3/GF4 use for locals, then attach it to the
+	// return record via trace_writer_register_return_cbor. This is a drop-in
+	// replacement for register_return (the FFI routes both through the SAME
+	// registerReturn), so the number/ordering of call/return records — and thus
+	// the G3 nesting + balanced-pair invariant — is unchanged. Returns live in
+	// the call stream, not values.dat, so there is no parallel-index constraint
+	// (unlike gdscript_ct_trace_assign, this does not require g_ct_started).
+	//
+	// A `-> void` / fall-off-the-end function has retvalue == NIL, which encodes
+	// as a None value node (kind "None", TypeId 0) — consistent with G4's
+	// `null -> None`, not the format's bare one-byte VoidReturnMarker.
+	gdscript_ct_ensure_types();
+	if (!g_ct_encoder) {
+		// Encoder unavailable (should not happen once the writer exists): fall
+		// back to a valueless return so the call/return pair still balances.
+		trace_writer_register_return(g_ct_writer);
+		return;
+	}
+	gdscript_ct_encode_variant(p_return_value);
+	size_t cbor_len = 0;
+	const uint8_t *cbor = ct_value_get_bytes(g_ct_encoder, &cbor_len);
+	if (!cbor || cbor_len == 0) {
+		trace_writer_register_return(g_ct_writer);
+		return;
+	}
+	trace_writer_register_return_cbor(g_ct_writer, cbor, cbor_len);
 }
 
 // GF3: intern the compound-collection types on first use. Kept out of

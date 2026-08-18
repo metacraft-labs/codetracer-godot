@@ -46,7 +46,19 @@ void gdscript_ct_trace_call(const StringName &name, const StringName &source, in
 // suspension (a suspended coroutine simply records as two adjacent balanced
 // frames rather than one spanning frame — full await-continuation semantics
 // are GF10; non-coroutine nesting is exact).
-void gdscript_ct_trace_return();
+//
+// GF5: the return VALUE is now captured. `return_value` is the VM's `retvalue`
+// at the exit path — the Variant the OPCODE_RETURN* opcode stored, or a
+// default-constructed NIL for a `-> void` / fall-off-the-end function. It is
+// encoded with the SAME recursive ct_value_* encoder G4/GF3/GF4 use and
+// attached to the return record via trace_writer_register_return_cbor. This is
+// ADDITIONAL data on the existing return event: it does NOT add, remove, or
+// reorder any call/return record, so the G3 nesting + balanced-pair invariant
+// is unchanged (register_return_cbor calls the same registerReturn the bare
+// register_return does, just with value bytes). A void / no-return function
+// records a None return value (retvalue is NIL), not the format's bare
+// VoidReturnMarker — consistent with G4's `null -> None` scalar handling.
+void gdscript_ct_trace_return(const Variant &return_value);
 
 // G4: called from the write opcodes (OPCODE_ASSIGN* / OPCODE_OPERATOR* /
 // typed-assign variants) in gdscript_vm.cpp right AFTER the result Variant is

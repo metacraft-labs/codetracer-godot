@@ -4022,7 +4022,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 	// If that is the case then we exit the function as normal. Otherwise we postpone it until the last `await` is completed.
 	// This ensures the call stack can be properly shown when using `await`, showing what resumed the function.
 	if (!p_state || awaited) {
-		gdscript_ct_trace_return(); // CodeTracer G3: return (normal / yield-suspend exit)
+		gdscript_ct_trace_return(retvalue); // CodeTracer G3 return + GF5 return value (normal / yield-suspend exit)
 		GDScriptLanguage::get_singleton()->exit_function();
 
 		// Free stack, except reserved addresses.
@@ -4046,7 +4046,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 		p_state->completed.emit(args, 1);
 
 		// Exit function only after executing the remaining function states to preserve async call stack.
-		gdscript_ct_trace_return(); // CodeTracer G3: return (await-resume completion exit)
+		gdscript_ct_trace_return(retvalue); // CodeTracer G3 return + GF5 return value (await-resume completion exit)
 		GDScriptLanguage::get_singleton()->exit_function();
 	}
 
