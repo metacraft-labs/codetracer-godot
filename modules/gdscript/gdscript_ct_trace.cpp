@@ -68,9 +68,15 @@
 #include "core/templates/rid.h"
 #include "core/variant/callable.h" // also declares Signal
 
+// GF12: threads. Thread::get_caller_id() yields a stable per-OS-thread id (main
+// == Thread::MAIN_ID == 1, each started Thread / WorkerThreadPool worker a unique
+// id) — the thread id supplied to the writer's thread-lifecycle events.
+#include "core/os/thread.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex> // GF12: serialize the shared writer/encoder across worker threads
 
 // The CTFS writer's C header names a parameter `mutable`, which is a C++
 // keyword. Shim it out for this C++ translation unit (we never call that
@@ -83,6 +89,132 @@ static trace_writer_t g_ct_writer = nullptr;
 static bool g_ct_inited = false;   // init attempted?
 static bool g_ct_disabled = false; // tracing off (env unset or init failed)
 static bool g_ct_started = false;  // trace_writer_start emitted the first step?
+
+// GF12: WRITER THREAD-SAFETY (resolves GDScript-Recorder.md open question #3).
+//
+// When GDScript runs on a worker thread (Thread.start / WorkerThreadPool.add_task)
+// GDScriptFunction::call executes ON THAT OS THREAD, so every hook below can fire
+// CONCURRENTLY from multiple OS threads into the SINGLE shared writer + the single
+// reused CBOR encoder + the cached type-id maps. The linked CTFS writer
+// (libcodetracer_trace_writer.a) is NOT thread-safe: it builds one in-memory
+// container with a single shared "pending step" slot (see codetracer_trace_writer_ffi.nim)
+// and unsynchronized stream buffers, so concurrent emits race and — measured on
+// the GF11 binary — CRASH (SIGSEGV / SIGABRT), HANG, or drop data. The writer's
+// own contract is therefore "serialize externally", and it exposes thread-
+// LIFECYCLE events (trace_writer_register_thread_start / _switch / _exit) to
+// attribute a single interleaved exec stream to distinct CodeTracer threads
+// (the BEAM recorder's model: one process == one thread via ThreadStart/Switch/Exit).
+//
+// STRATEGY: a single global mutex serializes the ENTIRE emit path of every hook
+// (writer + encoder + type maps are all covered by the one lock), and the recorder
+// emits ThreadStart/ThreadSwitch on OS-thread change so a worker's steps/calls/
+// values carry a thread id distinct from the main thread.
+//
+//   * SINGLE-THREAD BYTE-IDENTICAL: a non-threaded program only ever emits on the
+//     main thread, so g_ct_active_thread never changes, NO thread event is ever
+//     emitted, and g_ct_pending_owner always equals the caller — the guards below
+//     are inert and the main-thread step/value/call streams are unchanged.
+//   * NO DEADLOCK: the lock is taken per-hook (never held across a VM opcode, so
+//     it can never be held across a user Mutex.lock/Semaphore.wait), and a
+//     thread-local reentrancy guard makes any hook that fires while this thread is
+//     already inside an emit (e.g. a Variant->String that re-enters GDScript) a
+//     no-op instead of a recursive self-lock.
+static std::mutex g_ct_mutex;
+static thread_local bool g_ct_in_emit = false;
+
+// GF12: thread-attribution state (all guarded by g_ct_mutex).
+static bool g_ct_have_active = false;     // has any emit run yet?
+static uint64_t g_ct_active_thread = 0;   // OS thread the exec stream is currently attributed to
+static uint64_t g_ct_main_thread = 0;     // the first thread that ever emitted (implicit default)
+// g_ct_pending_owner is the OS thread whose step currently occupies the writer's
+// single pending-step slot. A value hook attaches only when it still owns that
+// slot; any thread event flushes the pending step, so it invalidates the owner.
+// This keeps values.dat parallel-indexed to steps.dat under interleaving: a value
+// is NEVER misattached to another thread's step (it is dropped instead — the
+// documented, correctness-preserving behavior for the inherently racy step/value
+// window; per-thread STEP counts, call/return records and captured return values
+// are unaffected because they do not depend on the shared pending slot).
+static uint64_t g_ct_pending_owner = 0;
+// Threads for which a ThreadStart has already been emitted (the main thread is
+// implicitly "started"). A small fixed set: real programs use a handful of worker
+// threads; beyond the cap we fall back to ThreadSwitch (still correct, just no
+// ThreadStart marker for that extra thread).
+static const int CT_MAX_THREADS = 128;
+static uint64_t g_ct_started_threads[CT_MAX_THREADS];
+static int g_ct_started_count = 0;
+
+static inline uint64_t gdscript_ct_current_thread() {
+	return (uint64_t)Thread::get_caller_id();
+}
+
+// GF12: RAII lock + reentrancy guard for a hook body. `engaged` is false when the
+// same thread is already inside an emit (reentrancy) — the hook then does nothing,
+// avoiding a recursive self-deadlock without changing what is recorded.
+struct CtEmitLock {
+	bool engaged = false;
+	CtEmitLock() {
+		if (g_ct_in_emit) {
+			return;
+		}
+		g_ct_in_emit = true;
+		g_ct_mutex.lock();
+		engaged = true;
+	}
+	~CtEmitLock() {
+		if (engaged) {
+			g_ct_mutex.unlock();
+			g_ct_in_emit = false;
+		}
+	}
+	CtEmitLock(const CtEmitLock &) = delete;
+	CtEmitLock &operator=(const CtEmitLock &) = delete;
+};
+
+// GF12: called (while holding g_ct_mutex) at the top of each STEP/CALL/RETURN hook,
+// before the writer event it precedes. Emits a ThreadStart/ThreadSwitch when the
+// emitting OS thread differs from the one the exec stream is currently attributed
+// to, so the following event is attributed to the correct CodeTracer thread. NEVER
+// emits a thread event for a single-threaded program (the thread never changes).
+// `cur` is the caller's current OS thread id.
+//
+// Thread events are exec-stream events that FLUSH the writer's pending step, so
+// emitting one invalidates g_ct_pending_owner (any half-valued step is committed).
+// We only emit once the exec stream has begun (g_ct_started); before that the very
+// first step is still pending via trace_writer_start and there is nothing to switch.
+static void gdscript_ct_note_thread_locked(uint64_t cur) {
+	if (!g_ct_have_active) {
+		g_ct_have_active = true;
+		g_ct_main_thread = cur;
+		g_ct_active_thread = cur;
+		return; // first emitter (main): implicit default, no event → byte-identical
+	}
+	if (cur == g_ct_active_thread) {
+		return;
+	}
+	if (!g_ct_started) {
+		// Exec stream not begun yet: just remember the active thread; the first
+		// real step (trace_writer_start) will anchor it with no thread event.
+		g_ct_active_thread = cur;
+		return;
+	}
+	bool started_before = (cur == g_ct_main_thread);
+	for (int i = 0; i < g_ct_started_count && !started_before; i++) {
+		if (g_ct_started_threads[i] == cur) {
+			started_before = true;
+		}
+	}
+	if (started_before) {
+		trace_writer_register_thread_switch(g_ct_writer, cur);
+	} else {
+		trace_writer_register_thread_start(g_ct_writer, cur);
+		if (g_ct_started_count < CT_MAX_THREADS) {
+			g_ct_started_threads[g_ct_started_count++] = cur;
+		}
+	}
+	// The thread event flushed the writer's pending step: no thread owns it now.
+	g_ct_pending_owner = 0;
+	g_ct_active_thread = cur;
+}
 
 // G4: a single reused streaming CBOR value encoder + cached type ids. The
 // encoder is reset before each value; type ids are interned once on the writer
@@ -244,19 +376,29 @@ static void gdscript_ct_ensure_types() {
 }
 
 void gdscript_ct_trace_step(const StringName &p_source, int64_t p_line) {
+	CtEmitLock lk; // GF12: serialize + reentrancy-guard the emit path
+	if (!lk.engaged) {
+		return;
+	}
 	if (!gdscript_ct_ensure_writer()) {
 		return;
 	}
+	// GF12: attribute this step to the emitting OS thread (emits ThreadStart/
+	// ThreadSwitch on a thread change; a no-op on a single-threaded program).
+	uint64_t cur = gdscript_ct_current_thread();
+	gdscript_ct_note_thread_locked(cur);
 
 	CharString src_cs = String(p_source).utf8();
 	if (unlikely(!g_ct_started)) {
 		g_ct_started = true;
 		// Registers the first (pending) step at this real source line.
 		trace_writer_start(g_ct_writer, src_cs.get_data(), p_line);
+		g_ct_pending_owner = cur; // GF12: this thread owns the pending step
 		return;
 	}
 
 	trace_writer_register_step(g_ct_writer, src_cs.get_data(), p_line);
+	g_ct_pending_owner = cur; // GF12: this thread owns the new pending step
 
 	// GF10: flush a pending async-resume marker onto THIS (first resumed) step,
 	// so continuation.step_id is the first line executed after the await resumes
@@ -269,6 +411,10 @@ void gdscript_ct_trace_step(const StringName &p_source, int64_t p_line) {
 }
 
 void gdscript_ct_trace_await_suspend(const void *p_call_state) {
+	CtEmitLock lk; // GF12: serialize + reentrancy-guard
+	if (!lk.engaged) {
+		return;
+	}
 	gdscript_ct_emit_async_marker(CT_ASYNC_SUSPEND_TAG, (uintptr_t)p_call_state);
 }
 
@@ -277,6 +423,10 @@ void gdscript_ct_trace_await_resume(const void *p_call_state) {
 	// At OPCODE_AWAIT_RESUME the interpreter has not yet emitted an OPCODE_LINE
 	// for the resumed body, so binding here would land the marker back on the
 	// suspend step; deferring makes continuation.step_id the first resumed line.
+	CtEmitLock lk; // GF12: serialize the pending-resume slot write
+	if (!lk.engaged) {
+		return;
+	}
 	if (g_ct_disabled) {
 		return;
 	}
@@ -285,9 +435,16 @@ void gdscript_ct_trace_await_resume(const void *p_call_state) {
 }
 
 void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source, int64_t p_line) {
+	CtEmitLock lk; // GF12: serialize + reentrancy-guard
+	if (!lk.engaged) {
+		return;
+	}
 	if (!gdscript_ct_ensure_writer()) {
 		return;
 	}
+	// GF12: attribute this call to the emitting OS thread (before register_call so
+	// the call's entry_step lands in the correct thread region).
+	gdscript_ct_note_thread_locked(gdscript_ct_current_thread());
 
 	CharString name_cs = String(p_name).utf8();
 	CharString src_cs = String(p_source).utf8();
@@ -301,11 +458,19 @@ void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source
 static void gdscript_ct_encode_variant(const Variant &value);
 
 void gdscript_ct_trace_return(const Variant &p_return_value) {
+	CtEmitLock lk; // GF12: serialize + reentrancy-guard
+	if (!lk.engaged) {
+		return;
+	}
 	// Never create the writer from a return: a return only makes sense after a
 	// matching call (which already created it). Guard on the live handle.
 	if (g_ct_disabled || !g_ct_writer) {
 		return;
 	}
+	// GF12: attribute this return to the emitting OS thread. The return VALUE
+	// rides the call stream (not the shared pending step), so it is captured
+	// reliably even under interleaving.
+	gdscript_ct_note_thread_locked(gdscript_ct_current_thread());
 
 	// GF5: capture the return VALUE. Encode it with the same recursive
 	// ct_value_* encoder G4/GF3/GF4 use for locals, then attach it to the
@@ -821,9 +986,21 @@ static void gdscript_ct_emit_named_value(const String &p_name, const Variant &p_
 
 void gdscript_ct_trace_assign(const GDScriptFunction *p_func, int p_dest_address,
 		const Variant &p_value, int p_line) {
+	CtEmitLock lk; // GF12: serialize + reentrancy-guard
+	if (!lk.engaged) {
+		return;
+	}
 	// A value can only attach to an already-registered step; refuse otherwise
 	// so values.dat stays parallel-indexed to steps.dat.
 	if (g_ct_disabled || !g_ct_writer || !g_ct_started || !p_func) {
+		return;
+	}
+	// GF12: attach only if THIS thread still owns the writer's pending step. If
+	// another thread has registered a step (or a thread event flushed ours) since
+	// this thread's own step, the pending slot is foreign and attaching here would
+	// misattach the value — drop it instead (parallel-index safety). On a single-
+	// threaded program the owner is always this thread, so this never drops.
+	if (g_ct_pending_owner != gdscript_ct_current_thread()) {
 		return;
 	}
 
@@ -895,7 +1072,15 @@ void gdscript_ct_trace_assign(const GDScriptFunction *p_func, int p_dest_address
 // parallel-index contract as gdscript_ct_trace_assign: a member value can only
 // attach to an already-registered step.
 void gdscript_ct_trace_member_assign(const StringName &p_name, const Variant &p_value) {
+	CtEmitLock lk; // GF12: serialize + reentrancy-guard
+	if (!lk.engaged) {
+		return;
+	}
 	if (g_ct_disabled || !g_ct_writer || !g_ct_started) {
+		return;
+	}
+	// GF12: parallel-index safety under threads (see gdscript_ct_trace_assign).
+	if (g_ct_pending_owner != gdscript_ct_current_thread()) {
 		return;
 	}
 	gdscript_ct_emit_named_value(String(p_name), p_value);
