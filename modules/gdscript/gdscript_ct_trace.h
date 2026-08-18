@@ -101,4 +101,44 @@ void gdscript_ct_trace_assign(const GDScriptFunction *func, int dest_address,
 // to a member name via GDScript::debug_get_member_by_index.
 void gdscript_ct_trace_member_assign(const StringName &name, const Variant &value);
 
+// GF10: async continuation (coroutines & `await`). Conforms to CodeTracer's
+// async-continuation model (HTTP-Request-Panel.md §3.2 ContinuationLink /
+// Async-Continuation-Algorithms.md §5 AsyncLinkRecord), it does NOT invent a
+// parallel scheme.
+//
+// The GDScript `await` suspend/resume path re-enters GDScriptFunction::call with
+// a CallState (`p_state`) — the suspended coroutine frame. On suspension
+// (OPCODE_AWAIT with a Signal) the VM creates a Ref<GDScriptFunctionState> whose
+// `state` member IS that CallState; on resumption GDScriptFunctionState::resume
+// calls `function->call(..., &state)`, so `&gdfs->state` at suspend and
+// `p_state` at resume are the SAME pointer. That pointer is the async
+// `context_id` (analogous to Nim's Future ptr / Python's coroutine obj).
+//
+// The recorder emits two markers per await via trace_writer_register_special_event
+// (an events.dat record whose reader-side step_id is the current step): a SUSPEND
+// marker carrying context_id at the `await` step, and a RESUME marker carrying
+// the SAME context_id at the first resumed line. The db-backend pairs them by
+// context_id into a ContinuationLink (link_type "await"): registration.step_id =
+// the suspend step, continuation.step_id = the resume step. No C-ABI extension is
+// required — register_special_event already carries (kind, metadata, content).
+//
+// Call/return stays BALANCED across the yield with no change to G3: each
+// GDScriptFunction::call invocation still runs exactly one enter/exit pair (the
+// suspend exit and the resume entry are separate invocations), so a suspended
+// coroutine records as two adjacent balanced frames and the coroutine's locals
+// survive the suspension (Godot saves/restores the stack), readable with their
+// pre-await values on resume. This resolves GDScript-Recorder.md open question #4.
+
+// SUSPEND: called from the OPCODE_AWAIT handler right after `awaited = true`,
+// with `call_state` = &gdfs->state (the CallState the resume will re-enter with).
+// Emits a suspend marker bound to the current (await-line) step.
+void gdscript_ct_trace_await_suspend(const void *call_state);
+
+// RESUME: called from the OPCODE_AWAIT_RESUME handler with `call_state` =
+// `p_state` (the same CallState pointer as the matching suspend). The marker is
+// DEFERRED to the next per-line step (see gdscript_ct_trace_step) so
+// continuation.step_id is the first resumed source line — strictly greater than
+// the suspend step, as the ContinuationLink model requires.
+void gdscript_ct_trace_await_resume(const void *call_state);
+
 #endif // GDSCRIPT_CT_TRACE_H

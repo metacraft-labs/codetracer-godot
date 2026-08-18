@@ -68,6 +68,8 @@
 #include "core/templates/rid.h"
 #include "core/variant/callable.h" // also declares Signal
 
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 
 // The CTFS writer's C header names a parameter `mutable`, which is a C++
@@ -115,6 +117,49 @@ static const int CT_MAX_VALUE_DEPTH = 8;
 
 // Cached CT_GDSCRIPT_TRACE presence (env is read once).
 static int g_ct_active = -1; // -1 unknown, 0 inactive, 1 active
+
+// GF10: a pending async-resume marker, deferred to the next per-line step so the
+// continuation binds to the first RESUMED source line (strictly after the
+// suspend step). A single slot is sufficient because GDScript coroutine resume
+// runs synchronously on the resuming thread: the OPCODE_AWAIT_RESUME and the
+// following OPCODE_LINE are adjacent with no other coroutine interleaving between
+// them (nested/concurrent resume is a documented GF12-thread follow-up).
+static bool g_ct_pending_resume = false;
+static uintptr_t g_ct_pending_resume_ctx = 0;
+
+// GF10: content tags for the suspend/resume markers. The db-backend's
+// `gdscript-coroutine` ContinuationPattern keys off these prefixes; the marker
+// METADATA carries the context_id (the CallState pointer) as a hex string.
+static const char *CT_ASYNC_SUSPEND_TAG = "ct-async-suspend:gdscript-coroutine";
+static const char *CT_ASYNC_RESUME_TAG = "ct-async-resume:gdscript-coroutine";
+
+// GF10: emit one async marker as an events.dat special event. content = the
+// suspend/resume tag; metadata = "<context_id_hex> <step_id>" where context_id is
+// the CallState pointer and step_id is the exec-stream step the marker refers to.
+//
+// We encode step_id EXPLICITLY rather than relying on the event's implicit step
+// binding: the FFI buffers one "pending step" (for late-arriving column deltas /
+// values — see flushPendingStep in codetracer_trace_writer_ffi.nim), so the
+// IOEvent's implicit stepId (msWriter.stepCount - 1) lags the just-registered
+// line by one. trace_writer_next_step_index() DOES account for the pending step
+// (it returns stepCount + hasPendingStep), so the step just registered — the one
+// this marker refers to — is next_step_index() - 1. The db-backend reads this
+// metadata step_id, which matches reader.step(StepId(n)) indexing.
+//
+// FFI_EVENT_TRACE_LOG_EVENT is a neutral log kind (it does not perturb the
+// write/read event kinds recorders rely on).
+static void gdscript_ct_emit_async_marker(const char *tag, uintptr_t ctx) {
+	// A marker only makes sense once a step exists to anchor it to.
+	if (g_ct_disabled || !g_ct_writer || !g_ct_started) {
+		return;
+	}
+	uint64_t next = trace_writer_next_step_index(g_ct_writer);
+	uint64_t step = (next > 0) ? (next - 1) : 0;
+	char meta[48];
+	snprintf(meta, sizeof(meta), "0x%llx %llu",
+			(unsigned long long)ctx, (unsigned long long)step);
+	trace_writer_register_special_event(g_ct_writer, FFI_EVENT_TRACE_LOG_EVENT, meta, tag);
+}
 
 bool gdscript_ct_trace_active() {
 	if (g_ct_active < 0) {
@@ -212,6 +257,31 @@ void gdscript_ct_trace_step(const StringName &p_source, int64_t p_line) {
 	}
 
 	trace_writer_register_step(g_ct_writer, src_cs.get_data(), p_line);
+
+	// GF10: flush a pending async-resume marker onto THIS (first resumed) step,
+	// so continuation.step_id is the first line executed after the await resumes
+	// — strictly greater than the suspend step. The step above was just
+	// registered, so the marker binds to it (stepCount - 1).
+	if (unlikely(g_ct_pending_resume)) {
+		g_ct_pending_resume = false;
+		gdscript_ct_emit_async_marker(CT_ASYNC_RESUME_TAG, g_ct_pending_resume_ctx);
+	}
+}
+
+void gdscript_ct_trace_await_suspend(const void *p_call_state) {
+	gdscript_ct_emit_async_marker(CT_ASYNC_SUSPEND_TAG, (uintptr_t)p_call_state);
+}
+
+void gdscript_ct_trace_await_resume(const void *p_call_state) {
+	// Defer the resume marker to the next per-line step (gdscript_ct_trace_step).
+	// At OPCODE_AWAIT_RESUME the interpreter has not yet emitted an OPCODE_LINE
+	// for the resumed body, so binding here would land the marker back on the
+	// suspend step; deferring makes continuation.step_id the first resumed line.
+	if (g_ct_disabled) {
+		return;
+	}
+	g_ct_pending_resume = true;
+	g_ct_pending_resume_ctx = (uintptr_t)p_call_state;
 }
 
 void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source, int64_t p_line) {

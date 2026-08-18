@@ -2676,6 +2676,12 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 					awaited = true;
 
+					// CodeTracer GF10: async suspend marker. `&gdfs->state` is the
+					// CallState the matching resume re-enters call() with (see
+					// GDScriptFunctionState::resume), so it is the stable async
+					// context_id pairing this suspend with its continuation.
+					gdscript_ct_trace_await_suspend(&gdfs->state);
+
 #ifdef DEBUG_ENABLED
 					exit_ok = true;
 #endif
@@ -2692,6 +2698,12 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					OPCODE_BREAK;
 				}
 #endif
+				// CodeTracer GF10: async resume marker. `p_state` is the SAME
+				// CallState pointer the matching suspend recorded, so it pairs this
+				// continuation with its registration. Deferred to the next per-line
+				// step so continuation.step_id is the first resumed source line.
+				gdscript_ct_trace_await_resume(p_state);
+
 				GET_VARIANT_PTR(result, 0);
 				*result = p_state->result;
 				ip += 2;
