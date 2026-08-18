@@ -182,6 +182,16 @@ void gdscript_ct_trace_utility_diagnostic(const StringName &function,
 // gdscript_ct_trace_call / _return (no VM change there); this hook covers the
 // native-call site.
 //
+// N2: at the SAME call-entry/exit boundary, when the MCR native-marker interface
+// (ct_mcr_mark_span_start / ct_mcr_mark_span_end, also weak-dlsym'd) is present,
+// the recorder emits a REAL native span anchor into the parent trace and uses its
+// authoritative (GEID, tick) as the call-enter/exit join key — so a native->nested
+// lookup lands on a genuine native event (closing N1 gap (b), the read-only cursor
+// having no native anchor). Confined to gdscript_ct_trace.cpp; inert & byte-
+// identical standalone (absent symbols -> no native event, join falls back to the
+// N1 sample path). Exercised end-to-end only under a live `ct-mcr record` on the
+// Linux substrate (N2 e2e runbook in GDScript-Recorder.milestones.org).
+//
 // Called from the native-call opcodes (OPCODE_CALL and OPCODE_CALL_METHOD_BIND*)
 // right AFTER the native method executed — the crossing where the parent native
 // MCR trace is the continuation of this GDScript step. Emits a `native-call` join

@@ -78,10 +78,12 @@
 #include <cstdlib>
 #include <mutex> // GF12: serialize the shared writer/encoder across worker threads
 
-// N1: dlsym(RTLD_DEFAULT, "ct_mcr_now") — weakly resolve the MCR interposer's
-// exported live-GEID reader at runtime, so the standalone engine neither links
-// nor depends on it (absent -> join-key emission is inert).
+// N1/N2: dlsym(RTLD_DEFAULT, "ct_mcr_now" / "ct_mcr_mark_span_*") — weakly
+// resolve the MCR interposer's exported context-reader and native-marker entry
+// points at runtime, so the standalone engine neither links nor depends on them
+// (absent -> join-key emission + native-anchor emission are inert).
 #include <dlfcn.h>
+#include <unistd.h> // getpid() — process-stable OTel trace id for the span markers
 
 // The CTFS writer's C header names a parameter `mutable`, which is a C++
 // keyword. Shim it out for this C++ translation unit (we never call that
@@ -335,8 +337,32 @@ struct CtMcrCoordinates {
 };
 typedef void (*CtMcrNowFn)(CtMcrCoordinates *);
 
+// N2: the MCR interposer's native-marker entry points (trace_context.nim,
+// exported as ct_mcr_mark_span_start / ct_mcr_mark_span_end). Calling these
+// ALLOCATES an authoritative native (GEID, tick) AND EMITS a real native event
+// (a span marker) into the parent MCR trace's ring — the native ANCHOR the
+// correlation record §5 / §6 says native->nested needs (a native event that
+// points AT the nested trace), which N1's read-only ct_mcr_now cursor could not
+// provide. Signature per trace_context.nim (OpenTelemetry-style span markers):
+//   int ct_mcr_mark_span_start(const char *traceIdHex/*32*/, const char *spanIdHex/*16*/,
+//                              const char *parentSpanIdHex/*16 or null*/,
+//                              const char *serviceName, CtMcrCoordinates *out);
+//   int ct_mcr_mark_span_end  (const char *traceIdHex, const char *spanIdHex,
+//                              const char *parentSpanIdHex, const char *serviceName,
+//                              uint64_t startGeid, CtMcrCoordinates *out);
+// The returned `out.geid` is the authoritative allocated GEID of the emitted
+// native event (with hasGeid/recordingAvailable set). NOTE: CtMcrCoordinates does
+// NOT surface the allocated per-thread TICK (it carries only wall/monotonic
+// clocks + geid), so tick fidelity (nested-trace-correlation.md §6 gap (a))
+// remains the monotonic-clock sample even on this authoritative path; the GEID is
+// fully authoritative and now backed by a real native anchor (gap (b) closed).
+typedef int (*CtMcrMarkSpanStartFn)(const char *, const char *, const char *, const char *, CtMcrCoordinates *);
+typedef int (*CtMcrMarkSpanEndFn)(const char *, const char *, const char *, const char *, uint64_t, CtMcrCoordinates *);
+
 static int g_ct_join_resolved = 0; // 0 unknown, -1 no source, 1 have a source
 static CtMcrNowFn g_ct_mcr_now = nullptr;
+static CtMcrMarkSpanStartFn g_ct_mark_span_start = nullptr; // N2 native anchor (weak)
+static CtMcrMarkSpanEndFn g_ct_mark_span_end = nullptr;     // N2 native anchor (weak)
 static bool g_ct_have_shim = false;
 static uint64_t g_ct_shim_geid = 0;
 static uint64_t g_ct_shim_tick = 0;
@@ -356,6 +382,12 @@ static void gdscript_ct_resolve_join_source() {
 		g_ct_mcr_now = (CtMcrNowFn)sym;
 		g_ct_join_resolved = 1;
 	}
+	// N2: the native-marker entry points, weakly (both present or both absent —
+	// they live in the same interposer dylib, so the enter/exit span stack stays
+	// balanced). Absent when standalone (macOS today) -> native-anchor emission is
+	// inert and the join keys fall back to the N1 sample path.
+	g_ct_mark_span_start = (CtMcrMarkSpanStartFn)dlsym(RTLD_DEFAULT, "ct_mcr_mark_span_start");
+	g_ct_mark_span_end = (CtMcrMarkSpanEndFn)dlsym(RTLD_DEFAULT, "ct_mcr_mark_span_end");
 	// 2. The env shim (also honored as a controlled override; the live interface
 	//    takes precedence when it yields a usable coordinate).
 	const char *g = getenv("CT_MCR_GEID");
@@ -398,12 +430,22 @@ static bool gdscript_ct_sample_join_key(uint64_t *out_geid, uint64_t *out_tick) 
 // lock is held. `site` is 0 call-enter / 1 call-exit / 2 native-call. INERT (no
 // event) when tracing is inactive, no step exists yet, or no parent context is
 // available (standalone -> byte-identical).
-static void gdscript_ct_emit_join_locked(int site) {
+//
+// `have_override` lets the caller supply an AUTHORITATIVE (geid, tick) sampled
+// from a native anchor it just emitted (N2 ct_mcr_mark_span_*), instead of the
+// read-only ct_mcr_now cursor / shim. When set, the join key is exactly the
+// native anchor's coordinate, so native->nested resolves to a REAL native event
+// (nested-trace-correlation.md §3.2), not just the sampled cursor.
+static void gdscript_ct_emit_join_locked(int site, bool have_override = false,
+		uint64_t ov_geid = 0, uint64_t ov_tick = 0) {
 	if (g_ct_disabled || !g_ct_writer || !g_ct_started) {
 		return;
 	}
 	uint64_t geid = 0, tick = 0;
-	if (!gdscript_ct_sample_join_key(&geid, &tick)) {
+	if (have_override) {
+		geid = ov_geid;
+		tick = ov_tick;
+	} else if (!gdscript_ct_sample_join_key(&geid, &tick)) {
 		return;
 	}
 	// step this join binds to: next_step_index() accounts for the pending step, so
@@ -428,6 +470,112 @@ static void gdscript_ct_emit_join_locked(int site) {
 			(unsigned long long)step, site_str, (unsigned long long)thread);
 	trace_writer_register_special_event(g_ct_writer, FFI_EVENT_TRACE_LOG_EVENT, meta, content);
 	g_ct_join_counter++;
+}
+
+// ---------------------------------------------------------------------------
+// N2: native-anchor span markers at the GDScriptFunction::call boundary.
+//
+// Closes N1 gap (b): where N1 only SAMPLED the parent's read-only cursor
+// (ct_mcr_now), N2 emits a REAL native event (an OTel-style span marker) into the
+// parent MCR trace at each GDScript frame's entry/exit via ct_mcr_mark_span_*.
+// The marker allocates an authoritative native GEID and IS a native event that a
+// native->nested lookup can land on — the co-located native anchor for the
+// GDScript call. Its returned GEID becomes the call-enter / call-exit join key
+// (passed as the emit override) so the two traces share the same authoritative
+// coordinate at that boundary.
+//
+// INERT STANDALONE: on a build with no MCR interposer loaded (macOS today, or any
+// standalone run) dlsym yields null for both symbols, the span stack is never
+// touched, and nothing is emitted on either side — the nested .ct stays
+// byte-identical and the join keys fall back to the N1 sample path. The real
+// native-marker effect is exercised under a live `ct-mcr record` on the Linux
+// substrate (N2 e2e — see GDScript-Recorder.milestones.org N2 runbook).
+struct CtNativeSpanFrame {
+	uint64_t start_geid; // authoritative GEID the matching mark_span_end links to
+	char span_id[17];    // 16 hex chars + NUL — this frame's OTel span id
+	bool used;           // true iff mark_span_start actually emitted a native event
+};
+// Per-thread span nesting stack (LIFO, mirrors GDScriptFunction::call nesting on
+// that thread). thread_local keeps pairing correct even though the emit lock
+// serialises threads.
+static thread_local CtNativeSpanFrame g_ct_span_stack[256];
+static thread_local int g_ct_span_depth = 0;
+static thread_local uint64_t g_ct_span_counter = 0;
+
+// The process-stable 32-hex-char OTel trace id (all this engine's GDScript span
+// markers share one trace id; computed once from the pid).
+static const char *gdscript_ct_trace_id_hex() {
+	static char trace_id[33];
+	static bool ready = false;
+	if (!ready) {
+		// Two u64 halves => exactly 32 hex chars. A fixed high tag + the pid keeps
+		// it well-formed and stable for this process.
+		snprintf(trace_id, sizeof(trace_id), "%016llx%016llx",
+				(unsigned long long)0xC0DE772ACE900001ULL,
+				(unsigned long long)getpid());
+		ready = true;
+	}
+	return trace_id;
+}
+
+// Emit the native span-start anchor for the frame just entered. Returns true and
+// fills *out_geid/*out_tick with the authoritative native coordinate when the
+// marker was emitted; false (no override) when the native-marker interface is
+// absent (standalone) or the marker did not emit. ASSUMES the emit lock is held.
+static bool gdscript_ct_native_span_enter(uint64_t *out_geid, uint64_t *out_tick) {
+	gdscript_ct_resolve_join_source();
+	if (!g_ct_mark_span_start || !g_ct_mark_span_end) {
+		return false; // no native-anchor path — leave the span stack untouched (inert).
+	}
+	if (g_ct_span_depth >= (int)(sizeof(g_ct_span_stack) / sizeof(g_ct_span_stack[0]))) {
+		return false; // pathological recursion depth — skip the anchor, stay balanced-safe.
+	}
+	CtNativeSpanFrame &frame = g_ct_span_stack[g_ct_span_depth];
+	frame.used = false;
+	frame.start_geid = 0;
+	// This frame's span id: (thread << 40) ^ counter, formatted as 16 hex.
+	uint64_t span_val = (gdscript_ct_current_thread() << 40) ^ (g_ct_span_counter + 1);
+	g_ct_span_counter++;
+	snprintf(frame.span_id, sizeof(frame.span_id), "%016llx", (unsigned long long)span_val);
+	// Parent span = the enclosing frame's span id (null at the outermost frame).
+	const char *parent = (g_ct_span_depth > 0) ? g_ct_span_stack[g_ct_span_depth - 1].span_id : nullptr;
+	g_ct_span_depth++; // push BEFORE emitting so a re-entrant emit sees the right parent.
+
+	CtMcrCoordinates coords = {};
+	int rc = g_ct_mark_span_start(gdscript_ct_trace_id_hex(), frame.span_id, parent, "gdscript", &coords);
+	if (rc == 1 && coords.hasGeid && coords.recordingAvailable) {
+		frame.used = true;
+		frame.start_geid = coords.geid;
+		*out_geid = coords.geid;
+		*out_tick = (uint64_t)coords.monotonicTimeNs; // tick fidelity: §6 gap (a)
+		return true;
+	}
+	return false;
+}
+
+// Emit the native span-end anchor for the frame being exited, matching the most
+// recent gdscript_ct_native_span_enter on this thread. Returns true + the
+// authoritative end coordinate when emitted. ASSUMES the emit lock is held.
+static bool gdscript_ct_native_span_exit(uint64_t *out_geid, uint64_t *out_tick) {
+	gdscript_ct_resolve_join_source();
+	if (!g_ct_mark_span_start || !g_ct_mark_span_end || g_ct_span_depth <= 0) {
+		return false; // inert / no matching push.
+	}
+	g_ct_span_depth--; // pop
+	CtNativeSpanFrame &frame = g_ct_span_stack[g_ct_span_depth];
+	if (!frame.used) {
+		return false; // the matching start did not emit a native anchor.
+	}
+	const char *parent = (g_ct_span_depth > 0) ? g_ct_span_stack[g_ct_span_depth - 1].span_id : nullptr;
+	CtMcrCoordinates coords = {};
+	int rc = g_ct_mark_span_end(gdscript_ct_trace_id_hex(), frame.span_id, parent, "gdscript",
+			frame.start_geid, &coords);
+	if (rc == 1 && coords.hasGeid && coords.recordingAvailable) {
+		*out_geid = coords.geid;
+		*out_tick = (uint64_t)coords.monotonicTimeNs;
+		return true;
+	}
+	return false;
 }
 
 bool gdscript_ct_trace_active() {
@@ -639,9 +787,15 @@ void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source
 	size_t fid = trace_writer_ensure_function_id(g_ct_writer,
 			name_cs.get_data(), src_cs.get_data(), p_line);
 	trace_writer_register_call(g_ct_writer, fid);
-	// N1: tag this GDScript frame's entry with the parent native (GEID, tick).
+	// N2: emit a NATIVE span-start anchor for this GDScript frame (a real native
+	// event in the parent MCR trace) and use its authoritative (GEID, tick) as the
+	// call-enter join key. Falls back to the N1 sample path when the native-marker
+	// interface is absent (standalone -> inert, nothing emitted on either side).
+	uint64_t a_geid = 0, a_tick = 0;
+	bool anchored = gdscript_ct_native_span_enter(&a_geid, &a_tick);
+	// N1/N2: tag this GDScript frame's entry with the parent native (GEID, tick).
 	// Inert (nothing emitted) standalone or before the first step exists.
-	gdscript_ct_emit_join_locked(0 /* call-enter */);
+	gdscript_ct_emit_join_locked(0 /* call-enter */, anchored, a_geid, a_tick);
 }
 
 // GF5: forward declarations — the return hook (below) reuses the recursive
@@ -663,11 +817,18 @@ void gdscript_ct_trace_return(const Variant &p_return_value) {
 	// reliably even under interleaving.
 	gdscript_ct_note_thread_locked(gdscript_ct_current_thread());
 
-	// N1: tag this GDScript frame's exit with the parent native (GEID, tick),
+	// N2: emit the matching NATIVE span-end anchor for this frame (the native event
+	// the parent MCR trace closes the frame's span with) and use its authoritative
+	// (GEID, tick) as the call-exit join key. Balanced with the span-start pushed by
+	// the matching gdscript_ct_trace_call (per-thread LIFO stack). Inert / sample
+	// fallback when the native-marker interface is absent.
+	uint64_t x_geid = 0, x_tick = 0;
+	bool x_anchored = gdscript_ct_native_span_exit(&x_geid, &x_tick);
+	// N1/N2: tag this GDScript frame's exit with the parent native (GEID, tick),
 	// on BOTH exit paths (normal + await-resume). Emitted before the return record
 	// (order is irrelevant — the join binds to the current step, not the return).
 	// Inert (nothing emitted) standalone or before the first step exists.
-	gdscript_ct_emit_join_locked(1 /* call-exit */);
+	gdscript_ct_emit_join_locked(1 /* call-exit */, x_anchored, x_geid, x_tick);
 
 	// GF5: capture the return VALUE. Encode it with the same recursive
 	// ct_value_* encoder G4/GF3/GF4 use for locals, then attach it to the
