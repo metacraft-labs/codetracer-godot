@@ -141,4 +141,34 @@ void gdscript_ct_trace_await_suspend(const void *call_state);
 // the suspend step, as the ContinuationLink model requires.
 void gdscript_ct_trace_await_resume(const void *call_state);
 
+// GF13: diagnostics. GDScript has NO exceptions (there is no try/catch to
+// record); push_error / push_warning are the diagnostic surface. They are native
+// CORE Variant utility functions (variant_utility.cpp), vararg, so the compiler
+// emits them as OPCODE_CALL_UTILITY (never the validated form) — the seam this
+// hook is called from, right after Variant::call_utility_function runs. When
+// `function` is push_error or push_warning, the diagnostic is recorded as an
+// events.dat SPECIAL EVENT (the same channel GF10's async markers use — NOT an
+// invented exception model) carrying the joined vararg message (mirroring the
+// engine's own join_string). The multi-stream writer maps the FfiEventLogKind to
+// an IOEventKind, so `ct-print --full` renders them as two DISTINCT io kinds:
+//   push_error   -> FFI_EVENT_ERROR          (io_kind ioError)
+//   push_warning -> FFI_EVENT_TRACE_LOG_EVENT (io_kind ioStderr)
+// The diagnostic LEVEL is additionally tagged in the event METADATA
+// ("ct-push-error" / "ct-push-warning") for a real event-log pane, though
+// ct-print does not surface multi-stream io metadata (the io_kind + message
+// already distinguish warning from error). The message is the event `content`
+// (surfaced as the io event's `text`).
+// The event binds to the current step (the push_* call site's own OPCODE_LINE
+// step). Any OTHER utility function (print, str, typeof, ...) is ignored, so the
+// step/value/call streams of programs that call no diagnostics are byte-identical
+// to GF12. No-op (cheap) when tracing is inactive.
+//
+// `assert` needs NO hook: an `assert(cond, msg)` statement occupies its own
+// source line, so its OPCODE_LINE already records it as an ordinary step (a
+// passing assert is a no-op step and execution continues); a FAILING assert
+// halts the VM in a debug build (OPCODE_BREAK), and the atexit flush still
+// serializes whatever was recorded up to the assert line.
+void gdscript_ct_trace_utility_diagnostic(const StringName &function,
+		const Variant **args, int argc);
+
 #endif // GDSCRIPT_CT_TRACE_H

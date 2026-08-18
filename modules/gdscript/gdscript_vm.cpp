@@ -2446,6 +2446,11 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				Callable::CallError err;
 				Variant::call_utility_function(function, dst, (const Variant **)argptrs, argc, err);
 
+				// CodeTracer GF13: record push_error / push_warning (GDScript's
+				// only diagnostic surface — it has no exceptions) as an events.dat
+				// special event; every other utility call is ignored.
+				gdscript_ct_trace_utility_diagnostic(function, (const Variant **)argptrs, argc);
+
 #ifdef DEBUG_ENABLED
 				if (err.error != Callable::CallError::CALL_OK) {
 					String methodstr = function;

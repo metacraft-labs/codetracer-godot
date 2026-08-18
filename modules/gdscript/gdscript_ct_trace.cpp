@@ -434,6 +434,57 @@ void gdscript_ct_trace_await_resume(const void *p_call_state) {
 	g_ct_pending_resume_ctx = (uintptr_t)p_call_state;
 }
 
+// GF13: metadata tags distinguishing a warning from an error diagnostic. The
+// wire format has no dedicated Warning kind, so push_warning rides the neutral
+// FFI_EVENT_TRACE_LOG_EVENT kind and carries its level in the event metadata for
+// a real event-log pane. (`ct-print --full` does not surface multi-stream io
+// metadata, but it DOES render the two events with distinct io kinds — ioError
+// vs ioStderr — and the message text, which already distinguish them.)
+static const char *CT_PUSH_ERROR_TAG = "ct-push-error";
+static const char *CT_PUSH_WARNING_TAG = "ct-push-warning";
+
+void gdscript_ct_trace_utility_diagnostic(const StringName &p_function,
+		const Variant **p_args, int p_argc) {
+	// Cheap name reject BEFORE taking the lock: OPCODE_CALL_UTILITY fires for
+	// every core utility call (print, str, typeof, ...), but only the two
+	// diagnostic functions are recorded. StringName == is an O(1) compare.
+	static const StringName s_push_error = StringName("push_error");
+	static const StringName s_push_warning = StringName("push_warning");
+	const bool is_error = (p_function == s_push_error);
+	const bool is_warning = (p_function == s_push_warning);
+	if (!is_error && !is_warning) {
+		return;
+	}
+
+	CtEmitLock lk; // GF12: serialize + reentrancy-guard the emit path
+	if (!lk.engaged) {
+		return;
+	}
+	// A diagnostic only makes sense once a step exists to anchor it to (the
+	// push_* call site's own OPCODE_LINE step); mirrors the async-marker guard.
+	if (g_ct_disabled || !g_ct_writer || !g_ct_started) {
+		return;
+	}
+
+	// Join the vararg args into one message exactly as the engine does
+	// (VariantUtilityFunctions::push_error/push_warning call join_string over
+	// all args), so the recorded message matches what the program logged.
+	String message;
+	for (int i = 0; i < p_argc; i++) {
+		if (p_args[i]) {
+			message += p_args[i]->operator String();
+		}
+	}
+	CharString msg_cs = message.utf8();
+	const char *tag = is_error ? CT_PUSH_ERROR_TAG : CT_PUSH_WARNING_TAG;
+	// push_error -> FFI_EVENT_ERROR (io_kind ioError); push_warning ->
+	// FFI_EVENT_TRACE_LOG_EVENT (io_kind ioStderr) — two distinct io kinds.
+	const int kind = is_error ? FFI_EVENT_ERROR : FFI_EVENT_TRACE_LOG_EVENT;
+	// content == the message (surfaced by the reader as the io event's `text`);
+	// metadata == the level tag (for a real event-log pane; not surfaced by ct-print).
+	trace_writer_register_special_event(g_ct_writer, kind, tag, msg_cs.get_data());
+}
+
 void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source, int64_t p_line) {
 	CtEmitLock lk; // GF12: serialize + reentrancy-guard
 	if (!lk.engaged) {
