@@ -1,6 +1,7 @@
 /**************************************************************************/
 /*  gdscript_ct_trace.cpp — CodeTracer GDScript recorder                  */
-/*  (G2 steps, G3 calls/returns, G4 values, GF3 collections)             */
+/*  (G2 steps, G3 calls/returns, G4 values, GF3 collections,             */
+/*   GF4 math/struct/handle Variant types)                               */
 /**************************************************************************/
 // LINKS the existing CTFS writer (libcodetracer_trace_writer.a); does NOT
 // reimplement the format.
@@ -38,6 +39,30 @@
 #include "core/variant/dictionary.h"
 #include "core/variant/variant.h"
 #include "gdscript_function.h"
+
+// GF4: math / struct / handle Variant types. Most are pulled in transitively by
+// variant.h (it holds a union of every math type), but we include them
+// explicitly so this TU is self-documenting about what it encodes.
+#include "core/math/aabb.h"
+#include "core/math/basis.h"
+#include "core/math/color.h"
+#include "core/math/plane.h"
+#include "core/math/projection.h"
+#include "core/math/quaternion.h"
+#include "core/math/rect2.h"
+#include "core/math/rect2i.h"
+#include "core/math/transform_2d.h"
+#include "core/math/transform_3d.h"
+#include "core/math/vector2.h"
+#include "core/math/vector2i.h"
+#include "core/math/vector3.h"
+#include "core/math/vector3i.h"
+#include "core/math/vector4.h"
+#include "core/math/vector4i.h"
+#include "core/object/object.h"
+#include "core/string/node_path.h"
+#include "core/templates/rid.h"
+#include "core/variant/callable.h" // also declares Signal
 
 #include <cstdlib>
 
@@ -244,6 +269,208 @@ static void gdscript_ct_write_raw(const Variant &value) {
 		ct_value_end_compound(g_ct_encoder);                                   \
 	} while (0)
 
+// GF4: intern a Struct type lazily by name. Idempotent (the writer's type
+// registry dedups on kind+name), and — crucially for the lazy-interning
+// discipline GF3 established — this is ONLY reached when a struct/handle value
+// is actually encoded, so a scalar-only recording never registers any of these
+// and its types table stays byte-identical to G4/GF1/GF2 ([None, Int, Float,
+// Bool, String, Variant]). The C-ABI type registry stores only kind + a lang
+// type name (TypeSpecificInfo is None); it has NO per-field-name registration,
+// and the streaming CBOR encoder's ct_value_begin_struct writes only positional
+// field_values + a type_id (no field_names). So GF4 encodes each Godot math
+// type as a Struct of the SAME kind the db-backend's ValueRecord::Struct
+// expects, with one registered Struct type per Godot type (the type name, e.g.
+// "Vector3", is what distinguishes it and surfaces in ct-print's per-var
+// type_name); field NAMES are conveyed positionally by that per-type canonical
+// order (documented in scripts/EXPECTED-GF4.md), because the C-ABI exposes no
+// way to attach literal field names without extending
+// libcodetracer_trace_writer.a (out of scope for a modules/gdscript-confined
+// change).
+static inline uint64_t gct_stype(const char *name) {
+	return trace_writer_ensure_type_id(g_ct_writer, FFI_TYPE_STRUCT, name);
+}
+
+// GF4: scalar field writers (the struct field values recurse through the SAME
+// scalar path G4 established, so Int/Float/String type ids stay shared).
+static inline void gct_f(double v) {
+	ct_value_write_float(g_ct_encoder, v, g_ct_type_float);
+}
+static inline void gct_i(int64_t v) {
+	ct_value_write_int(g_ct_encoder, v, g_ct_type_int);
+}
+static inline void gct_str(const String &v) {
+	CharString cs = v.utf8();
+	ct_value_write_string(g_ct_encoder,
+			(const uint8_t *)cs.get_data(), (size_t)cs.length(), g_ct_type_string);
+}
+
+// GF4: float-vector structs (x,y[,z[,w]]) and their integer variants.
+static void gct_vec2(const Vector2 &v) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Vector2"), 2);
+	gct_f(v.x);
+	gct_f(v.y);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_vec2i(const Vector2i &v) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Vector2i"), 2);
+	gct_i(v.x);
+	gct_i(v.y);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_vec3(const Vector3 &v) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Vector3"), 3);
+	gct_f(v.x);
+	gct_f(v.y);
+	gct_f(v.z);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_vec3i(const Vector3i &v) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Vector3i"), 3);
+	gct_i(v.x);
+	gct_i(v.y);
+	gct_i(v.z);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_vec4(const Vector4 &v) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Vector4"), 4);
+	gct_f(v.x);
+	gct_f(v.y);
+	gct_f(v.z);
+	gct_f(v.w);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_vec4i(const Vector4i &v) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Vector4i"), 4);
+	gct_i(v.x);
+	gct_i(v.y);
+	gct_i(v.z);
+	gct_i(v.w);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_color(const Color &c) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Color"), 4);
+	gct_f(c.r);
+	gct_f(c.g);
+	gct_f(c.b);
+	gct_f(c.a);
+	ct_value_end_compound(g_ct_encoder);
+}
+// GF4: composite structs whose fields are themselves structs (encoded as nested
+// Structs, mirroring how GF3 nests collections).
+static void gct_rect2(const Rect2 &r) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Rect2"), 2); // position, size
+	gct_vec2(r.position);
+	gct_vec2(r.size);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_rect2i(const Rect2i &r) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Rect2i"), 2); // position, size
+	gct_vec2i(r.position);
+	gct_vec2i(r.size);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_plane(const Plane &p) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Plane"), 2); // normal, d
+	gct_vec3(p.normal);
+	gct_f(p.d);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_quat(const Quaternion &q) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Quaternion"), 4);
+	gct_f(q.x);
+	gct_f(q.y);
+	gct_f(q.z);
+	gct_f(q.w);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_aabb(const AABB &a) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("AABB"), 2); // position, size
+	gct_vec3(a.position);
+	gct_vec3(a.size);
+	ct_value_end_compound(g_ct_encoder);
+}
+// Basis: three Vector3 fields named x,y,z. Godot stores the matrix as `rows`;
+// we emit the rows in order (for a diagonal/scale basis rows == columns, which
+// is what the GF4 fixture uses, so the row-vs-column distinction is moot there).
+static void gct_basis(const Basis &b) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Basis"), 3); // x, y, z (rows)
+	gct_vec3(b.rows[0]);
+	gct_vec3(b.rows[1]);
+	gct_vec3(b.rows[2]);
+	ct_value_end_compound(g_ct_encoder);
+}
+// Transform2D: two basis columns (x, y) + origin, matching GDScript's t.x/t.y/
+// t.origin accessors (columns[0], columns[1], columns[2]).
+static void gct_xform2d(const Transform2D &t) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Transform2D"), 3); // x, y, origin
+	gct_vec2(t.columns[0]);
+	gct_vec2(t.columns[1]);
+	gct_vec2(t.columns[2]);
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_xform3d(const Transform3D &t) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Transform3D"), 2); // basis, origin
+	gct_basis(t.basis);
+	gct_vec3(t.origin);
+	ct_value_end_compound(g_ct_encoder);
+}
+// Projection: four Vector4 columns (x, y, z, w), matching GDScript's p.x..p.w.
+static void gct_projection(const Projection &p) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Projection"), 4);
+	gct_vec4(p.columns[0]);
+	gct_vec4(p.columns[1]);
+	gct_vec4(p.columns[2]);
+	gct_vec4(p.columns[3]);
+	ct_value_end_compound(g_ct_encoder);
+}
+
+// GF4: handle / reference types. Deep or cyclic object graphs are OUT OF SCOPE:
+// OBJECT/RefCounted is a FAITHFUL SHALLOW representation — class name + instance
+// id only, NO property walk — so it cannot recurse into another object and no
+// visited-guard is needed (the encoder emits two scalars and stops). RID, Callable
+// and Signal are small Structs carrying the identifying handle (id / method name /
+// signal name); the nondeterministic object/instance ids they also carry are
+// deliberately NOT emitted (Callable/Signal) so the encoding is deterministic.
+static void gct_rid(const RID &r) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("RID"), 1); // id
+	gct_i((int64_t)r.get_id());
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_callable(const Callable &c) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Callable"), 1); // method
+	gct_str(String(c.get_method()));
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_signal(const Signal &s) {
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Signal"), 1); // name
+	gct_str(String(s.get_name()));
+	ct_value_end_compound(g_ct_encoder);
+}
+static void gct_object(Object *o) {
+	if (!o) {
+		ct_value_write_none_typed(g_ct_encoder, g_ct_type_none);
+		return;
+	}
+	ct_value_begin_struct(g_ct_encoder, gct_stype("Object"), 2); // class, id
+	gct_str(o->get_class());
+	gct_i((int64_t)(uint64_t)o->get_instance_id());
+	ct_value_end_compound(g_ct_encoder);
+}
+
+// GF4: encode a packed struct-array (PackedVector2/3/4Array, PackedColorArray)
+// as a Sequence of the matching per-element Struct — picking up the GF3 Raw
+// deferrals now that the struct element encoders exist.
+#define CT_ENCODE_PACKED_STRUCT_SEQ(m_packed_type, m_elem_encode)                \
+	do {                                                                        \
+		const m_packed_type _a = value.operator m_packed_type();               \
+		const int _n = _a.size();                                              \
+		ct_value_begin_sequence(g_ct_encoder, g_ct_type_seq, _n);              \
+		for (int _i = 0; _i < _n; _i++) {                                      \
+			m_elem_encode(_a[_i]);                                             \
+		}                                                                     \
+		ct_value_end_compound(g_ct_encoder);                                   \
+	} while (0)
+
 // GF3: recursively encode `value` into the reused CBOR encoder.
 //   - scalars (int/float/bool/String/null)  -> written directly (G4).
 //   - ARRAY (untyped) and typed Array[T]     -> Sequence of encoded elements.
@@ -251,9 +478,18 @@ static void gdscript_ct_write_raw(const Variant &value) {
 //     matching scalar.
 //   - DICTIONARY (untyped) and typed Dictionary[K,V] -> Sequence of key/value
 //     Tuples (the Python/Ruby dict pattern).
-//   - everything else (Vector*/Color/Transform*/Object/Callable/Packed vector &
-//     color arrays ...) -> Raw printed form (milestone GF4).
+//   - GF4 math/struct types (Vector2/2i/3/3i/4/4i, Rect2/2i, Transform2D/3D,
+//     Basis, Quaternion, AABB, Plane, Color, Projection) -> named-field Struct
+//     (one registered Struct type per Godot type; nested struct fields nest).
+//   - GF4 handle/string types: STRING_NAME/NODE_PATH -> String; RID/Callable/
+//     Signal/Object(RefCounted) -> shallow Struct.
+//   - PACKED_VECTOR2/3/4_ARRAY, PACKED_COLOR_ARRAY -> Sequence of the matching
+//     struct element (the GF3 Raw deferrals, now supported).
+//   - anything still unhandled -> Raw printed form.
 // `depth` bounds nesting; at the cap a still-nesting collection degrades to Raw.
+// Math structs are finitely bounded (deepest is Transform3D -> Basis -> Vector3)
+// and objects are shallow (no property walk), so they cannot recurse without
+// bound and are encoded regardless of `depth`.
 static void gdscript_ct_encode_variant_rec(const Variant &value, int depth) {
 	switch (value.get_type()) {
 		case Variant::NIL:
@@ -347,13 +583,102 @@ static void gdscript_ct_encode_variant_rec(const Variant &value, int depth) {
 			ct_value_end_compound(g_ct_encoder);
 			return;
 		}
+		// GF4: string/handle types that map to a plain String.
+		case Variant::NODE_PATH: {
+			const NodePath np = value.operator NodePath();
+			gct_str(String(np));
+			return;
+		}
+		// GF4: math / struct types -> named-field Struct (one type per Godot
+		// type). Interns its Struct type lazily via gct_stype on first use.
+		case Variant::VECTOR2:
+			gct_vec2(value.operator Vector2());
+			return;
+		case Variant::VECTOR2I:
+			gct_vec2i(value.operator Vector2i());
+			return;
+		case Variant::VECTOR3:
+			gct_vec3(value.operator Vector3());
+			return;
+		case Variant::VECTOR3I:
+			gct_vec3i(value.operator Vector3i());
+			return;
+		case Variant::VECTOR4:
+			gct_vec4(value.operator Vector4());
+			return;
+		case Variant::VECTOR4I:
+			gct_vec4i(value.operator Vector4i());
+			return;
+		case Variant::RECT2:
+			gct_rect2(value.operator Rect2());
+			return;
+		case Variant::RECT2I:
+			gct_rect2i(value.operator Rect2i());
+			return;
+		case Variant::PLANE:
+			gct_plane(value.operator Plane());
+			return;
+		case Variant::QUATERNION:
+			gct_quat(value.operator Quaternion());
+			return;
+		case Variant::AABB:
+			gct_aabb(value.operator ::AABB());
+			return;
+		case Variant::BASIS:
+			gct_basis(value.operator Basis());
+			return;
+		case Variant::TRANSFORM2D:
+			gct_xform2d(value.operator Transform2D());
+			return;
+		case Variant::TRANSFORM3D:
+			gct_xform3d(value.operator Transform3D());
+			return;
+		case Variant::PROJECTION:
+			gct_projection(value.operator Projection());
+			return;
+		case Variant::COLOR:
+			gct_color(value.operator Color());
+			return;
+		// GF4: handle types -> shallow Struct.
+		case Variant::RID:
+			gct_rid(value.operator ::RID());
+			return;
+		case Variant::CALLABLE:
+			gct_callable(value.operator Callable());
+			return;
+		case Variant::SIGNAL:
+			gct_signal(value.operator Signal());
+			return;
+		case Variant::OBJECT:
+			gct_object(value.operator Object *());
+			return;
+		// GF4: packed struct-arrays -> Sequence of struct elements (GF3 Raw
+		// deferrals, now supported).
+		case Variant::PACKED_VECTOR2_ARRAY:
+			gdscript_ct_ensure_collection_types();
+			CT_ENCODE_PACKED_STRUCT_SEQ(PackedVector2Array, gct_vec2);
+			return;
+		case Variant::PACKED_VECTOR3_ARRAY:
+			gdscript_ct_ensure_collection_types();
+			CT_ENCODE_PACKED_STRUCT_SEQ(PackedVector3Array, gct_vec3);
+			return;
+		case Variant::PACKED_VECTOR4_ARRAY:
+			gdscript_ct_ensure_collection_types();
+			CT_ENCODE_PACKED_STRUCT_SEQ(PackedVector4Array, gct_vec4);
+			return;
+		case Variant::PACKED_COLOR_ARRAY:
+			gdscript_ct_ensure_collection_types();
+			CT_ENCODE_PACKED_STRUCT_SEQ(PackedColorArray, gct_color);
+			return;
 		default:
-			// GF4: Vector*/Color/Transform*/Object/Callable/Packed vector &
-			// color arrays / etc. remain Raw printed form for now.
+			// Anything still unhandled remains the Raw printed form (bounded by
+			// Godot's recursion-guarded Variant->String).
 			gdscript_ct_write_raw(value);
 			return;
 	}
 }
+
+#undef CT_ENCODE_PACKED_STRUCT_SEQ
 
 #undef CT_ENCODE_PACKED_SEQ
 
