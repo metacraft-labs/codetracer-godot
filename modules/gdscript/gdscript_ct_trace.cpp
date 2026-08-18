@@ -1,6 +1,6 @@
 /**************************************************************************/
 /*  gdscript_ct_trace.cpp — CodeTracer GDScript recorder                  */
-/*  (G2 steps, G3 calls/returns, G4 values)                               */
+/*  (G2 steps, G3 calls/returns, G4 values, GF3 collections)             */
 /**************************************************************************/
 // LINKS the existing CTFS writer (libcodetracer_trace_writer.a); does NOT
 // reimplement the format.
@@ -34,6 +34,8 @@
 #include "gdscript_ct_trace.h"
 
 #include "core/string/ustring.h"
+#include "core/variant/array.h"
+#include "core/variant/dictionary.h"
 #include "core/variant/variant.h"
 #include "gdscript_function.h"
 
@@ -61,7 +63,26 @@ static uint64_t g_ct_type_float = 0;
 static uint64_t g_ct_type_bool = 0;
 static uint64_t g_ct_type_string = 0;
 static uint64_t g_ct_type_raw = 0;
+// GF3: compound-collection types. Arrays and Packed*Arrays encode as a
+// `Sequence` ("Array"); Dictionaries encode as a `Sequence` ("Dictionary") of
+// key/value `Tuple`s ("Pair") — the Python/Ruby dict pattern (mirrors the Ruby
+// recorder's Hash -> Seq-of-Pair encoding in
+// codetracer-ruby-recorder .../native_tracer/src/lib.rs).
+static uint64_t g_ct_type_seq = 0;
+static uint64_t g_ct_type_dict = 0;
+static uint64_t g_ct_type_pair = 0;
 static bool g_ct_types_ready = false;
+// GF3: the compound-collection types are interned LAZILY, on first encounter of
+// a collection, so a scalar-only recording's types table is byte-identical to
+// G4/GF1/GF2 (it never gains Array/Dictionary/Pair). Mirrors the Ruby recorder's
+// inline ensure_type_id.
+static bool g_ct_coll_types_ready = false;
+
+// GF3: recursion cap for nested collections. Mirrors the Ruby recorder's
+// MAX_STREAMING_DEPTH intent — a sane bound so a cyclic Array/Dictionary
+// reference cannot recurse forever. Beyond the cap we fall back to the Raw
+// printed form (bounded by Godot's own recursion-guarded Variant->String).
+static const int CT_MAX_VALUE_DEPTH = 8;
 
 // Cached CT_GDSCRIPT_TRACE presence (env is read once).
 static int g_ct_active = -1; // -1 unknown, 0 inactive, 1 active
@@ -185,39 +206,160 @@ void gdscript_ct_trace_return() {
 	trace_writer_register_return(g_ct_writer);
 }
 
-// G4: encode `value` into the reused CBOR encoder. Only the common scalar and
-// String cases are done here (G4 scope: int/float/bool/String/null); every
-// other Variant type falls through to a Raw (printed) value, which is the
-// clean extension point milestone GF4 replaces with the full type matrix
-// (Vector*/Color/Transform*/Array/Dictionary/Object/Packed* ...).
-static void gdscript_ct_encode_variant(const Variant &value) {
-	ct_value_encoder_reset(g_ct_encoder);
+// GF3: intern the compound-collection types on first use. Kept out of
+// gdscript_ct_ensure_types so a scalar-only recording never registers them and
+// its types table stays byte-identical to G4/GF1/GF2. The scalar types (incl.
+// None at TypeId(0)) are already interned by gdscript_ct_ensure_types before any
+// value is encoded, so these land after them: Array (Seq), Dictionary (Seq),
+// Pair (Tuple).
+static void gdscript_ct_ensure_collection_types() {
+	if (likely(g_ct_coll_types_ready)) {
+		return;
+	}
+	g_ct_type_seq = trace_writer_ensure_type_id(g_ct_writer, FFI_TYPE_SEQ, "Array");
+	g_ct_type_dict = trace_writer_ensure_type_id(g_ct_writer, FFI_TYPE_SEQ, "Dictionary");
+	g_ct_type_pair = trace_writer_ensure_type_id(g_ct_writer, FFI_TYPE_TUPLE, "Pair");
+	g_ct_coll_types_ready = true;
+}
+
+// GF4 extension point: encode any still-unsupported Variant type as a Raw
+// (printed) value. Godot's Variant->String is recursion-guarded, so this is
+// bounded even for cyclic collections reached past the depth cap.
+static void gdscript_ct_write_raw(const Variant &value) {
+	CharString s = value.operator String().utf8();
+	ct_value_write_raw(g_ct_encoder,
+			(const uint8_t *)s.get_data(), (size_t)s.length(), g_ct_type_raw);
+}
+
+// GF3: encode a packed scalar array as a `Sequence` of a fixed element writer.
+// Packed*Array elements are always scalars, so no recursion (depth) is needed.
+#define CT_ENCODE_PACKED_SEQ(m_packed_type, m_elem_write)                        \
+	do {                                                                        \
+		const m_packed_type _a = value.operator m_packed_type();               \
+		const int _n = _a.size();                                              \
+		ct_value_begin_sequence(g_ct_encoder, g_ct_type_seq, _n);              \
+		for (int _i = 0; _i < _n; _i++) {                                      \
+			m_elem_write;                                                      \
+		}                                                                     \
+		ct_value_end_compound(g_ct_encoder);                                   \
+	} while (0)
+
+// GF3: recursively encode `value` into the reused CBOR encoder.
+//   - scalars (int/float/bool/String/null)  -> written directly (G4).
+//   - ARRAY (untyped) and typed Array[T]     -> Sequence of encoded elements.
+//   - PACKED_{BYTE,INT32,INT64,FLOAT32,FLOAT64,STRING}_ARRAY -> Sequence of the
+//     matching scalar.
+//   - DICTIONARY (untyped) and typed Dictionary[K,V] -> Sequence of key/value
+//     Tuples (the Python/Ruby dict pattern).
+//   - everything else (Vector*/Color/Transform*/Object/Callable/Packed vector &
+//     color arrays ...) -> Raw printed form (milestone GF4).
+// `depth` bounds nesting; at the cap a still-nesting collection degrades to Raw.
+static void gdscript_ct_encode_variant_rec(const Variant &value, int depth) {
 	switch (value.get_type()) {
-		case Variant::NIL: {
+		case Variant::NIL:
 			ct_value_write_none_typed(g_ct_encoder, g_ct_type_none);
-		} break;
-		case Variant::BOOL: {
+			return;
+		case Variant::BOOL:
 			ct_value_write_bool_typed(g_ct_encoder, (bool)value ? 1 : 0, g_ct_type_bool);
-		} break;
-		case Variant::INT: {
+			return;
+		case Variant::INT:
 			ct_value_write_int(g_ct_encoder, (int64_t)value, g_ct_type_int);
-		} break;
-		case Variant::FLOAT: {
+			return;
+		case Variant::FLOAT:
 			ct_value_write_float(g_ct_encoder, (double)value, g_ct_type_float);
-		} break;
+			return;
 		case Variant::STRING:
 		case Variant::STRING_NAME: {
 			CharString s = String(value).utf8();
 			ct_value_write_string(g_ct_encoder,
 					(const uint8_t *)s.get_data(), (size_t)s.length(), g_ct_type_string);
-		} break;
-		default: {
-			// GF4 extension point: everything else is a Raw printed form for now.
-			CharString s = value.operator String().utf8();
-			ct_value_write_raw(g_ct_encoder,
-					(const uint8_t *)s.get_data(), (size_t)s.length(), g_ct_type_raw);
-		} break;
+			return;
+		}
+		case Variant::ARRAY: {
+			// Untyped Array and typed Array[T] are both Variant::ARRAY.
+			if (depth <= 0) {
+				gdscript_ct_write_raw(value);
+				return;
+			}
+			gdscript_ct_ensure_collection_types();
+			const Array arr = value.operator Array();
+			const int n = arr.size();
+			ct_value_begin_sequence(g_ct_encoder, g_ct_type_seq, n);
+			for (int i = 0; i < n; i++) {
+				gdscript_ct_encode_variant_rec(arr[i], depth - 1);
+			}
+			ct_value_end_compound(g_ct_encoder);
+			return;
+		}
+		case Variant::PACKED_BYTE_ARRAY:
+			gdscript_ct_ensure_collection_types();
+			CT_ENCODE_PACKED_SEQ(PackedByteArray,
+					ct_value_write_int(g_ct_encoder, (int64_t)_a[_i], g_ct_type_int));
+			return;
+		case Variant::PACKED_INT32_ARRAY:
+			gdscript_ct_ensure_collection_types();
+			CT_ENCODE_PACKED_SEQ(PackedInt32Array,
+					ct_value_write_int(g_ct_encoder, (int64_t)_a[_i], g_ct_type_int));
+			return;
+		case Variant::PACKED_INT64_ARRAY:
+			gdscript_ct_ensure_collection_types();
+			CT_ENCODE_PACKED_SEQ(PackedInt64Array,
+					ct_value_write_int(g_ct_encoder, (int64_t)_a[_i], g_ct_type_int));
+			return;
+		case Variant::PACKED_FLOAT32_ARRAY:
+			gdscript_ct_ensure_collection_types();
+			CT_ENCODE_PACKED_SEQ(PackedFloat32Array,
+					ct_value_write_float(g_ct_encoder, (double)_a[_i], g_ct_type_float));
+			return;
+		case Variant::PACKED_FLOAT64_ARRAY:
+			gdscript_ct_ensure_collection_types();
+			CT_ENCODE_PACKED_SEQ(PackedFloat64Array,
+					ct_value_write_float(g_ct_encoder, (double)_a[_i], g_ct_type_float));
+			return;
+		case Variant::PACKED_STRING_ARRAY:
+			gdscript_ct_ensure_collection_types();
+			CT_ENCODE_PACKED_SEQ(PackedStringArray, {
+				CharString s = _a[_i].utf8();
+				ct_value_write_string(g_ct_encoder,
+						(const uint8_t *)s.get_data(), (size_t)s.length(), g_ct_type_string);
+			});
+			return;
+		case Variant::DICTIONARY: {
+			// Untyped Dictionary and typed Dictionary[K,V] are both
+			// Variant::DICTIONARY. Encode as a Sequence of 2-element (key, value)
+			// Tuples — the Python/Ruby dict pattern the UI renders uniformly.
+			if (depth <= 0) {
+				gdscript_ct_write_raw(value);
+				return;
+			}
+			gdscript_ct_ensure_collection_types();
+			const Dictionary d = value.operator Dictionary();
+			const Array keys = d.keys(); // Godot preserves insertion order.
+			const int n = keys.size();
+			ct_value_begin_sequence(g_ct_encoder, g_ct_type_dict, n);
+			for (int i = 0; i < n; i++) {
+				const Variant k = keys[i];
+				ct_value_begin_tuple(g_ct_encoder, g_ct_type_pair, 2);
+				gdscript_ct_encode_variant_rec(k, depth - 1);
+				gdscript_ct_encode_variant_rec(d[k], depth - 1);
+				ct_value_end_compound(g_ct_encoder);
+			}
+			ct_value_end_compound(g_ct_encoder);
+			return;
+		}
+		default:
+			// GF4: Vector*/Color/Transform*/Object/Callable/Packed vector &
+			// color arrays / etc. remain Raw printed form for now.
+			gdscript_ct_write_raw(value);
+			return;
 	}
+}
+
+#undef CT_ENCODE_PACKED_SEQ
+
+static void gdscript_ct_encode_variant(const Variant &value) {
+	ct_value_encoder_reset(g_ct_encoder);
+	gdscript_ct_encode_variant_rec(value, CT_MAX_VALUE_DEPTH);
 }
 
 void gdscript_ct_trace_assign(const GDScriptFunction *p_func, int p_dest_address,
