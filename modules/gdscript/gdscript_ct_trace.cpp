@@ -1,7 +1,7 @@
 /**************************************************************************/
 /*  gdscript_ct_trace.cpp — CodeTracer GDScript recorder                  */
 /*  (G2 steps, G3 calls/returns, G4 values, GF3 collections,             */
-/*   GF4 math/struct/handle Variant types)                               */
+/*   GF4 math/struct/handle Variant types, GF8 member/property writes)   */
 /**************************************************************************/
 // LINKS the existing CTFS writer (libcodetracer_trace_writer.a); does NOT
 // reimplement the format.
@@ -39,6 +39,10 @@
 #include "core/variant/dictionary.h"
 #include "core/variant/variant.h"
 #include "gdscript_function.h"
+// GF8: member-write name resolution. GDScriptFunction::get_script() yields the
+// owning GDScript, whose debug_get_member_by_index / debug_get_static_var_by_index
+// invert member_indices / static_variables_indices (StringName<->index).
+#include "gdscript.h"
 
 // GF4: math / struct / handle Variant types. Most are pulled in transitively by
 // variant.h (it holds a union of every math type), but we include them
@@ -718,6 +722,33 @@ static void gdscript_ct_encode_variant(const Variant &value) {
 	gdscript_ct_encode_variant_rec(value, CT_MAX_VALUE_DEPTH);
 }
 
+// G4/GF8: encode `p_value` and attach it to the CURRENT step under `p_name`.
+// Shared by the stack-slot path (gdscript_ct_trace_assign) and the member-name
+// paths (the ADDR_TYPE_MEMBER branch below + gdscript_ct_trace_member_assign).
+// Callers guarantee the writer exists and the first step was emitted. Skips
+// empty / `@`-prefixed synthetic names (loop iterators, compiler temporaries),
+// mirroring codetracer-nim's resolveTracedSlotSym. Scalar-only recordings keep
+// the byte-identical 6-entry types table: gdscript_ct_encode_variant only
+// interns collection/struct types when it actually encounters such a value.
+static void gdscript_ct_emit_named_value(const String &p_name, const Variant &p_value) {
+	if (p_name.is_empty() || p_name[0] == '@') {
+		return;
+	}
+	gdscript_ct_ensure_types();
+	if (!g_ct_encoder) {
+		return;
+	}
+	gdscript_ct_encode_variant(p_value);
+	size_t cbor_len = 0;
+	const uint8_t *cbor = ct_value_get_bytes(g_ct_encoder, &cbor_len);
+	if (!cbor || cbor_len == 0) {
+		return;
+	}
+	CharString name_cs = p_name.utf8();
+	trace_writer_register_variable_cbor(g_ct_writer,
+			name_cs.get_data(), cbor, cbor_len);
+}
+
 void gdscript_ct_trace_assign(const GDScriptFunction *p_func, int p_dest_address,
 		const Variant &p_value, int p_line) {
 	// A value can only attach to an already-registered step; refuse otherwise
@@ -726,14 +757,39 @@ void gdscript_ct_trace_assign(const GDScriptFunction *p_func, int p_dest_address
 		return;
 	}
 
-	// Decode the destination address. Only STACK writes (local variables /
-	// arguments) carry a source-level name we resolve here. CONSTANT slots are
-	// never written; MEMBER (instance property) writes are milestone GF8.
+	// Decode the destination address. STACK writes (local variables / arguments)
+	// resolve their name from stack_debug; MEMBER writes (instance fields —
+	// GF8) resolve it from the owning script's member_indices. CONSTANT slots
+	// are never written.
 	int addr_type = (p_dest_address & GDScriptFunction::ADDR_TYPE_MASK) >> GDScriptFunction::ADDR_BITS;
+	int slot = p_dest_address & GDScriptFunction::ADDR_MASK;
+
+	if (addr_type == GDScriptFunction::ADDR_TYPE_MEMBER) {
+		// GF8: a write into an instance member slot — the common `member = expr`
+		// / `self.member = expr` case, plus member initializers, @export
+		// defaults and @onready assignments (all of which the compiler emits as
+		// an OPCODE_ASSIGN* into an ADDR_TYPE_MEMBER destination — see
+		// gdscript_compiler.cpp). The 24-bit slot is the member INDEX into the
+		// instance's `members` array; invert it to the declared name via the
+		// owning script's member_indices (debug_get_member_by_index).
+		const GDScript *scr = p_func->get_script();
+		if (!scr) {
+			return;
+		}
+		StringName mname = scr->debug_get_member_by_index(slot);
+		String mname_str = String(mname);
+		if (mname_str.is_empty() || mname_str == "<error>") {
+			// Not a resolvable member (should not happen for a real field);
+			// skip rather than emit a bogus name.
+			return;
+		}
+		gdscript_ct_emit_named_value(mname_str, p_value);
+		return;
+	}
+
 	if (addr_type != GDScriptFunction::ADDR_TYPE_STACK) {
 		return;
 	}
-	int slot = p_dest_address & GDScriptFunction::ADDR_MASK;
 
 	// Resolve slot -> declared name using the same table Godot's own debugger
 	// uses for `debug_get_stack_level_locals` (GDScriptFunction::stack_debug,
@@ -759,25 +815,18 @@ void gdscript_ct_trace_assign(const GDScriptFunction *p_func, int p_dest_address
 		return;
 	}
 
-	String name_str = String(*name);
 	// Loop iterators and other synthetic locals ARE in stack_debug but carry an
-	// `@`-prefixed name; treat them as temporaries and skip.
-	if (name_str.is_empty() || name_str[0] == '@') {
-		return;
-	}
+	// `@`-prefixed name; gdscript_ct_emit_named_value treats them as temporaries.
+	gdscript_ct_emit_named_value(String(*name), p_value);
+}
 
-	gdscript_ct_ensure_types();
-	if (!g_ct_encoder) {
+// GF8: member writes whose opcode carries the member NAME directly (not a
+// stack-slot address). See the header for the covered opcodes. Same
+// parallel-index contract as gdscript_ct_trace_assign: a member value can only
+// attach to an already-registered step.
+void gdscript_ct_trace_member_assign(const StringName &p_name, const Variant &p_value) {
+	if (g_ct_disabled || !g_ct_writer || !g_ct_started) {
 		return;
 	}
-	gdscript_ct_encode_variant(p_value);
-
-	size_t cbor_len = 0;
-	const uint8_t *cbor = ct_value_get_bytes(g_ct_encoder, &cbor_len);
-	if (!cbor || cbor_len == 0) {
-		return;
-	}
-	CharString name_cs = name_str.utf8();
-	trace_writer_register_variable_cbor(g_ct_writer,
-			name_cs.get_data(), cbor, cbor_len);
+	gdscript_ct_emit_named_value(String(p_name), p_value);
 }

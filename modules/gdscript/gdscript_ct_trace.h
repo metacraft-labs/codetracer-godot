@@ -75,4 +75,24 @@ void gdscript_ct_trace_return(const Variant &return_value);
 void gdscript_ct_trace_assign(const GDScriptFunction *func, int dest_address,
 		const Variant &value, int line);
 
+// GF8: called from the member-write opcodes that carry the member NAME directly
+// (not a stack-slot address that gdscript_ct_trace_assign resolves):
+//   - OPCODE_SET_STATIC_VARIABLE — `static var` write; name resolved by the
+//     caller via GDScript::debug_get_static_var_by_index(index).
+//   - OPCODE_SET_MEMBER — a self native/registered property write; `name` is the
+//     StringName the opcode already holds (_global_names_ptr[indexname]).
+//   - OPCODE_SET_NAMED — an in-place named write on a base Variant (e.g.
+//     `vec.x = 1`); `name` is the mutated field's StringName.
+// `value` is the freshly written Variant. The value is encoded with the SAME
+// recursive ct_value_* encoder the G4/GF3/GF4 stack path uses and attached to
+// the current step via trace_writer_register_variable_cbor, so member values
+// stay parallel-indexed to steps (it refuses to emit before the first step
+// exists, just like gdscript_ct_trace_assign). No-op (cheap) when tracing is
+// inactive. INSTANCE-member writes addressed via ADDR_TYPE_MEMBER (the common
+// `member = expr` / `self.member = expr` / member-initializer / @onready /
+// @export-default case) do NOT come through here — they arrive as an ordinary
+// OPCODE_ASSIGN* whose destination address gdscript_ct_trace_assign now resolves
+// to a member name via GDScript::debug_get_member_by_index.
+void gdscript_ct_trace_member_assign(const StringName &name, const Variant &value);
+
 #endif // GDSCRIPT_CT_TRACE_H

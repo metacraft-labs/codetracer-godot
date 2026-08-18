@@ -38,8 +38,13 @@ def steps(doc):
 
 # (function, source line, varname, value-kind, expected value)
 # Hand-derived from test-programs/gdscript/gf_typing.gd; see EXPECTED-GF1.md.
-# NOTE: `counter` (static var) is intentionally ABSENT — its capture is GF8
-# (member writes), not GF1.
+# NOTE (updated for GF8, 2026-08-18): `counter` (static var) USED to be asserted
+# ABSENT here because member/static writes were deferred to GF8. GF8 now captures
+# static-var writes, so `counter` is correctly captured (0 in @static_initializer
+# / @implicit_new, then 1 after `counter += 1` in _init). The prior member-ABSENCE
+# assertion is now outdated and is replaced by a PRESENCE assertion below
+# (COUNTER_PRESENT). Every other GF1 fact (the typed/operator/const/enum captures
+# and the 6-entry scalar-only types table) is unchanged.
 EXPECTED = [
     # typed / inferred / untyped locals
     ("_init", 37, "a", "Int", 5),
@@ -85,8 +90,11 @@ EXPECTED = [
 
 EXPECTED_TYPES = ["None", "Int", "Float", "Bool", "String", "Variant"]
 
-# static-var write deferred to GF8 — assert it is NOT captured as a named local.
-DEFERRED_ABSENT = ["counter"]
+# static-var write is CAPTURED as of GF8 (was DEFERRED_ABSENT pre-GF8). The
+# `static var counter := 0` initializer records 0, and `counter += 1` in _init
+# records 1; both land on their own steps by NAME. Assert the sequence of Int
+# values captured for `counter` (order = step order).
+COUNTER_PRESENT_VALUES = [0, 0, 1]
 
 
 def value_scalar(val):
@@ -154,19 +162,27 @@ def assert_facts(doc):
                 % (function, line, varname, got_val, got_kind, expected_val))
         observed.append("%s=%r:%s" % (varname, expected_val, kind))
 
-    # GF8 boundary: the static var must NOT appear as a captured named local
-    # anywhere in the trace.
+    # GF8: the static var `counter` IS now captured (member/static writes are no
+    # longer deferred). Assert the captured Int sequence, in step order.
+    counter_vals = []
     for s in sts:
         for v in s.get("vars", []):
-            if v.get("varname") in DEFERRED_ABSENT:
-                raise VerifyError(
-                    "static var %r WAS captured at %s:%s — GF1 must defer member "
-                    "writes to GF8" % (v.get("varname"), s.get("function"), s.get("line")))
+            if v.get("varname") == "counter":
+                val = v.get("value", {})
+                if val.get("kind") != "Int":
+                    raise VerifyError(
+                        "counter capture at %s:%s has kind %r, expected Int"
+                        % (s.get("function"), s.get("line"), val.get("kind")))
+                counter_vals.append(val.get("i"))
+    if counter_vals != COUNTER_PRESENT_VALUES:
+        raise VerifyError(
+            "static var `counter` captures %r != expected %r (GF8 captures static "
+            "writes)" % (counter_vals, COUNTER_PRESENT_VALUES))
 
     return ("PASS GF1: %d captured values on their own steps "
-            "(typing/operators/const/enums); types=%s; static var deferred to "
-            "GF8 (absent as expected). %s"
-            % (len(EXPECTED), types, observed))
+            "(typing/operators/const/enums); types=%s; static var `counter` "
+            "captured %r (GF8 member/static writes). %s"
+            % (len(EXPECTED), types, counter_vals, observed))
 
 
 def tamper(doc, mode):

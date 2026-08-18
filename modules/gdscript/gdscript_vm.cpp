@@ -1241,6 +1241,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					OPCODE_BREAK;
 				}
 #endif
+				gdscript_ct_trace_member_assign(*index, *value); // CodeTracer GF8: in-place named write on a base
 				ip += 4;
 			}
 			DISPATCH_OPCODE;
@@ -1325,6 +1326,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					OPCODE_BREAK;
 				}
 #endif
+				gdscript_ct_trace_member_assign(*index, *src); // CodeTracer GF8: self native/registered property write
 				ip += 3;
 			}
 			DISPATCH_OPCODE;
@@ -1362,6 +1364,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				gdscript->static_variables.write[index] = *value;
 
+				gdscript_ct_trace_member_assign(gdscript->debug_get_static_var_by_index(index), *value); // CodeTracer GF8: static var write
 				ip += 4;
 			}
 			DISPATCH_OPCODE;

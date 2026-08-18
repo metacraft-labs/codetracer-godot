@@ -262,10 +262,21 @@ def assert_facts(doc):
         raise VerifyError("_static_init local marker %r != [7]"
                           % scalar_list(caps.get("marker", []), "Int", "i"))
 
-    # --- I. member/property values are GF8-deferred (absent as named locals) --
-    for member in ("species", "v", "count"):
+    # --- I. member values (GF8) -----------------------------------------------
+    # Updated for GF8 (2026-08-18): member/static writes are now captured, so the
+    # prior "species/v/count all ABSENT" expectation is outdated. `species =
+    # got_name` is an ADDR_TYPE_MEMBER write and is now correctly captured by NAME
+    # (['rex','spot'] across the two Animal._init frames) — assert it PRESENT.
+    # `Tag.v` and `Kennel.count` are only DECLARED, never written, so they remain
+    # absent (there is no write opcode for them). Every other GF7 fact is
+    # unchanged.
+    species = scalar_list(caps.get("species", []), "String", "text")
+    if species != ["rex", "spot"]:
+        raise VerifyError("member `species` captures %r != ['rex','spot'] (GF8 member writes)"
+                          % species)
+    for member in ("v", "count"):
         if member in caps:
-            raise VerifyError("member %r captured as a named local (should be GF8-deferred)"
+            raise VerifyError("member %r captured but is never written (only declared)"
                               % member)
 
     # --- J. balance -----------------------------------------------------------
@@ -279,9 +290,9 @@ def assert_facts(doc):
             "chain x2 (Dog._init -> super Animal._init) with the arg propagated "
             "cross-file (got_name=pup=['rex','spot']); inner classes label@"
             "gf_animal.gd->'tag' and size@gf_dog.gd->3; _static_init@gf_dog.gd "
-            "under @static_initializer (marker=7); members species/v/count "
-            "GF8-deferred (absent); types [None,Int,Float,Bool,String,Variant,"
-            "Object]; call/return balanced.")
+            "under @static_initializer (marker=7); member species=['rex','spot'] "
+            "captured (GF8), v/count never written (absent); types [None,Int,"
+            "Float,Bool,String,Variant,Object]; call/return balanced.")
 
 
 # --- tamper -----------------------------------------------------------------
