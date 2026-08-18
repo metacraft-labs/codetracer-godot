@@ -1,0 +1,68 @@
+name: 🎯 GDScript Feature Corpus
+# CodeTracer GDScript recorder — GT1 corpus + no-silent-skip gate.
+#
+# This is a NEW workflow added for the CodeTracer GDScript recorder fork; it does
+# not modify Godot's upstream build workflows. It builds the patched engine under
+# nix, then runs the unified corpus runner AND the no-silent-skip gate over the
+# committed feature corpus (test-programs/gdscript/CORPUS.md).
+#
+# NOTE (CI-activates-on-publish): the fork's remote is still godotengine/godot;
+# this job is DEFINED now and activates once the fork is pushed to its own remote
+# (metacraft-labs/codetracer-engine-godot). It has been verified LOCALLY on macOS
+# arm64 — both scripts run green — pending that publish.
+on:
+  push:
+    branches: [codetracer/gdscript-recorder]
+  pull_request:
+    branches: [codetracer/gdscript-recorder]
+  workflow_dispatch:
+
+concurrency:
+  group: gdscript-feature-corpus-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gdscript-feature-corpus:
+    name: Record + verify GDScript feature corpus
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout codetracer-engine-godot
+        uses: actions/checkout@v4
+
+      - name: Checkout codetracer-trace-format-nim (ct-print + writer)
+        uses: actions/checkout@v4
+        with:
+          repository: metacraft-labs/codetracer-trace-format-nim
+          path: ../codetracer-trace-format-nim
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build patched engine (nix develop -c scons)
+        run: BUILD=always scripts/record-and-verify.sh
+        # BUILD=always builds the engine and then runs the full corpus in one
+        # step; the runner's corpus_ensure_engine() invokes the same
+        # `nix develop -c scons … module_gdscript_enabled=yes vulkan=no metal=no
+        # opengl3=no disable_path_overrides=no import_env_vars=$NIX*` build the
+        # per-milestone runners use.
+
+      - name: No-silent-skip gate
+        run: scripts/verify-corpus-no-silent-skip.sh
+
+      - name: Upload logs + traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdscript-corpus-logs
+          path: |
+            /tmp/ct-corpus.*/**/stdout.log
+            /tmp/ct-corpus.*/**/full.json
+            /tmp/ct-corpus.*/**/gdscript_trace.ct
+            /tmp/ct-nss.*/**/stdout.log
+            /tmp/ct-nss.*/**/gdscript_trace.ct
+          if-no-files-found: ignore
+          retention-days: 14
