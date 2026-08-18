@@ -76,6 +76,7 @@ is the discipline that keeps "every feature is covered" honest.
 | `gf_threads.gd`         | GF12      | primary | `verify_gf12.py`  | `EXPECTED-GF12.md`| `CT_GF12_RESULT=8`            |
 | `gf_diag.gd`            | GF13      | primary | `verify_gf13.py`  | `EXPECTED-GF13.md`| `CT_GF13_RESULT=29`           |
 | `gf_diag_assert_fail.gd`| GF13      | probe   | inline halt-check | `EXPECTED-GF13.md`| —                             |
+| `n1_nested.gd`          | N1        | primary | `verify_n1.py standalone` | `EXPECTED-N1.md` | `CT_N1_RESULT=12`         |
 
 Notes:
 
@@ -92,6 +93,14 @@ Notes:
   corpus runner asserts the halt (a step at the assert line, no step after it,
   and the post-assert `SHOULD_NOT_REACH` print absent), mirroring
   `record-and-verify-gf13.sh`.
+- `n1_nested.gd` is dual-mode. The corpus records it STANDALONE (no `CT_MCR_*`),
+  where the N1 join-key emission is INERT — `verify_n1.py standalone` asserts it
+  records its steps but emits ZERO join events (byte-identical to a pre-N1
+  recording). The join-key proof itself (call-entry/exit + native-call `(GEID,
+  tick)` keys, well-formed and RESOLVABLE against a synthetic native trace per
+  the correlation record) runs under a controlled MCR context in the dedicated
+  `scripts/record-and-verify-n1.sh` (`verify_n1.py verify` + tamper), which the
+  corpus does not set up.
 
 <!-- CORPUS-MACHINE-BEGIN -->
 <!--
@@ -119,5 +128,6 @@ gf_node.gd|GF11|helper|gf_node_main.gd|-|-|EXPECTED-GF11.md|-
 gf_threads.gd|GF12|primary|gf_threads.gd|verify_gf12.py|verify|EXPECTED-GF12.md|CT_GF12_RESULT=8
 gf_diag.gd|GF13|primary|gf_diag.gd|verify_gf13.py|verify|EXPECTED-GF13.md|CT_GF13_RESULT=29
 gf_diag_assert_fail.gd|GF13|probe|gf_diag_assert_fail.gd|-|-|EXPECTED-GF13.md|-
+n1_nested.gd|N1|primary|n1_nested.gd|verify_n1.py|standalone|EXPECTED-N1.md|CT_N1_RESULT=12
 ```
 <!-- CORPUS-MACHINE-END -->

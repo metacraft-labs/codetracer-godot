@@ -171,4 +171,23 @@ void gdscript_ct_trace_await_resume(const void *call_state);
 void gdscript_ct_trace_utility_diagnostic(const StringName &function,
 		const Variant **args, int argc);
 
+// N1: nested-trace correlation join keys. When the patched engine runs INSIDE a
+// CodeTracer MCR recording, GDScript call-entry/exit and native-call boundaries
+// are tagged with the parent native trace's (GEID, tick) so the nested GDScript
+// trace can be correlated to the parent — wire contract:
+// codetracer-trace-format-spec/nested-trace-correlation.md. The keys are sampled
+// from the parent recorder's in-process context (the MCR interposer's exported
+// ct_mcr_now, resolved weakly via dlsym, or the CT_MCR_GEID/CT_MCR_TICK shim) and
+// emitted as events.dat special events. Call-entry/exit joins are emitted from
+// gdscript_ct_trace_call / _return (no VM change there); this hook covers the
+// native-call site.
+//
+// Called from the native-call opcodes (OPCODE_CALL and OPCODE_CALL_METHOD_BIND*)
+// right AFTER the native method executed — the crossing where the parent native
+// MCR trace is the continuation of this GDScript step. Emits a `native-call` join
+// bound to the current step. INERT (emits nothing) when tracing is inactive, no
+// step exists yet, or no parent MCR context is available (standalone recording ->
+// byte-identical). No-op (cheap) when tracing is inactive.
+void gdscript_ct_trace_native_call();
+
 #endif // GDSCRIPT_CT_TRACE_H

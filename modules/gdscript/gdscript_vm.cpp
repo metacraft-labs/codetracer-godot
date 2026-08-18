@@ -2050,6 +2050,8 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				}
 #endif // DEBUG_ENABLED
 
+				gdscript_ct_trace_native_call(); // CodeTracer N1: native-call join key
+
 				ip += 3;
 			}
 			DISPATCH_OPCODE;
@@ -2137,6 +2139,8 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					OPCODE_BREAK;
 				}
 #endif
+				gdscript_ct_trace_native_call(); // CodeTracer N1: native-call join key
+
 				ip += 3;
 			}
 			DISPATCH_OPCODE;

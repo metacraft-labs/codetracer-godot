@@ -78,6 +78,11 @@
 #include <cstdlib>
 #include <mutex> // GF12: serialize the shared writer/encoder across worker threads
 
+// N1: dlsym(RTLD_DEFAULT, "ct_mcr_now") — weakly resolve the MCR interposer's
+// exported live-GEID reader at runtime, so the standalone engine neither links
+// nor depends on it (absent -> join-key emission is inert).
+#include <dlfcn.h>
+
 // The CTFS writer's C header names a parameter `mutable`, which is a C++
 // keyword. Shim it out for this C++ translation unit (we never call that
 // entry point here).
@@ -293,6 +298,138 @@ static void gdscript_ct_emit_async_marker(const char *tag, uintptr_t ctx) {
 	trace_writer_register_special_event(g_ct_writer, FFI_EVENT_TRACE_LOG_EVENT, meta, tag);
 }
 
+// ---------------------------------------------------------------------------
+// N1: nested-trace correlation join keys (GEID, tick).
+//
+// When the patched engine runs INSIDE a CodeTracer MCR recording, every GDScript
+// call-entry/exit and native-call boundary is tagged with the parent native
+// trace's (GEID, tick) so the nested GDScript trace can be correlated to the
+// parent. Wire contract: codetracer-trace-format-spec/nested-trace-correlation.md.
+// The keys ride the SAME events.dat special-event channel GF10/GF13 use (no new
+// CTFS stream, no C-ABI change).
+//
+// CONTEXT SOURCE (tried in order; INERT — no join events at all — when neither is
+// present, so a standalone recording is byte-identical):
+//   1. ct_mcr_now(CtMcrCoordinates*) — the MCR interposer's exported live-GEID
+//      reader (codetracer-native-recorder ct_interpose trace_context.nim). Present
+//      only when the process is under `ct-mcr record` (the interposer dylib is
+//      loaded); resolved WEAKLY via dlsym(RTLD_DEFAULT). Trusted only when
+//      recordingAvailable && hasGeid.
+//   2. CT_MCR_GEID / CT_MCR_TICK env vars — a controllable shim standing in for
+//      the live interface when there is no real MCR context (drives the N1
+//      synthetic-native-context test). Provides a BASE (geid, tick); the recorder
+//      adds a monotonic per-join offset so each join event gets a distinct, ordered
+//      key — mimicking the live counter and satisfying the correlation record's
+//      GEID-monotonic ordering rule (nested-trace-correlation.md §3.3).
+//
+// ct_mcr_now exposes the live GEID but not a dedicated per-thread tick field today
+// (nested-trace-correlation.md §6); N1 uses its monotonic-time sample as the tick
+// on the real path. The authoritative tick + a native event anchoring
+// native->nested is an N2 dependency.
+struct CtMcrCoordinates {
+	int64_t wallTimeUnixNs;
+	int64_t monotonicTimeNs;
+	uint64_t geid;
+	uint32_t hasGeid;
+	uint32_t recordingAvailable;
+};
+typedef void (*CtMcrNowFn)(CtMcrCoordinates *);
+
+static int g_ct_join_resolved = 0; // 0 unknown, -1 no source, 1 have a source
+static CtMcrNowFn g_ct_mcr_now = nullptr;
+static bool g_ct_have_shim = false;
+static uint64_t g_ct_shim_geid = 0;
+static uint64_t g_ct_shim_tick = 0;
+static uint64_t g_ct_join_counter = 0; // monotonic per emitted join (shim offset + ordering aid)
+
+// content prefix that identifies a nested-trace join event (parent-kind gdscript).
+static const char *CT_JOIN_TAG = "ct-nested-join:gdscript";
+
+static void gdscript_ct_resolve_join_source() {
+	if (g_ct_join_resolved != 0) {
+		return;
+	}
+	g_ct_join_resolved = -1;
+	// 1. The live MCR interface (weak; absent when standalone).
+	void *sym = dlsym(RTLD_DEFAULT, "ct_mcr_now");
+	if (sym) {
+		g_ct_mcr_now = (CtMcrNowFn)sym;
+		g_ct_join_resolved = 1;
+	}
+	// 2. The env shim (also honored as a controlled override; the live interface
+	//    takes precedence when it yields a usable coordinate).
+	const char *g = getenv("CT_MCR_GEID");
+	const char *t = getenv("CT_MCR_TICK");
+	if (g && g[0] != '\0') {
+		g_ct_shim_geid = strtoull(g, nullptr, 0);
+		g_ct_shim_tick = (t && t[0] != '\0') ? strtoull(t, nullptr, 0) : 0;
+		g_ct_have_shim = true;
+		g_ct_join_resolved = 1;
+	}
+}
+
+// Sample the parent native (geid, tick). Returns false when no parent context is
+// available (standalone) — the caller then emits nothing.
+static bool gdscript_ct_sample_join_key(uint64_t *out_geid, uint64_t *out_tick) {
+	gdscript_ct_resolve_join_source();
+	if (g_ct_join_resolved != 1) {
+		return false;
+	}
+	// Prefer the live MCR interface when it yields a usable coordinate.
+	if (g_ct_mcr_now) {
+		CtMcrCoordinates c = {};
+		g_ct_mcr_now(&c);
+		if (c.recordingAvailable && c.hasGeid) {
+			*out_geid = c.geid;
+			*out_tick = (uint64_t)c.monotonicTimeNs;
+			return true;
+		}
+	}
+	// Fall back to the controllable shim: base + monotonic per-join offset.
+	if (g_ct_have_shim) {
+		*out_geid = g_ct_shim_geid + g_ct_join_counter;
+		*out_tick = g_ct_shim_tick + g_ct_join_counter;
+		return true;
+	}
+	return false;
+}
+
+// Emit one nested-trace join event bound to the current step. ASSUMES the emit
+// lock is held. `site` is 0 call-enter / 1 call-exit / 2 native-call. INERT (no
+// event) when tracing is inactive, no step exists yet, or no parent context is
+// available (standalone -> byte-identical).
+static void gdscript_ct_emit_join_locked(int site) {
+	if (g_ct_disabled || !g_ct_writer || !g_ct_started) {
+		return;
+	}
+	uint64_t geid = 0, tick = 0;
+	if (!gdscript_ct_sample_join_key(&geid, &tick)) {
+		return;
+	}
+	// step this join binds to: next_step_index() accounts for the pending step, so
+	// the just-registered line is next_step_index() - 1 (same rule as the async
+	// markers — see gdscript_ct_emit_async_marker).
+	uint64_t next = trace_writer_next_step_index(g_ct_writer);
+	uint64_t step = (next > 0) ? (next - 1) : 0;
+	uint64_t thread = gdscript_ct_current_thread();
+	const char *site_str = (site == 0) ? "call-enter" : (site == 1) ? "call-exit"
+																	 : "native-call";
+	// content: self-describing (ct-print surfaces this as the io event `text`; it
+	// does NOT surface metadata). metadata: the same fields (structured consumers).
+	char content[192];
+	snprintf(content, sizeof(content),
+			"%s geid=%llu tick=%llu step=%llu site=%s thread=%llu",
+			CT_JOIN_TAG, (unsigned long long)geid, (unsigned long long)tick,
+			(unsigned long long)step, site_str, (unsigned long long)thread);
+	char meta[160];
+	snprintf(meta, sizeof(meta),
+			"geid=%llu tick=%llu step=%llu site=%s thread=%llu",
+			(unsigned long long)geid, (unsigned long long)tick,
+			(unsigned long long)step, site_str, (unsigned long long)thread);
+	trace_writer_register_special_event(g_ct_writer, FFI_EVENT_TRACE_LOG_EVENT, meta, content);
+	g_ct_join_counter++;
+}
+
 bool gdscript_ct_trace_active() {
 	if (g_ct_active < 0) {
 		const char *out_dir = getenv("CT_GDSCRIPT_TRACE");
@@ -502,6 +639,9 @@ void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source
 	size_t fid = trace_writer_ensure_function_id(g_ct_writer,
 			name_cs.get_data(), src_cs.get_data(), p_line);
 	trace_writer_register_call(g_ct_writer, fid);
+	// N1: tag this GDScript frame's entry with the parent native (GEID, tick).
+	// Inert (nothing emitted) standalone or before the first step exists.
+	gdscript_ct_emit_join_locked(0 /* call-enter */);
 }
 
 // GF5: forward declarations — the return hook (below) reuses the recursive
@@ -522,6 +662,12 @@ void gdscript_ct_trace_return(const Variant &p_return_value) {
 	// rides the call stream (not the shared pending step), so it is captured
 	// reliably even under interleaving.
 	gdscript_ct_note_thread_locked(gdscript_ct_current_thread());
+
+	// N1: tag this GDScript frame's exit with the parent native (GEID, tick),
+	// on BOTH exit paths (normal + await-resume). Emitted before the return record
+	// (order is irrelevant — the join binds to the current step, not the return).
+	// Inert (nothing emitted) standalone or before the first step exists.
+	gdscript_ct_emit_join_locked(1 /* call-exit */);
 
 	// GF5: capture the return VALUE. Encode it with the same recursive
 	// ct_value_* encoder G4/GF3/GF4 use for locals, then attach it to the
@@ -550,6 +696,21 @@ void gdscript_ct_trace_return(const Variant &p_return_value) {
 		return;
 	}
 	trace_writer_register_return_cbor(g_ct_writer, cbor, cbor_len);
+}
+
+// N1: native-call join. Called from the native-call opcodes (OPCODE_CALL and
+// OPCODE_CALL_METHOD_BIND*) right after the native method executed — the crossing
+// where the parent native MCR trace is the continuation of this GDScript step.
+void gdscript_ct_trace_native_call() {
+	CtEmitLock lk; // serialize + reentrancy-guard (as every emit hook does)
+	if (!lk.engaged) {
+		return;
+	}
+	// Never creates the writer; a native call only matters once recording is live.
+	if (g_ct_disabled || !g_ct_writer) {
+		return;
+	}
+	gdscript_ct_emit_join_locked(2 /* native-call */);
 }
 
 // GF3: intern the compound-collection types on first use. Kept out of
