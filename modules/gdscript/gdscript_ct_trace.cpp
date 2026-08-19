@@ -38,6 +38,10 @@
 #include "core/variant/array.h"
 #include "core/variant/dictionary.h"
 #include "core/variant/variant.h"
+// §5.2 source bundling: read the recorded `.gd` source text so the `res://`
+// virtual path resolves at replay, and mirror the writer's path interning.
+#include "core/io/file_access.h"
+#include "core/templates/hash_map.h"
 #include "gdscript_function.h"
 // GF8: member-write name resolution. GDScriptFunction::get_script() yields the
 // owning GDScript, whose debug_get_member_by_index / debug_get_static_var_by_index
@@ -660,6 +664,59 @@ static void gdscript_ct_ensure_types() {
 	g_ct_types_ready = (g_ct_encoder != nullptr);
 }
 
+// §5.2 SOURCE BUNDLING (Mixed-Native-GDScript-Debugging §3.2 / §5.2).
+//
+// A GDScript path is a Godot `res://` virtual path that never exists on the
+// debugging host's filesystem, so the standalone `.ct` must carry the `.gd`
+// SOURCE TEXT for the Editor Pane and the value-origin classifier to resolve
+// it (Value-Origin-Tracking §6.1 bundled-sources). We stream each recorded
+// file's source into the container's srcviews stream via
+// trace_writer_register_source_view (view_kind 0 = raw = the source itself,
+// no sourcemap). The bundle is ADDITIVE metadata: the step / value / call
+// streams are byte-identical to a run without it.
+//
+// register_source_view keys on `path_id`, and the writer interns paths in
+// first-seen order starting at 0 EXCLUSIVELY through trace_writer_start /
+// trace_writer_register_step below (ensure_function_id interns the function
+// NAME, not the path, in the multi-stream backend). We therefore mirror that
+// interning here with a first-seen map + counter so our `path_id` matches the
+// index the reader recovers from paths.dat. Bundling is done once per file, on
+// first sight, and is best-effort: a source that cannot be read is simply not
+// bundled (the origin gap remains for that file — honest degradation) rather
+// than emitting empty text.
+static HashMap<String, uint64_t> g_ct_bundled_path_ids;
+static uint64_t g_ct_next_path_id = 0;
+
+static void gdscript_ct_bundle_source_locked(const String &p_res_path, uint64_t p_path_id) {
+	Error err = OK;
+	Vector<uint8_t> bytes = FileAccess::get_file_as_bytes(p_res_path, &err);
+	if (err != OK || bytes.is_empty()) {
+		return; // unreadable / empty — skip; do not bundle empty source
+	}
+	CharString name_cs = p_res_path.utf8();
+	// view_kind 0 = raw original source; NULL sourcemap = identity bundle.
+	trace_writer_register_source_view(
+			g_ct_writer,
+			p_path_id,
+			/*view_kind=*/0,
+			name_cs.get_data(), (size_t)name_cs.length(),
+			bytes.ptr(), (size_t)bytes.size(),
+			nullptr, 0);
+}
+
+// Record the writer-mirrored path id for `p_res_path` on first sight and
+// bundle its source text once. Must be called from inside the emit lock,
+// immediately after the trace_writer_start / trace_writer_register_step call
+// that interns the same path, so ids stay in lockstep with paths.dat.
+static void gdscript_ct_note_and_bundle_path_locked(const String &p_res_path) {
+	if (g_ct_bundled_path_ids.has(p_res_path)) {
+		return;
+	}
+	uint64_t path_id = g_ct_next_path_id++;
+	g_ct_bundled_path_ids.insert(p_res_path, path_id);
+	gdscript_ct_bundle_source_locked(p_res_path, path_id);
+}
+
 void gdscript_ct_trace_step(const StringName &p_source, int64_t p_line) {
 	CtEmitLock lk; // GF12: serialize + reentrancy-guard the emit path
 	if (!lk.engaged) {
@@ -673,16 +730,19 @@ void gdscript_ct_trace_step(const StringName &p_source, int64_t p_line) {
 	uint64_t cur = gdscript_ct_current_thread();
 	gdscript_ct_note_thread_locked(cur);
 
-	CharString src_cs = String(p_source).utf8();
+	String source_str = String(p_source);
+	CharString src_cs = source_str.utf8();
 	if (unlikely(!g_ct_started)) {
 		g_ct_started = true;
 		// Registers the first (pending) step at this real source line.
 		trace_writer_start(g_ct_writer, src_cs.get_data(), p_line);
+		gdscript_ct_note_and_bundle_path_locked(source_str); // first path -> id 0
 		g_ct_pending_owner = cur; // GF12: this thread owns the pending step
 		return;
 	}
 
 	trace_writer_register_step(g_ct_writer, src_cs.get_data(), p_line);
+	gdscript_ct_note_and_bundle_path_locked(source_str);
 	g_ct_pending_owner = cur; // GF12: this thread owns the new pending step
 
 	// GF10: flush a pending async-resume marker onto THIS (first resumed) step,

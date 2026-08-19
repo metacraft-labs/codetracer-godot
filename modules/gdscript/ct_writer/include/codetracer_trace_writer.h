@@ -159,6 +159,44 @@ void trace_writer_register_special_event(trace_writer_t handle,
     int kind, const char* metadata, const char* content);
 
 /* --------------------------------------------------------------------------
+ * Bundled source text (Alternate Source Views — Deminification / self-
+ * contained sources)
+ *
+ * Buffer the source bytes for an already-registered path into the
+ * container's `srcviews.dat` / `srcviews.off` extension streams (spec:
+ * codetracer-trace-format-spec/internal-files.md §"Alternate Source Views").
+ * The GDScript recorder uses this to BUNDLE each recorded `.gd`'s source
+ * text into the `.ct` so a replay host can resolve the Godot `res://`
+ * virtual path — which never exists on the debugging host's filesystem —
+ * without the original project checkout (Mixed-Native-GDScript-Debugging
+ * §3.2 / §5.2; Value-Origin-Tracking §6.1 bundled-sources resolution).
+ *
+ * `path_id` MUST refer to a path already interned via
+ * trace_writer_start / trace_writer_register_step (paths are interned in
+ * first-seen registration order, starting at 0). `view_kind` is 0 = raw
+ * (the original source itself — what the recorder bundles), 1 = prettier,
+ * 2 = black, 128+ vendor-specific. `view_name` is a display name (need not
+ * be NUL-terminated — pass its length). `sourcemap` may be NULL / length 0
+ * ("no map"), which is what a raw identity bundle carries.
+ *
+ * Only the binary (multi-stream) backend supports source views. Registering
+ * at least one adds the srcviews.dat/off streams (and their meta.dat flag);
+ * a recording that registers none is byte-for-byte unchanged — the step /
+ * value / call streams are never touched. Returns the new view's 0-based
+ * index on success, -1 on failure (see trace_writer_last_error).
+ * -------------------------------------------------------------------------- */
+
+int64_t trace_writer_register_source_view(trace_writer_t handle,
+    uint64_t path_id,
+    uint8_t view_kind,
+    const char* view_name,
+    size_t view_name_len,
+    const uint8_t* content,
+    size_t content_len,
+    const uint8_t* sourcemap,
+    size_t sourcemap_len);
+
+/* --------------------------------------------------------------------------
  * Request / interval spans (RS-M1)
  *
  * A span is a bounded, labeled interval of execution — an HTTP request, a
