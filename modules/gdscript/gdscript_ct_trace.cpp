@@ -32,7 +32,14 @@
 // MaterializedReplaySession invariant). We refuse to emit a value before the
 // first step exists (g_ct_started), since a value with no step to attach to
 // would desync the parallel index.
+// This recorder is a pure CONSUMER of the general GDScriptTracer hook
+// (gdscript_tracer.h). It registers a tracer, receives engine-neutral
+// StringName/Variant callbacks, and does all recorder-specific work here:
+// Variant->CBOR encoding, CTFS writer calls, thread attribution, await
+// markers, source bundling. It touches NO gdscript_vm.cpp internals — the hook
+// already resolved stack/member slots to declared names before calling us.
 #include "gdscript_ct_trace.h"
+#include "gdscript_tracer.h"
 
 #include "core/string/ustring.h"
 #include "core/variant/array.h"
@@ -42,11 +49,6 @@
 // virtual path resolves at replay, and mirror the writer's path interning.
 #include "core/io/file_access.h"
 #include "core/templates/hash_map.h"
-#include "gdscript_function.h"
-// GF8: member-write name resolution. GDScriptFunction::get_script() yields the
-// owning GDScript, whose debug_get_member_by_index / debug_get_static_var_by_index
-// invert member_indices / static_variables_indices (StringName<->index).
-#include "gdscript.h"
 
 // GF4: math / struct / handle Variant types. Most are pulled in transitively by
 // variant.h (it holds a union of every math type), but we include them
@@ -81,13 +83,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex> // GF12: serialize the shared writer/encoder across worker threads
-
-// N1/N2: dlsym(RTLD_DEFAULT, "ct_mcr_now" / "ct_mcr_mark_span_*") — weakly
-// resolve the MCR interposer's exported context-reader and native-marker entry
-// points at runtime, so the standalone engine neither links nor depends on them
-// (absent -> join-key emission + native-anchor emission are inert).
-#include <dlfcn.h>
-#include <unistd.h> // getpid() — process-stable OTel trace id for the span markers
 
 // The CTFS writer's C header names a parameter `mutable`, which is a C++
 // keyword. Shim it out for this C++ translation unit (we never call that
@@ -302,284 +297,6 @@ static void gdscript_ct_emit_async_marker(const char *tag, uintptr_t ctx) {
 	snprintf(meta, sizeof(meta), "0x%llx %llu",
 			(unsigned long long)ctx, (unsigned long long)step);
 	trace_writer_register_special_event(g_ct_writer, FFI_EVENT_TRACE_LOG_EVENT, meta, tag);
-}
-
-// ---------------------------------------------------------------------------
-// N1: nested-trace correlation join keys (GEID, tick).
-//
-// When the patched engine runs INSIDE a CodeTracer MCR recording, every GDScript
-// call-entry/exit and native-call boundary is tagged with the parent native
-// trace's (GEID, tick) so the nested GDScript trace can be correlated to the
-// parent. Wire contract: codetracer-trace-format-spec/nested-trace-correlation.md.
-// The keys ride the SAME events.dat special-event channel GF10/GF13 use (no new
-// CTFS stream, no C-ABI change).
-//
-// CONTEXT SOURCE (tried in order; INERT — no join events at all — when neither is
-// present, so a standalone recording is byte-identical):
-//   1. ct_mcr_now(CtMcrCoordinates*) — the MCR interposer's exported live-GEID
-//      reader (codetracer-native-recorder ct_interpose trace_context.nim). Present
-//      only when the process is under `ct-mcr record` (the interposer dylib is
-//      loaded); resolved WEAKLY via dlsym(RTLD_DEFAULT). Trusted only when
-//      recordingAvailable && hasGeid.
-//   2. CT_MCR_GEID / CT_MCR_TICK env vars — a controllable shim standing in for
-//      the live interface when there is no real MCR context (drives the N1
-//      synthetic-native-context test). Provides a BASE (geid, tick); the recorder
-//      adds a monotonic per-join offset so each join event gets a distinct, ordered
-//      key — mimicking the live counter and satisfying the correlation record's
-//      GEID-monotonic ordering rule (nested-trace-correlation.md §3.3).
-//
-// ct_mcr_now exposes the live GEID but not a dedicated per-thread tick field today
-// (nested-trace-correlation.md §6); N1 uses its monotonic-time sample as the tick
-// on the real path. The authoritative tick + a native event anchoring
-// native->nested is an N2 dependency.
-struct CtMcrCoordinates {
-	int64_t wallTimeUnixNs;
-	int64_t monotonicTimeNs;
-	uint64_t geid;
-	uint32_t hasGeid;
-	uint32_t recordingAvailable;
-};
-typedef void (*CtMcrNowFn)(CtMcrCoordinates *);
-
-// N2: the MCR interposer's native-marker entry points (trace_context.nim,
-// exported as ct_mcr_mark_span_start / ct_mcr_mark_span_end). Calling these
-// ALLOCATES an authoritative native (GEID, tick) AND EMITS a real native event
-// (a span marker) into the parent MCR trace's ring — the native ANCHOR the
-// correlation record §5 / §6 says native->nested needs (a native event that
-// points AT the nested trace), which N1's read-only ct_mcr_now cursor could not
-// provide. Signature per trace_context.nim (OpenTelemetry-style span markers):
-//   int ct_mcr_mark_span_start(const char *traceIdHex/*32*/, const char *spanIdHex/*16*/,
-//                              const char *parentSpanIdHex/*16 or null*/,
-//                              const char *serviceName, CtMcrCoordinates *out);
-//   int ct_mcr_mark_span_end  (const char *traceIdHex, const char *spanIdHex,
-//                              const char *parentSpanIdHex, const char *serviceName,
-//                              uint64_t startGeid, CtMcrCoordinates *out);
-// The returned `out.geid` is the authoritative allocated GEID of the emitted
-// native event (with hasGeid/recordingAvailable set). NOTE: CtMcrCoordinates does
-// NOT surface the allocated per-thread TICK (it carries only wall/monotonic
-// clocks + geid), so tick fidelity (nested-trace-correlation.md §6 gap (a))
-// remains the monotonic-clock sample even on this authoritative path; the GEID is
-// fully authoritative and now backed by a real native anchor (gap (b) closed).
-typedef int (*CtMcrMarkSpanStartFn)(const char *, const char *, const char *, const char *, CtMcrCoordinates *);
-typedef int (*CtMcrMarkSpanEndFn)(const char *, const char *, const char *, const char *, uint64_t, CtMcrCoordinates *);
-
-static int g_ct_join_resolved = 0; // 0 unknown, -1 no source, 1 have a source
-static CtMcrNowFn g_ct_mcr_now = nullptr;
-static CtMcrMarkSpanStartFn g_ct_mark_span_start = nullptr; // N2 native anchor (weak)
-static CtMcrMarkSpanEndFn g_ct_mark_span_end = nullptr;     // N2 native anchor (weak)
-static bool g_ct_have_shim = false;
-static uint64_t g_ct_shim_geid = 0;
-static uint64_t g_ct_shim_tick = 0;
-static uint64_t g_ct_join_counter = 0; // monotonic per emitted join (shim offset + ordering aid)
-
-// content prefix that identifies a nested-trace join event (parent-kind gdscript).
-static const char *CT_JOIN_TAG = "ct-nested-join:gdscript";
-
-static void gdscript_ct_resolve_join_source() {
-	if (g_ct_join_resolved != 0) {
-		return;
-	}
-	g_ct_join_resolved = -1;
-	// 1. The live MCR interface (weak; absent when standalone).
-	void *sym = dlsym(RTLD_DEFAULT, "ct_mcr_now");
-	if (sym) {
-		g_ct_mcr_now = (CtMcrNowFn)sym;
-		g_ct_join_resolved = 1;
-	}
-	// N2: the native-marker entry points, weakly (both present or both absent —
-	// they live in the same interposer dylib, so the enter/exit span stack stays
-	// balanced). Absent when standalone (macOS today) -> native-anchor emission is
-	// inert and the join keys fall back to the N1 sample path.
-	g_ct_mark_span_start = (CtMcrMarkSpanStartFn)dlsym(RTLD_DEFAULT, "ct_mcr_mark_span_start");
-	g_ct_mark_span_end = (CtMcrMarkSpanEndFn)dlsym(RTLD_DEFAULT, "ct_mcr_mark_span_end");
-	// 2. The env shim (also honored as a controlled override; the live interface
-	//    takes precedence when it yields a usable coordinate).
-	const char *g = getenv("CT_MCR_GEID");
-	const char *t = getenv("CT_MCR_TICK");
-	if (g && g[0] != '\0') {
-		g_ct_shim_geid = strtoull(g, nullptr, 0);
-		g_ct_shim_tick = (t && t[0] != '\0') ? strtoull(t, nullptr, 0) : 0;
-		g_ct_have_shim = true;
-		g_ct_join_resolved = 1;
-	}
-}
-
-// Sample the parent native (geid, tick). Returns false when no parent context is
-// available (standalone) — the caller then emits nothing.
-static bool gdscript_ct_sample_join_key(uint64_t *out_geid, uint64_t *out_tick) {
-	gdscript_ct_resolve_join_source();
-	if (g_ct_join_resolved != 1) {
-		return false;
-	}
-	// Prefer the live MCR interface when it yields a usable coordinate.
-	if (g_ct_mcr_now) {
-		CtMcrCoordinates c = {};
-		g_ct_mcr_now(&c);
-		if (c.recordingAvailable && c.hasGeid) {
-			*out_geid = c.geid;
-			*out_tick = (uint64_t)c.monotonicTimeNs;
-			return true;
-		}
-	}
-	// Fall back to the controllable shim: base + monotonic per-join offset.
-	if (g_ct_have_shim) {
-		*out_geid = g_ct_shim_geid + g_ct_join_counter;
-		*out_tick = g_ct_shim_tick + g_ct_join_counter;
-		return true;
-	}
-	return false;
-}
-
-// Emit one nested-trace join event bound to the current step. ASSUMES the emit
-// lock is held. `site` is 0 call-enter / 1 call-exit / 2 native-call. INERT (no
-// event) when tracing is inactive, no step exists yet, or no parent context is
-// available (standalone -> byte-identical).
-//
-// `have_override` lets the caller supply an AUTHORITATIVE (geid, tick) sampled
-// from a native anchor it just emitted (N2 ct_mcr_mark_span_*), instead of the
-// read-only ct_mcr_now cursor / shim. When set, the join key is exactly the
-// native anchor's coordinate, so native->nested resolves to a REAL native event
-// (nested-trace-correlation.md §3.2), not just the sampled cursor.
-static void gdscript_ct_emit_join_locked(int site, bool have_override = false,
-		uint64_t ov_geid = 0, uint64_t ov_tick = 0) {
-	if (g_ct_disabled || !g_ct_writer || !g_ct_started) {
-		return;
-	}
-	uint64_t geid = 0, tick = 0;
-	if (have_override) {
-		geid = ov_geid;
-		tick = ov_tick;
-	} else if (!gdscript_ct_sample_join_key(&geid, &tick)) {
-		return;
-	}
-	// step this join binds to: next_step_index() accounts for the pending step, so
-	// the just-registered line is next_step_index() - 1 (same rule as the async
-	// markers — see gdscript_ct_emit_async_marker).
-	uint64_t next = trace_writer_next_step_index(g_ct_writer);
-	uint64_t step = (next > 0) ? (next - 1) : 0;
-	uint64_t thread = gdscript_ct_current_thread();
-	const char *site_str = (site == 0) ? "call-enter" : (site == 1) ? "call-exit"
-																	 : "native-call";
-	// content: self-describing (ct-print surfaces this as the io event `text`; it
-	// does NOT surface metadata). metadata: the same fields (structured consumers).
-	char content[192];
-	snprintf(content, sizeof(content),
-			"%s geid=%llu tick=%llu step=%llu site=%s thread=%llu",
-			CT_JOIN_TAG, (unsigned long long)geid, (unsigned long long)tick,
-			(unsigned long long)step, site_str, (unsigned long long)thread);
-	char meta[160];
-	snprintf(meta, sizeof(meta),
-			"geid=%llu tick=%llu step=%llu site=%s thread=%llu",
-			(unsigned long long)geid, (unsigned long long)tick,
-			(unsigned long long)step, site_str, (unsigned long long)thread);
-	trace_writer_register_special_event(g_ct_writer, FFI_EVENT_TRACE_LOG_EVENT, meta, content);
-	g_ct_join_counter++;
-}
-
-// ---------------------------------------------------------------------------
-// N2: native-anchor span markers at the GDScriptFunction::call boundary.
-//
-// Closes N1 gap (b): where N1 only SAMPLED the parent's read-only cursor
-// (ct_mcr_now), N2 emits a REAL native event (an OTel-style span marker) into the
-// parent MCR trace at each GDScript frame's entry/exit via ct_mcr_mark_span_*.
-// The marker allocates an authoritative native GEID and IS a native event that a
-// native->nested lookup can land on — the co-located native anchor for the
-// GDScript call. Its returned GEID becomes the call-enter / call-exit join key
-// (passed as the emit override) so the two traces share the same authoritative
-// coordinate at that boundary.
-//
-// INERT STANDALONE: on a build with no MCR interposer loaded (macOS today, or any
-// standalone run) dlsym yields null for both symbols, the span stack is never
-// touched, and nothing is emitted on either side — the nested .ct stays
-// byte-identical and the join keys fall back to the N1 sample path. The real
-// native-marker effect is exercised under a live `ct-mcr record` on the Linux
-// substrate (N2 e2e — see GDScript-Recorder.milestones.org N2 runbook).
-struct CtNativeSpanFrame {
-	uint64_t start_geid; // authoritative GEID the matching mark_span_end links to
-	char span_id[17];    // 16 hex chars + NUL — this frame's OTel span id
-	bool used;           // true iff mark_span_start actually emitted a native event
-};
-// Per-thread span nesting stack (LIFO, mirrors GDScriptFunction::call nesting on
-// that thread). thread_local keeps pairing correct even though the emit lock
-// serialises threads.
-static thread_local CtNativeSpanFrame g_ct_span_stack[256];
-static thread_local int g_ct_span_depth = 0;
-static thread_local uint64_t g_ct_span_counter = 0;
-
-// The process-stable 32-hex-char OTel trace id (all this engine's GDScript span
-// markers share one trace id; computed once from the pid).
-static const char *gdscript_ct_trace_id_hex() {
-	static char trace_id[33];
-	static bool ready = false;
-	if (!ready) {
-		// Two u64 halves => exactly 32 hex chars. A fixed high tag + the pid keeps
-		// it well-formed and stable for this process.
-		snprintf(trace_id, sizeof(trace_id), "%016llx%016llx",
-				(unsigned long long)0xC0DE772ACE900001ULL,
-				(unsigned long long)getpid());
-		ready = true;
-	}
-	return trace_id;
-}
-
-// Emit the native span-start anchor for the frame just entered. Returns true and
-// fills *out_geid/*out_tick with the authoritative native coordinate when the
-// marker was emitted; false (no override) when the native-marker interface is
-// absent (standalone) or the marker did not emit. ASSUMES the emit lock is held.
-static bool gdscript_ct_native_span_enter(uint64_t *out_geid, uint64_t *out_tick) {
-	gdscript_ct_resolve_join_source();
-	if (!g_ct_mark_span_start || !g_ct_mark_span_end) {
-		return false; // no native-anchor path — leave the span stack untouched (inert).
-	}
-	if (g_ct_span_depth >= (int)(sizeof(g_ct_span_stack) / sizeof(g_ct_span_stack[0]))) {
-		return false; // pathological recursion depth — skip the anchor, stay balanced-safe.
-	}
-	CtNativeSpanFrame &frame = g_ct_span_stack[g_ct_span_depth];
-	frame.used = false;
-	frame.start_geid = 0;
-	// This frame's span id: (thread << 40) ^ counter, formatted as 16 hex.
-	uint64_t span_val = (gdscript_ct_current_thread() << 40) ^ (g_ct_span_counter + 1);
-	g_ct_span_counter++;
-	snprintf(frame.span_id, sizeof(frame.span_id), "%016llx", (unsigned long long)span_val);
-	// Parent span = the enclosing frame's span id (null at the outermost frame).
-	const char *parent = (g_ct_span_depth > 0) ? g_ct_span_stack[g_ct_span_depth - 1].span_id : nullptr;
-	g_ct_span_depth++; // push BEFORE emitting so a re-entrant emit sees the right parent.
-
-	CtMcrCoordinates coords = {};
-	int rc = g_ct_mark_span_start(gdscript_ct_trace_id_hex(), frame.span_id, parent, "gdscript", &coords);
-	if (rc == 1 && coords.hasGeid && coords.recordingAvailable) {
-		frame.used = true;
-		frame.start_geid = coords.geid;
-		*out_geid = coords.geid;
-		*out_tick = (uint64_t)coords.monotonicTimeNs; // tick fidelity: §6 gap (a)
-		return true;
-	}
-	return false;
-}
-
-// Emit the native span-end anchor for the frame being exited, matching the most
-// recent gdscript_ct_native_span_enter on this thread. Returns true + the
-// authoritative end coordinate when emitted. ASSUMES the emit lock is held.
-static bool gdscript_ct_native_span_exit(uint64_t *out_geid, uint64_t *out_tick) {
-	gdscript_ct_resolve_join_source();
-	if (!g_ct_mark_span_start || !g_ct_mark_span_end || g_ct_span_depth <= 0) {
-		return false; // inert / no matching push.
-	}
-	g_ct_span_depth--; // pop
-	CtNativeSpanFrame &frame = g_ct_span_stack[g_ct_span_depth];
-	if (!frame.used) {
-		return false; // the matching start did not emit a native anchor.
-	}
-	const char *parent = (g_ct_span_depth > 0) ? g_ct_span_stack[g_ct_span_depth - 1].span_id : nullptr;
-	CtMcrCoordinates coords = {};
-	int rc = g_ct_mark_span_end(gdscript_ct_trace_id_hex(), frame.span_id, parent, "gdscript",
-			frame.start_geid, &coords);
-	if (rc == 1 && coords.hasGeid && coords.recordingAvailable) {
-		*out_geid = coords.geid;
-		*out_tick = (uint64_t)coords.monotonicTimeNs;
-		return true;
-	}
-	return false;
 }
 
 bool gdscript_ct_trace_active() {
@@ -847,15 +564,6 @@ void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source
 	size_t fid = trace_writer_ensure_function_id(g_ct_writer,
 			name_cs.get_data(), src_cs.get_data(), p_line);
 	trace_writer_register_call(g_ct_writer, fid);
-	// N2: emit a NATIVE span-start anchor for this GDScript frame (a real native
-	// event in the parent MCR trace) and use its authoritative (GEID, tick) as the
-	// call-enter join key. Falls back to the N1 sample path when the native-marker
-	// interface is absent (standalone -> inert, nothing emitted on either side).
-	uint64_t a_geid = 0, a_tick = 0;
-	bool anchored = gdscript_ct_native_span_enter(&a_geid, &a_tick);
-	// N1/N2: tag this GDScript frame's entry with the parent native (GEID, tick).
-	// Inert (nothing emitted) standalone or before the first step exists.
-	gdscript_ct_emit_join_locked(0 /* call-enter */, anchored, a_geid, a_tick);
 }
 
 // GF5: forward declarations — the return hook (below) reuses the recursive
@@ -876,19 +584,6 @@ void gdscript_ct_trace_return(const Variant &p_return_value) {
 	// rides the call stream (not the shared pending step), so it is captured
 	// reliably even under interleaving.
 	gdscript_ct_note_thread_locked(gdscript_ct_current_thread());
-
-	// N2: emit the matching NATIVE span-end anchor for this frame (the native event
-	// the parent MCR trace closes the frame's span with) and use its authoritative
-	// (GEID, tick) as the call-exit join key. Balanced with the span-start pushed by
-	// the matching gdscript_ct_trace_call (per-thread LIFO stack). Inert / sample
-	// fallback when the native-marker interface is absent.
-	uint64_t x_geid = 0, x_tick = 0;
-	bool x_anchored = gdscript_ct_native_span_exit(&x_geid, &x_tick);
-	// N1/N2: tag this GDScript frame's exit with the parent native (GEID, tick),
-	// on BOTH exit paths (normal + await-resume). Emitted before the return record
-	// (order is irrelevant — the join binds to the current step, not the return).
-	// Inert (nothing emitted) standalone or before the first step exists.
-	gdscript_ct_emit_join_locked(1 /* call-exit */, x_anchored, x_geid, x_tick);
 
 	// GF5: capture the return VALUE. Encode it with the same recursive
 	// ct_value_* encoder G4/GF3/GF4 use for locals, then attach it to the
@@ -917,21 +612,6 @@ void gdscript_ct_trace_return(const Variant &p_return_value) {
 		return;
 	}
 	trace_writer_register_return_cbor(g_ct_writer, cbor, cbor_len);
-}
-
-// N1: native-call join. Called from the native-call opcodes (OPCODE_CALL and
-// OPCODE_CALL_METHOD_BIND*) right after the native method executed — the crossing
-// where the parent native MCR trace is the continuation of this GDScript step.
-void gdscript_ct_trace_native_call() {
-	CtEmitLock lk; // serialize + reentrancy-guard (as every emit hook does)
-	if (!lk.engaged) {
-		return;
-	}
-	// Never creates the writer; a native call only matters once recording is live.
-	if (g_ct_disabled || !g_ct_writer) {
-		return;
-	}
-	gdscript_ct_emit_join_locked(2 /* native-call */);
 }
 
 // GF3: intern the compound-collection types on first use. Kept out of
@@ -1417,15 +1097,20 @@ static void gdscript_ct_emit_named_value(const String &p_name, const Variant &p_
 			name_cs.get_data(), cbor, cbor_len);
 }
 
-void gdscript_ct_trace_assign(const GDScriptFunction *p_func, int p_dest_address,
-		const Variant &p_value, int p_line) {
+// A write to a NAMED local / argument / member. The GDScriptTracer hook has
+// already resolved the slot/opcode to its declared name (via the debugger's own
+// slot->name tables), so this consumer only encodes the Variant and attaches it
+// to the current step. Covers the stack-slot path (OPCODE_ASSIGN* into a local),
+// the instance-member path (ADDR_TYPE_MEMBER), and the direct-name member-write
+// opcodes (SET_MEMBER / SET_NAMED / SET_NAMED_VALIDATED / SET_STATIC_VARIABLE).
+static void gdscript_ct_trace_variable_write(const StringName &p_name, const Variant &p_value) {
 	CtEmitLock lk; // GF12: serialize + reentrancy-guard
 	if (!lk.engaged) {
 		return;
 	}
 	// A value can only attach to an already-registered step; refuse otherwise
 	// so values.dat stays parallel-indexed to steps.dat.
-	if (g_ct_disabled || !g_ct_writer || !g_ct_started || !p_func) {
+	if (g_ct_disabled || !g_ct_writer || !g_ct_started) {
 		return;
 	}
 	// GF12: attach only if THIS thread still owns the writer's pending step. If
@@ -1436,85 +1121,95 @@ void gdscript_ct_trace_assign(const GDScriptFunction *p_func, int p_dest_address
 	if (g_ct_pending_owner != gdscript_ct_current_thread()) {
 		return;
 	}
-
-	// Decode the destination address. STACK writes (local variables / arguments)
-	// resolve their name from stack_debug; MEMBER writes (instance fields —
-	// GF8) resolve it from the owning script's member_indices. CONSTANT slots
-	// are never written.
-	int addr_type = (p_dest_address & GDScriptFunction::ADDR_TYPE_MASK) >> GDScriptFunction::ADDR_BITS;
-	int slot = p_dest_address & GDScriptFunction::ADDR_MASK;
-
-	if (addr_type == GDScriptFunction::ADDR_TYPE_MEMBER) {
-		// GF8: a write into an instance member slot — the common `member = expr`
-		// / `self.member = expr` case, plus member initializers, @export
-		// defaults and @onready assignments (all of which the compiler emits as
-		// an OPCODE_ASSIGN* into an ADDR_TYPE_MEMBER destination — see
-		// gdscript_compiler.cpp). The 24-bit slot is the member INDEX into the
-		// instance's `members` array; invert it to the declared name via the
-		// owning script's member_indices (debug_get_member_by_index).
-		const GDScript *scr = p_func->get_script();
-		if (!scr) {
-			return;
-		}
-		StringName mname = scr->debug_get_member_by_index(slot);
-		String mname_str = String(mname);
-		if (mname_str.is_empty() || mname_str == "<error>") {
-			// Not a resolvable member (should not happen for a real field);
-			// skip rather than emit a bogus name.
-			return;
-		}
-		gdscript_ct_emit_named_value(mname_str, p_value);
-		return;
-	}
-
-	if (addr_type != GDScriptFunction::ADDR_TYPE_STACK) {
-		return;
-	}
-
-	// Resolve slot -> declared name using the same table Godot's own debugger
-	// uses for `debug_get_stack_level_locals` (GDScriptFunction::stack_debug,
-	// populated only when local tracking is on — we force it via
-	// gdscript_ct_trace_active(); see GDScriptLanguage's constructor). We pass
-	// `line + 1` so a variable declared ON the current line (its stack_debug
-	// entry has sd.line == line) is IN scope: debug_get_stack_member_state
-	// keeps entries with sd.line < p_line, so the +1 includes the just-declared
-	// local while still excluding anything declared on a later line.
-	List<Pair<StringName, int>> locals;
-	p_func->debug_get_stack_member_state(p_line + 1, &locals);
-	const StringName *name = nullptr;
-	for (const Pair<StringName, int> &e : locals) {
-		if (e.second == slot) {
-			name = &e.first;
-			break;
-		}
-	}
-	if (!name) {
-		// The slot is not a named local at this line: it is a compiler
-		// temporary (expression intermediate results never enter stack_debug),
-		// so we skip it — mirroring codetracer-nim's resolveTracedSlotSym.
-		return;
-	}
-
-	// Loop iterators and other synthetic locals ARE in stack_debug but carry an
-	// `@`-prefixed name; gdscript_ct_emit_named_value treats them as temporaries.
-	gdscript_ct_emit_named_value(String(*name), p_value);
+	// gdscript_ct_emit_named_value still skips empty / `@`-prefixed synthetic
+	// names (loop iterators, compiler temporaries) as a defensive filter.
+	gdscript_ct_emit_named_value(String(p_name), p_value);
 }
 
-// GF8: member writes whose opcode carries the member NAME directly (not a
-// stack-slot address). See the header for the covered opcodes. Same
-// parallel-index contract as gdscript_ct_trace_assign: a member value can only
-// attach to an already-registered step.
-void gdscript_ct_trace_member_assign(const StringName &p_name, const Variant &p_value) {
+// A write to a stack/member slot addressed by OPERAND (OPCODE_ASSIGN* /
+// OPCODE_OPERATOR* into a local, or an ADDR_TYPE_MEMBER slot). Unlike the
+// direct-name writes above, the declared name is resolved HERE — under the emit
+// lock, AFTER the pending-step ownership check — by calling the engine-side
+// resolver gdscript_trace_resolve_slot_name(). Doing the (List-allocating)
+// resolution INSIDE the lock rather than eagerly in the VM hook keeps the window
+// between this thread's step and its value tiny, so a concurrent worker thread
+// cannot register its own step and steal the writer's single shared pending-step
+// slot mid-write, which would force this value to be dropped (GF12). This mirrors
+// the pre-refactor gdscript_ct_trace_assign ordering exactly. `p_func` is opaque
+// here (only handed back to the resolver), so this consumer stays free of any VM
+// header.
+static void gdscript_ct_trace_slot_write(const GDScriptFunction *p_func, int p_dest_address,
+		const Variant &p_value, int p_line) {
 	CtEmitLock lk; // GF12: serialize + reentrancy-guard
 	if (!lk.engaged) {
 		return;
 	}
-	if (g_ct_disabled || !g_ct_writer || !g_ct_started) {
+	// A value can only attach to an already-registered step; refuse otherwise so
+	// values.dat stays parallel-indexed to steps.dat.
+	if (g_ct_disabled || !g_ct_writer || !g_ct_started || !p_func) {
 		return;
 	}
-	// GF12: parallel-index safety under threads (see gdscript_ct_trace_assign).
+	// GF12: attach only if THIS thread still owns the writer's pending step (see
+	// gdscript_ct_trace_variable_write). Checked BEFORE resolution so a foreign
+	// slot costs nothing and — crucially — resolution runs while we still hold the
+	// lock and the ownership, closing the steal window that eager resolution opened.
 	if (g_ct_pending_owner != gdscript_ct_current_thread()) {
 		return;
 	}
-	gdscript_ct_emit_named_value(String(p_name), p_value);
+	StringName name = gdscript_trace_resolve_slot_name(p_func, p_dest_address, p_line);
+	if (name == StringName()) {
+		// Compiler temporary / unresolvable slot: not a source-level variable.
+		return;
+	}
+	gdscript_ct_emit_named_value(String(name), p_value);
+}
+
+// ---------------------------------------------------------------------------
+// Consumer registration.
+//
+// This recorder implements the general GDScriptTracer interface by forwarding
+// each callback to the entry points above, and registers a single instance at
+// static-init time (which runs before GDScriptLanguage is constructed) when
+// CT_GDSCRIPT_TRACE is set. When the env var is unset no tracer is registered,
+// so a build that includes this file behaves exactly like a stock+hook engine
+// (the VM's tracer pointer stays null and every seam is a no-op).
+class GdscriptCtTracer : public GDScriptTracer {
+public:
+	virtual void on_line(const StringName &p_source, int p_line) override {
+		gdscript_ct_trace_step(p_source, p_line);
+	}
+	virtual void on_call(const StringName &p_function, const StringName &p_source, int p_line) override {
+		gdscript_ct_trace_call(p_function, p_source, p_line);
+	}
+	virtual void on_return(const Variant &p_return_value) override {
+		gdscript_ct_trace_return(p_return_value);
+	}
+	virtual void on_variable_write(const StringName &p_name, const Variant &p_value) override {
+		gdscript_ct_trace_variable_write(p_name, p_value);
+	}
+	virtual void on_slot_write(const GDScriptFunction *p_func, int p_dest_address, const Variant &p_value, int p_line) override {
+		gdscript_ct_trace_slot_write(p_func, p_dest_address, p_value, p_line);
+	}
+	virtual void on_await_suspend(const void *p_context_id) override {
+		gdscript_ct_trace_await_suspend(p_context_id);
+	}
+	virtual void on_await_resume(const void *p_context_id) override {
+		gdscript_ct_trace_await_resume(p_context_id);
+	}
+	virtual void on_utility_call(const StringName &p_function, const Variant **p_args, int p_argc) override {
+		gdscript_ct_trace_utility_diagnostic(p_function, p_args, p_argc);
+	}
+	virtual bool wants_local_tracking() const override { return true; }
+};
+
+// Registered once, from initialize_gdscript_module() BEFORE the GDScriptLanguage
+// constructor runs (so track_locals is forced on in time). No-op unless
+// CT_GDSCRIPT_TRACE is set, so a build that includes this consumer behaves like
+// a stock+hook engine when recording is off. Explicit registration (rather than
+// a static initializer) keeps it deterministic and immune to linker dead-strip.
+void gdscript_ct_trace_register() {
+	static GdscriptCtTracer s_tracer;
+	if (gdscript_ct_trace_active()) {
+		GDScriptTracer::set_active(&s_tracer);
+	}
 }

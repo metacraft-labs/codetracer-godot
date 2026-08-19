@@ -29,7 +29,7 @@
 /**************************************************************************/
 
 #include "gdscript.h"
-#include "gdscript_ct_trace.h" // CodeTracer G2: per-line step emit
+#include "gdscript_tracer.h" // General GDScript execution-tracing hook
 #include "gdscript_function.h"
 #include "gdscript_lambda_callable.h"
 
@@ -663,7 +663,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 	GDScriptLanguage::CallLevel call_level;
 	GDScriptLanguage::get_singleton()->enter_function(&call_level, p_instance, this, stack, &ip, &line);
 
-	gdscript_ct_trace_call(name, source, _initial_line); // CodeTracer G3: call entry
+	gdscript_trace_call(name, source, _initial_line); // Tracer hook: call entry
 
 #ifdef DEBUG_ENABLED
 #define GD_ERR_BREAK(m_cond)                                                                                           \
@@ -715,13 +715,13 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 #endif // DEBUG_ENABLED
 
-// CodeTracer G4: capture the Variant just written to destination operand
+// Tracer hook: report the Variant just written to destination operand
 // `m_code_ofs` (whose raw 24-bit-encoded address is _code_ptr[ip + 1 +
-// m_code_ofs]) as the value of the named local at the current `line`. `m_dst`
-// is the already-decoded destination Variant*. The glue no-ops cheaply when
-// tracing is inactive and skips slots that are not named source-level locals.
+// m_code_ofs]) at the current `line`. `m_dst` is the already-decoded
+// destination Variant*. The shim no-ops cheaply when no tracer is registered
+// and resolves the slot to a named source-level variable before dispatching.
 #define CT_TRACE_ASSIGN(m_dst, m_code_ofs) \
-	gdscript_ct_trace_assign(this, _code_ptr[ip + 1 + (m_code_ofs)], *(m_dst), line)
+	gdscript_trace_slot_write(this, _code_ptr[ip + 1 + (m_code_ofs)], *(m_dst), line)
 
 #define LOAD_INSTRUCTION_ARGS                   \
 	int instr_arg_count = _code_ptr[ip + 1];    \
@@ -1241,7 +1241,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					OPCODE_BREAK;
 				}
 #endif
-				gdscript_ct_trace_member_assign(*index, *value); // CodeTracer GF8: in-place named write on a base
+				gdscript_trace_named_write(*index, *value); // Tracer hook: in-place named write on a base
 				ip += 4;
 			}
 			DISPATCH_OPCODE;
@@ -1267,7 +1267,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				// write_set_named). The written field value is *value (the
 				// source Variant), mirroring the OPCODE_SET_NAMED hook.
 				if (index_setter < setter_names.size()) {
-					gdscript_ct_trace_member_assign(StringName(setter_names[index_setter]), *value);
+					gdscript_trace_named_write(StringName(setter_names[index_setter]), *value);
 				}
 #endif
 				ip += 4;
@@ -1339,7 +1339,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					OPCODE_BREAK;
 				}
 #endif
-				gdscript_ct_trace_member_assign(*index, *src); // CodeTracer GF8: self native/registered property write
+				gdscript_trace_named_write(*index, *src); // Tracer hook: self native/registered property write
 				ip += 3;
 			}
 			DISPATCH_OPCODE;
@@ -1377,7 +1377,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 
 				gdscript->static_variables.write[index] = *value;
 
-				gdscript_ct_trace_member_assign(gdscript->debug_get_static_var_by_index(index), *value); // CodeTracer GF8: static var write
+				gdscript_trace_named_write(gdscript->debug_get_static_var_by_index(index), *value); // Tracer hook: static var write
 				ip += 4;
 			}
 			DISPATCH_OPCODE;
@@ -2050,8 +2050,6 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				}
 #endif // DEBUG_ENABLED
 
-				gdscript_ct_trace_native_call(); // CodeTracer N1: native-call join key
-
 				ip += 3;
 			}
 			DISPATCH_OPCODE;
@@ -2139,8 +2137,6 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					OPCODE_BREAK;
 				}
 #endif
-				gdscript_ct_trace_native_call(); // CodeTracer N1: native-call join key
-
 				ip += 3;
 			}
 			DISPATCH_OPCODE;
@@ -2450,10 +2446,9 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				Callable::CallError err;
 				Variant::call_utility_function(function, dst, (const Variant **)argptrs, argc, err);
 
-				// CodeTracer GF13: record push_error / push_warning (GDScript's
-				// only diagnostic surface — it has no exceptions) as an events.dat
-				// special event; every other utility call is ignored.
-				gdscript_ct_trace_utility_diagnostic(function, (const Variant **)argptrs, argc);
+				// Tracer hook: observe the utility call (a consumer may record
+				// push_error / push_warning — GDScript's only diagnostic surface).
+				gdscript_trace_utility_call(function, (const Variant **)argptrs, argc);
 
 #ifdef DEBUG_ENABLED
 				if (err.error != Callable::CallError::CALL_OK) {
@@ -2689,7 +2684,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 					// CallState the matching resume re-enters call() with (see
 					// GDScriptFunctionState::resume), so it is the stable async
 					// context_id pairing this suspend with its continuation.
-					gdscript_ct_trace_await_suspend(&gdfs->state);
+					gdscript_trace_await_suspend(&gdfs->state);
 
 #ifdef DEBUG_ENABLED
 					exit_ok = true;
@@ -2711,7 +2706,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				// CallState pointer the matching suspend recorded, so it pairs this
 				// continuation with its registration. Deferred to the next per-line
 				// step so continuation.step_id is the first resumed source line.
-				gdscript_ct_trace_await_resume(p_state);
+				gdscript_trace_await_resume(p_state);
 
 				GET_VARIANT_PTR(result, 0);
 				*result = p_state->result;
@@ -3962,7 +3957,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 				line = _code_ptr[ip + 1];
 				ip += 2;
 
-				gdscript_ct_trace_step(source, line); // CodeTracer G2: per-line step
+				gdscript_trace_line(source, line); // Tracer hook: per-line step
 
 				if (EngineDebugger::is_active()) {
 					// line
@@ -4059,7 +4054,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 	// If that is the case then we exit the function as normal. Otherwise we postpone it until the last `await` is completed.
 	// This ensures the call stack can be properly shown when using `await`, showing what resumed the function.
 	if (!p_state || awaited) {
-		gdscript_ct_trace_return(retvalue); // CodeTracer G3 return + GF5 return value (normal / yield-suspend exit)
+		gdscript_trace_return(retvalue); // Tracer hook: return (normal / yield-suspend exit)
 		GDScriptLanguage::get_singleton()->exit_function();
 
 		// Free stack, except reserved addresses.
@@ -4083,7 +4078,7 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 		p_state->completed.emit(args, 1);
 
 		// Exit function only after executing the remaining function states to preserve async call stack.
-		gdscript_ct_trace_return(retvalue); // CodeTracer G3 return + GF5 return value (await-resume completion exit)
+		gdscript_trace_return(retvalue); // Tracer hook: return (await-resume completion exit)
 		GDScriptLanguage::get_singleton()->exit_function();
 	}
 

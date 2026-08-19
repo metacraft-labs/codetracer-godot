@@ -32,6 +32,7 @@
 
 #include "gdscript.h"
 #include "gdscript_cache.h"
+#include "gdscript_ct_trace.h" // Register the bundled CodeTracer recorder consumer.
 #include "gdscript_parser.h"
 #include "gdscript_tokenizer_buffer.h"
 #include "gdscript_utility_functions.h"
@@ -139,6 +140,12 @@ static void _editor_init() {
 void initialize_gdscript_module(ModuleInitializationLevel p_level) {
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SERVERS) {
 		GDREGISTER_CLASS(GDScript);
+
+		// Register the bundled execution-tracing consumer BEFORE constructing
+		// GDScriptLanguage, whose constructor queries gdscript_tracer_wants_locals()
+		// to decide whether to force local-variable tracking on. No-op unless
+		// CT_GDSCRIPT_TRACE is set.
+		gdscript_ct_trace_register();
 
 		script_language_gd = memnew(GDScriptLanguage);
 		ScriptServer::register_language(script_language_gd);
