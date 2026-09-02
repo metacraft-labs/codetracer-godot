@@ -112,6 +112,13 @@ int trace_writer_finish_paths(trace_writer_t handle);
 
 void trace_writer_start(trace_writer_t handle, const char* path, int64_t line);
 void trace_writer_set_workdir(trace_writer_t handle, const char* workdir);
+/* IC-M2: stamp a fully-qualified-key origin namespace (the VM language, e.g.
+ * "gdscript") on every interned string when this materialized writer shares a
+ * container with the native recorder (MCR).  Call BEFORE trace_writer_begin_events.
+ * Passing "" (or never calling it) keeps bare payloads, byte-identical to a
+ * standalone trace. */
+void trace_writer_set_interning_qualifier(trace_writer_t handle,
+                                          const char* qualifier);
 void trace_writer_register_step(trace_writer_t handle,
                                 const char* path, int64_t line);
 
@@ -159,31 +166,22 @@ void trace_writer_register_special_event(trace_writer_t handle,
     int kind, const char* metadata, const char* content);
 
 /* --------------------------------------------------------------------------
- * Bundled source text (Alternate Source Views — Deminification / self-
- * contained sources)
+ * Source-view bundling (§5.2)
  *
- * Buffer the source bytes for an already-registered path into the
- * container's `srcviews.dat` / `srcviews.off` extension streams (spec:
- * codetracer-trace-format-spec/internal-files.md §"Alternate Source Views").
- * The GDScript recorder uses this to BUNDLE each recorded `.gd`'s source
- * text into the `.ct` so a replay host can resolve the Godot `res://`
- * virtual path — which never exists on the debugging host's filesystem —
- * without the original project checkout (Mixed-Native-GDScript-Debugging
- * §3.2 / §5.2; Value-Origin-Tracking §6.1 bundled-sources resolution).
+ * Bundle a `.gd` (or any) source's text into the container so a virtual
+ * `res://` path resolves at replay. `path_id` is the writer-interned path
+ * index (first-seen registration order, starting at 0). `view_kind` is
+ * 0 = raw original source, 1 = prettier, 2 = black, 128+ vendor-specific.
+ * `view_name` is a display name (need not be NUL-terminated — pass its
+ * length). `sourcemap` may be NULL / length 0 for a raw identity bundle.
  *
- * `path_id` MUST refer to a path already interned via
- * trace_writer_start / trace_writer_register_step (paths are interned in
- * first-seen registration order, starting at 0). `view_kind` is 0 = raw
- * (the original source itself — what the recorder bundles), 1 = prettier,
- * 2 = black, 128+ vendor-specific. `view_name` is a display name (need not
- * be NUL-terminated — pass its length). `sourcemap` may be NULL / length 0
- * ("no map"), which is what a raw identity bundle carries.
+ * Only the binary (multi-stream) backend supports source views. Returns the
+ * new view's 0-based index on success, -1 on failure.
  *
- * Only the binary (multi-stream) backend supports source views. Registering
- * at least one adds the srcviews.dat/off streams (and their meta.dat flag);
- * a recording that registers none is byte-for-byte unchanged — the step /
- * value / call streams are never touched. Returns the new view's 0-based
- * index on success, -1 on failure (see trace_writer_last_error).
+ * NOTE (vendored): this declaration is preserved from the prior header
+ * revision — the refreshed upstream header dropped it, but the symbol is
+ * still exported by libcodetracer_trace_writer.a and the GDScript recorder
+ * (gdscript_ct_trace.cpp §5.2) depends on it. See the SCsub note.
  * -------------------------------------------------------------------------- */
 
 int64_t trace_writer_register_source_view(trace_writer_t handle,
@@ -275,6 +273,41 @@ int trace_writer_register_span(trace_writer_t handle,
 int trace_writer_flush_spans(trace_writer_t handle);
 
 /*
+ * Open a native<->VM crossing span (Mixed-Trace-Debugging.md §3) and return its
+ * minted span_id — the handle to pass to trace_writer_end_crossing.  The
+ * crossing's start_step is the index of the first materialized step inside the
+ * VM frame; the buffered pending step is flushed first (as
+ * trace_writer_register_call does) so a crossing wrapping a call gets the same
+ * start_step the call gets as its entryStep.  span_type names the crossing kind
+ * (e.g. "gdscript-frame"), discriminated like "web-request" / "process".
+ *
+ * Streaming correctness (nested-trace-correlation.md §1.4): this call emits an
+ * OPEN span record (flags.open, end_step = 0) and flushes it immediately, so the
+ * in-flight crossing is visible to a reader before trace_writer_end_crossing
+ * settles it with the same span_id (last-record-wins).
+ *
+ * Crossings index the materialized step space, so ONLY the multi-stream backend
+ * supports them.  Returns 0 (never a valid 1-based span id) on any error — NULL
+ * handle, a non-multi-stream backend, a not-ready or closed writer, or a failure
+ * to write the open record — with trace_writer_last_error set.
+ */
+uint64_t trace_writer_begin_crossing(trace_writer_t handle,
+    const char* span_type);
+
+/*
+ * Settle the crossing opened as span_id: its SpanRecord is written (same span_id
+ * as the open record begin emitted, last-record-wins) with end_step = the last
+ * materialized step inside the frame, then the span stream is flushed so the
+ * record is committed to the container immediately (mid-run visibility, §3).  The
+ * pending step is flushed first (as trace_writer_register_return does).
+ * Crossings close strictly LIFO: span_id must be the innermost still-open
+ * crossing.  Returns 0 on success, non-zero (with trace_writer_last_error set) on
+ * a NULL handle, a non-multi-stream backend, a not-ready writer, or a span_id
+ * that is not the innermost open crossing.
+ */
+int trace_writer_end_crossing(trace_writer_t handle, uint64_t span_id);
+
+/*
  * The exec-stream index the NEXT event registered on this writer will occupy —
  * the `start_step` a span opened right now should carry.  A span that runs from
  * here to there is `start_step = trace_writer_next_step_index()` at entry and
@@ -349,6 +382,51 @@ int ct_write_meta_dat_to_buffer(
     uint8_t** out_buf, size_t* out_len);
 
 void ct_free_buffer(uint8_t* buf);
+
+/* --------------------------------------------------------------------------
+ * CTFS container — internal files added after the container was closed
+ *
+ * Every other writer entry point above operates on a `trace_writer_t`, i.e.
+ * on a container the caller is still building.  These two work on a container
+ * **on disk that has already been closed**, which is why they take a path:
+ * there is no live writer to hand a handle for.
+ *
+ * They exist for producers of *derived* streams — data computed from a
+ * finished trace that, by its own specification, must live inside the same
+ * `.ct` rather than beside it.  Such a producer only knows what it wants to
+ * store after the trace writer has sealed the file.
+ *
+ * Both return 0 on success and non-zero on failure; the reason is available
+ * from trace_writer_last_error().
+ * -------------------------------------------------------------------------- */
+
+/* Write a new, empty CTFS v4 container at `path`.
+ * `block_size = 0` selects the default of 4096. */
+int ct_container_create(const char* path, uint32_t block_size);
+
+/* Append `count` internal files to the already-closed container at `path`.
+ *
+ * names[i]     NUL-terminated internal filename; at most twelve characters
+ *              from [0-9a-z./-] (CTFS base40, see CTFS-Binary-Format.md §3).
+ * contents[i]  the file's complete content; may be NULL when lengths[i] == 0.
+ * lengths[i]   its length in bytes.
+ *
+ * The container must be quiescent (no other writer), unencrypted, v4, and a
+ * whole number of blocks.  A name that already exists is refused: CTFS is
+ * append-only and this call will not overwrite a stream.
+ *
+ * The batch is published as a unit.  All new data and mapping blocks are
+ * written and flushed first; the single rewrite of block 0 that makes them
+ * reachable happens last.  A crash in between leaves unreferenced trailing
+ * blocks — wasteful, still readable — never an entry pointing at absent data.
+ * There is deliberately no singular form of this call: attaching a related
+ * set of streams one at a time would make a half-attached container
+ * reachable, and every reader would have to cope with it. */
+int ct_container_append_files(const char* path,
+                              const char* const* names,
+                              const uint8_t* const* contents,
+                              const size_t* lengths,
+                              size_t count);
 
 /* --------------------------------------------------------------------------
  * meta.dat — reader handle

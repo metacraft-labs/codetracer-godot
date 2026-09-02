@@ -83,6 +83,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex> // GF12: serialize the shared writer/encoder across worker threads
+#include <vector> // MT3: LIFO stack of open native<->VM crossing span ids
 
 // The CTFS writer's C header names a parameter `mutable`, which is a C++
 // keyword. Shim it out for this C++ translation unit (we never call that
@@ -127,6 +128,20 @@ static bool g_ct_started = false;  // trace_writer_start emitted the first step?
 //     no-op instead of a recursive self-lock.
 static std::mutex g_ct_mutex;
 static thread_local bool g_ct_in_emit = false;
+
+// MT3: native<->VM crossing spans. A crossing = one native->VM->native GDScript
+// frame. Each function ENTER (on_call -> gdscript_ct_trace_call) opens a
+// "gdscript-frame" crossing via trace_writer_begin_crossing and pushes the
+// returned span_id; the matching function EXIT (on_return -> gdscript_ct_trace_return)
+// pops it and closes it via trace_writer_end_crossing. Crossings nest and MUST
+// close strictly LIFO (the writer errors otherwise), so this stack is opened and
+// closed at EXACTLY the same sites the writer's own call/return records are, and
+// therefore mirrors the writer's internal call-stack nesting one-for-one. The
+// whole emit path is serialized by g_ct_mutex, so this stack needs no separate
+// lock. A frame that never returns (process killed mid-frame, an await that never
+// resumes) simply leaves its crossing OPEN — the OPEN record was already flushed,
+// and atexit close commits it — which is acceptable degradation, not corruption.
+static std::vector<uint64_t> g_ct_crossing_stack;
 
 // GF12: thread-attribution state (all guarded by g_ct_mutex).
 static bool g_ct_have_active = false;     // has any emit run yet?
@@ -353,6 +368,13 @@ static bool gdscript_ct_ensure_writer() {
 	CharString events_cs = events_path.utf8();
 	trace_writer_set_workdir(g_ct_writer, out_dir);
 	trace_writer_begin_metadata(g_ct_writer, "");
+	// IC-M2: stamp every VM-interned string with the "gdscript" origin namespace
+	// so the materialized names coexist with native names when this container is
+	// combined with the native recorder (MCR). Must be set BEFORE begin_events,
+	// which is where the FFI resolves the shared container and initializes the
+	// writer. Harmless standalone: a lone gdscript trace just carries the
+	// qualifier on its keys (the reader strips it for display).
+	trace_writer_set_interning_qualifier(g_ct_writer, "gdscript");
 	trace_writer_begin_events(g_ct_writer, events_cs.get_data());
 	trace_writer_begin_paths(g_ct_writer, "");
 	atexit(gdscript_ct_close);
@@ -564,6 +586,18 @@ void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source
 	size_t fid = trace_writer_ensure_function_id(g_ct_writer,
 			name_cs.get_data(), src_cs.get_data(), p_line);
 	trace_writer_register_call(g_ct_writer, fid);
+
+	// MT3: open a native<->VM crossing for this frame, at the SAME site (and
+	// under the same lock) as the call record it wraps, so the crossing stack
+	// nests one-for-one with the writer's call stack. begin_crossing flushes the
+	// pending step just like register_call, so the crossing's start_step equals
+	// this call's entry_step. Always push exactly one entry per on_call (0 on
+	// failure) so the matching on_return pops exactly one and the stack stays
+	// balanced with the call/return pairs. Guarded by the live writer handle.
+	if (g_ct_writer) {
+		uint64_t span_id = trace_writer_begin_crossing(g_ct_writer, "gdscript-frame");
+		g_ct_crossing_stack.push_back(span_id);
+	}
 }
 
 // GF5: forward declarations — the return hook (below) reuses the recursive
@@ -584,6 +618,22 @@ void gdscript_ct_trace_return(const Variant &p_return_value) {
 	// rides the call stream (not the shared pending step), so it is captured
 	// reliably even under interleaving.
 	gdscript_ct_note_thread_locked(gdscript_ct_current_thread());
+
+	// MT3: close the native<->VM crossing this frame's matching on_call opened,
+	// popping the innermost entry so crossings close strictly LIFO (as the writer
+	// requires). Done here — before the return-value encoding below, which has
+	// its own early-return paths — so the crossing is closed on EVERY exit path.
+	// end_crossing flushes the pending step like register_return, and the
+	// crossing's end_step is the last materialized step, unaffected by whether the
+	// return record is written before or after this. A 0 span_id (a begin_crossing
+	// that failed) is popped but not closed, keeping the stack balanced.
+	if (!g_ct_crossing_stack.empty()) {
+		uint64_t span_id = g_ct_crossing_stack.back();
+		g_ct_crossing_stack.pop_back();
+		if (span_id != 0) {
+			trace_writer_end_crossing(g_ct_writer, span_id);
+		}
+	}
 
 	// GF5: capture the return VALUE. Encode it with the same recursive
 	// ct_value_* encoder G4/GF3/GF4 use for locals, then attach it to the
