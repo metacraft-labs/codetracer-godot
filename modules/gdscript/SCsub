@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 from misc.utility.scons_hints import *
 
+import os
+
 Import("env")
 Import("env_modules")
 
@@ -11,8 +13,25 @@ env_gdscript = env_modules.Clone()
 # (link-time) come from codetracer-trace-format-nim, vendored under
 # modules/gdscript/ct_writer/ (header in ct_writer/include/). The glue TU
 # gdscript_ct_trace.cpp is picked up by the "*.cpp" glob below.
+# The static lib is a *native* object archive, so it is vendored per host
+# platform+arch: `ct_writer/` holds the macOS arm64 build (the platform the
+# recorder was first brought up on) and `ct_writer/<platform>-<arch>/` (scons'
+# own platform/arch spelling, e.g. `linuxbsd-x86_64`) holds any other build.
+# Note the two archives are not interchangeable in a subtler way than being
+# different ISAs: the macOS one carries a `__.SYMDEF` index, which GNU ld
+# rejects outright ("archive has no index"), so a Linux link that silently
+# picked it up fails at the very last step of a full engine build.
+# The Linux x86_64 archive was produced from
+# codetracer-trace-format-nim with the repo's own `buildStaticLib` command
+# (`nim c --app:staticlib --mm:arc --noMain -d:release
+#  --nimMainPrefix:codetracerTraceWriter --passC:-fPIC -p:src`), run inside
+# that repo's `nix develop` shell so libzstd's headers resolve.
 env_gdscript.Prepend(CPPPATH=[Dir("ct_writer/include").srcnode()])
-env.Append(LIBPATH=[Dir("ct_writer").srcnode()])
+_ct_writer_dir = Dir("ct_writer").srcnode()
+_ct_writer_arch_dir = Dir("ct_writer/%s-%s" % (env["platform"], env["arch"])).srcnode()
+if os.path.exists(os.path.join(str(_ct_writer_arch_dir), "libcodetracer_trace_writer.a")):
+    _ct_writer_dir = _ct_writer_arch_dir
+env.Append(LIBPATH=[_ct_writer_dir])
 env.Append(LIBS=["codetracer_trace_writer"])
 # Runtime deps the Nim/arc static lib pulls in:
 if env["platform"] in ["linuxbsd", "android"]:

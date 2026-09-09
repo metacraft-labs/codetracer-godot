@@ -395,3 +395,9 @@ $RECYCLE.BIN/
 *.msp
 *.lnk
 *.generated.props
+
+# CodeTracer: the vendored CTFS writer archives are *inputs* to this build, not
+# build output, so they must survive the blanket `*.a` rule above. One per host
+# platform+arch; modules/gdscript/SCsub picks the matching one.
+!modules/gdscript/ct_writer/libcodetracer_trace_writer.a
+!modules/gdscript/ct_writer/*/libcodetracer_trace_writer.a
