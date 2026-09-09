@@ -118,7 +118,8 @@ done
 
 # --- (2) the native MCR container ------------------------------------------
 [[ -f "$NATIVE_CT" ]] || die "(2) no native container at $NATIVE_CT"
-NATIVE_INFO="$("$CT_MCR" trace info "$NATIVE_CT" 2>&1)" || die "(2) 'ct-mcr trace info' failed on $NATIVE_CT"
+NATIVE_INFO="$("$CT_MCR" trace info "$NATIVE_CT" 2>&1)" \
+	|| die "(2) 'ct-mcr trace info' failed on $NATIVE_CT: $NATIVE_INFO"
 native_events="$(printf '%s\n' "$NATIVE_INFO" | sed -n 's/^events: \([0-9]*\)$/\1/p')"
 native_threads="$(printf '%s\n' "$NATIVE_INFO" | sed -n 's/^threads: \([0-9]*\)$/\1/p')"
 native_program="$(printf '%s\n' "$NATIVE_INFO" | sed -n 's/^program: \(.*\)$/\1/p')"
@@ -129,7 +130,13 @@ log "(2) native: $native_events events, $native_threads threads, $(stat -c%s "$N
 
 # --- (3) the VM container ---------------------------------------------------
 [[ -f "$NESTED_CT" ]] || die "(3) no VM container at $NESTED_CT (was CT_GDSCRIPT_TRACE honoured?)"
-VM_SUMMARY="$("$CT_PRINT" --summary "$NESTED_CT" 2>&1)" || die "(3) 'ct-print --summary' failed on $NESTED_CT"
+# Print the tool's OWN message, not just "it failed". The reader refuses a
+# container whose writer predates a format correction, and its refusal names the
+# correction and tells you to re-record — which is the whole diagnosis. Swallowing
+# it turns "the vendored writer archive is older than the reader" into "ct-print
+# --summary failed", and the second sends you looking in the wrong place.
+VM_SUMMARY="$("$CT_PRINT" --summary "$NESTED_CT" 2>&1)" \
+	|| die "(3) 'ct-print --summary' failed on $NESTED_CT: $VM_SUMMARY"
 vm_steps="$(printf '%s\n' "$VM_SUMMARY" | sed -n 's/^ *steps: \([0-9]*\)$/\1/p')"
 vm_calls="$(printf '%s\n' "$VM_SUMMARY" | sed -n 's/^ *calls: \([0-9]*\)$/\1/p')"
 vm_values="$(printf '%s\n' "$VM_SUMMARY" | sed -n 's/^ *values: \([0-9]*\)$/\1/p')"
