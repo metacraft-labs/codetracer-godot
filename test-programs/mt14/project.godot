@@ -1,0 +1,13 @@
+; CodeTracer GDScript recorder — MT14 demo project.
+;
+; A checked-in project.godot (rather than one generated on the fly like the GT1
+; corpus does in scripts/corpus-lib.sh) because MT14 records this project under
+; a live `ct-mcr record`: the native trace names the exact argv, so the project
+; the argv points at has to be a fixed, reviewable artifact.
+config_version=5
+
+[application]
+
+config/name="ct-mt14-mixed"
+run/main_scene=""
+config/features=PackedStringArray("4.6")
