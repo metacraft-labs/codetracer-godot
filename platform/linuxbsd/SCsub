@@ -40,6 +40,17 @@ if env["dbus"]:
     if env["use_sowrap"]:
         common_linuxbsd.append("dbus-so_wrap.c")
 
+# CodeTracer HCR agent. Compiled from the reprobuild checkout in place (see
+# `hcr_agent_source` in the SConstruct) rather than vendored here, so the engine
+# always links the same agent the coordinator on the other end of the socket was
+# built against. The explicit `target=` keeps its object inside `bin/obj`
+# instead of next to the source in the other repo.
+if env["library_type"] == "executable" and env["hcr_agent_source"]:
+    common_linuxbsd += env.Object(
+        target="#bin/obj/hcr/repro_hcr_agent" + env["OBJSUFFIX"],
+        source=env["hcr_agent_source"],
+    )
+
 if env["library_type"] == "static_library":
     prog = env.add_library("#bin/godot", common_linuxbsd)
 elif env["library_type"] == "shared_library":

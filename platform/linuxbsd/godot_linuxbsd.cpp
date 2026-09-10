@@ -42,6 +42,21 @@
 #include <sys/resource.h>
 #endif
 
+#if defined(CT_HCR_AGENT_ENABLED)
+// CodeTracer hot-code-reload agent (Reprobuild HLX-M0/M1, Linux x86_64 ELF).
+//
+// The agent is linked INTO the engine because that is the only shape the
+// provider has: it publishes a branch into a NOP sled in this process's own
+// text, from this process's own thread, using raw `mprotect`/`membarrier`
+// syscalls. Nothing attaches from outside.
+//
+// It is inert unless `REPRO_HCR_AGENT_SOCKET` names a socket a coordinator is
+// listening on — `repro_hcr_agent_start_from_env` returns 0 immediately when
+// the variable is unset — so an engine built this way behaves exactly like an
+// unpatched one under every ordinary run.
+#include "repro_hcr_agent.h"
+#endif
+
 #if defined(__x86_64) || defined(__x86_64__)
 void __cpuid(int *r_cpuinfo, int p_info) {
 	// Note: Some compilers have a buggy `__cpuid` intrinsic, using inline assembly (based on LLVM-20 implementation) instead.
@@ -95,6 +110,29 @@ int main(int argc, char *argv[]) {
 #endif
 
 	godot_init_profiler();
+
+#if defined(CT_HCR_AGENT_ENABLED)
+	// Started before anything else the engine does, so a coordinator can be
+	// waiting on the handshake while the engine boots. The agent runs on its own
+	// detached thread and services patch requests as they arrive; passing no
+	// symbol table means every request resolves through the ELF resolver
+	// (HLX-M1) against this process's real symbols.
+	//
+	// The return value is reported rather than swallowed: -1 means the socket
+	// was named but the agent could not start, which must not look like "no
+	// coordinator was configured".
+	{
+		const char *hcr_profile = repro_hcr_agent_default_support_profile();
+		int hcr_rc = repro_hcr_agent_start_from_env(hcr_profile, nullptr, 0);
+		if (getenv("REPRO_HCR_AGENT_SOCKET") != nullptr) {
+			fprintf(stderr,
+					"[ct-hcr] agent start rc=%d profile=%s direct_patch=%d membarrier_sync_core=%d\n",
+					hcr_rc, hcr_profile,
+					repro_hcr_agent_host_supports_direct_patch(),
+					repro_hcr_agent_host_membarrier_sync_core());
+		}
+	}
+#endif
 
 	OS_LinuxBSD os;
 

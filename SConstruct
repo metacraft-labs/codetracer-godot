@@ -177,6 +177,15 @@ opts.Add(
 )
 opts.Add(BoolVariable("debug_symbols", "Build with debugging symbols", False))
 opts.Add(BoolVariable("separate_debug_symbols", "Extract debugging symbols to a separate file", False))
+opts.Add(
+    BoolVariable(
+        "hcr_patchable",
+        "Build an engine the CodeTracer HCR provider can hot-patch "
+        "(NOP sleds, aligned functions, build-id note, unstripped .symtab). "
+        "Requires HCR_PATCHABLE_CCFLAGS/HCR_PATCHABLE_LINKFLAGS in the environment.",
+        False,
+    )
+)
 opts.Add(BoolVariable("debug_paths_relative", "Make file paths in debug symbols relative (if supported)", False))
 opts.Add(
     EnumVariable(
@@ -634,6 +643,59 @@ env.Append(ASFLAGS=env.get("asflags", "").split())
 env.Append(ARFLAGS=env.get("arflags", "").split())
 env.Append(RCFLAGS=env.get("rcflags", "").split())
 
+# CodeTracer HCR patchable profile.
+#
+# The flags themselves are NOT written here on purpose. They are defined once,
+# in the Reprobuild project DSL
+# (`reprobuild/libs/repro_project_dsl/src/repro_project_dsl/runtime_core.nim`:
+# `patchableCompileFlags`, `patchableLinkFlags`), because the HCR provider that
+# has to accept this binary reads the same definitions. Retyping them into this
+# file would let the engine and the provider drift, and the drift is silent:
+# a wrong `-fpatchable-function-entry` operand still compiles, still links and
+# still runs — it only surfaces much later as an `absent-sled` refusal that
+# looks like a provider bug.
+#
+# `reprobuild/scripts/hcr_patchable_profile.nim` projects those definitions into
+# these two environment variables; `scripts/build-hcr-patchable-linux.sh` wires
+# the two together. If they are absent we ABORT rather than fall back to a
+# hardcoded guess, so a mis-wired build cannot masquerade as a patchable one.
+if env["hcr_patchable"]:
+    hcr_ccflags = os.environ.get("HCR_PATCHABLE_CCFLAGS", "").split()
+    hcr_linkflags = os.environ.get("HCR_PATCHABLE_LINKFLAGS", "").split()
+    if not hcr_ccflags:
+        print(
+            "ERROR: hcr_patchable=yes but HCR_PATCHABLE_CCFLAGS is unset or empty.\n"
+            "       Source the profile from the Reprobuild DSL, e.g.\n"
+            '         eval "$(<build-dir>/hcr_patchable_profile)"\n'
+            "       (see scripts/build-hcr-patchable-linux.sh). Refusing to guess."
+        )
+        Exit(255)
+    print(f"HCR patchable profile: CCFLAGS={hcr_ccflags} LINKFLAGS={hcr_linkflags}")
+    env.Append(CCFLAGS=hcr_ccflags)
+    env.Append(LINKFLAGS=hcr_linkflags)
+
+    # The HCR agent is a LIBRARY LINKED INTO THE TARGET, not a debugger that
+    # attaches from outside: `repro_hcr_agent_start_from_env` reads
+    # `REPRO_HCR_AGENT_SOCKET` and CONNECTS OUT to a coordinator. There is no
+    # ptrace path anywhere in the provider. So an engine that is merely
+    # patchable-SHAPED still cannot be patched — it has nobody listening. This
+    # links the production agent (compiled from the reprobuild checkout, never
+    # copied into this tree, so it cannot drift) and lets
+    # `platform/linuxbsd/godot_linuxbsd.cpp` start it.
+    #
+    # With the variable unset the engine is still built patchable-shaped, which
+    # is a useful thing to be able to inspect on its own.
+    env["hcr_agent_source"] = os.environ.get("HCR_AGENT_SOURCE", "")
+    if env["hcr_agent_source"]:
+        if not os.path.isfile(env["hcr_agent_source"]):
+            print(f"ERROR: HCR_AGENT_SOURCE={env['hcr_agent_source']} does not exist.")
+            Exit(255)
+        print(f"HCR agent source: {env['hcr_agent_source']}")
+        env.Append(CPPDEFINES=["CT_HCR_AGENT_ENABLED"])
+        env.Append(CPPPATH=[os.path.dirname(env["hcr_agent_source"])])
+else:
+    env["hcr_agent_source"] = ""
+
 # Feature build profile
 env.disabled_classes = []
 if env["build_profile"] != "":
@@ -851,6 +913,14 @@ else:
             # Remap absolute paths to relative paths for debug symbols.
             project_path = Dir("#").abspath
             env.AppendUnique(CCFLAGS=[f"-ffile-prefix-map={project_path}=."])
+    elif env["hcr_patchable"]:
+        # HCR needs the symbol table, not DWARF. `debug_symbols=yes` would give
+        # us both and costs an order of magnitude in object size and link time
+        # for information the provider never reads: it resolves functions from
+        # `.symtab`/`.dynsym` (HLX-M1), not from debug info. So the patchable
+        # profile takes the third option that upstream Godot does not offer —
+        # no `-g`, and no `-s` either.
+        pass
     else:
         if methods.is_apple_clang(env):
             # Apple Clang, its linker doesn't like -s.
