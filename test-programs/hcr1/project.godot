@@ -1,0 +1,12 @@
+; CodeTracer HCR demo — HCR1 live-patch project.
+;
+; Checked in rather than generated, for the same reason MT14's is: this project
+; is recorded and patched by scripts that name its path, so the thing they name
+; has to be a fixed, reviewable artifact.
+config_version=5
+
+[application]
+
+config/name="ct-hcr1-live-patch"
+run/main_scene=""
+config/features=PackedStringArray("4.6")
