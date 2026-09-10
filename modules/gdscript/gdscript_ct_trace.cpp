@@ -79,6 +79,10 @@
 // id) — the thread id supplied to the writer's thread-lifecycle events.
 #include "core/os/thread.h"
 
+// GDH-M3: the bundled-source set is keyed by the WRITER'S path id, not by the
+// `res://` string — see gdscript_ct_note_and_bundle_path_locked below.
+#include "core/templates/hash_set.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -414,17 +418,37 @@ static void gdscript_ct_ensure_types() {
 // no sourcemap). The bundle is ADDITIVE metadata: the step / value / call
 // streams are byte-identical to a run without it.
 //
-// register_source_view keys on `path_id`, and the writer interns paths in
-// first-seen order starting at 0 EXCLUSIVELY through trace_writer_start /
-// trace_writer_register_step below (ensure_function_id interns the function
-// NAME, not the path, in the multi-stream backend). We therefore mirror that
-// interning here with a first-seen map + counter so our `path_id` matches the
-// index the reader recovers from paths.dat. Bundling is done once per file, on
-// first sight, and is best-effort: a source that cannot be read is simply not
+// register_source_view keys on `path_id`, and GDH-M3 changed where that id
+// comes from. It used to be re-derived here: a local first-seen map plus a
+// `g_ct_next_path_id` counter MIRRORED the writer's private interning counter,
+// on the assumption that the writer interns paths in first-seen order starting
+// at 0.
+//
+// THAT ASSUMPTION IS NOW FALSE, AND ITS FAILURE IS SILENT.
+// `trace_writer_register_path_version` (design §6.4) appends a SECOND
+// paths.dat record for a path string the writer has already interned, so from
+// the first hot reload onward the mirror's count and the writer's ids diverge —
+// and because the mirror was keyed by STRING, the reloaded file resolved back
+// to the FIRST version's id. Every source view from that point on attached to
+// the wrong file, with nothing reporting it. A design that added versioning
+// while leaving the mirror in place would have shipped a worse defect than the
+// one it fixes, which is why GDH-M3's job is to DELETE the mirror rather than
+// to adjust it.
+//
+// So: the id comes from `trace_writer_current_path_id`, which answers with the
+// writer's own state, and the "already bundled" set is keyed by that id. Two
+// consequences fall out, both wanted:
+//
+//   * a RELOADED file is a new id, so its text IS bundled — the old
+//     string-keyed early return is exactly why a reloaded file's source never
+//     reached the container (design §2.2d);
+//   * repeat steps on an unchanged file are still bundled once, because the id
+//     is unchanged.
+//
+// Bundling stays best-effort: a source that cannot be read is simply not
 // bundled (the origin gap remains for that file — honest degradation) rather
 // than emitting empty text.
-static HashMap<String, uint64_t> g_ct_bundled_path_ids;
-static uint64_t g_ct_next_path_id = 0;
+static HashSet<uint64_t> g_ct_bundled_path_ids;
 
 static void gdscript_ct_bundle_source_locked(const String &p_res_path, uint64_t p_path_id) {
 	Error err = OK;
@@ -443,16 +467,27 @@ static void gdscript_ct_bundle_source_locked(const String &p_res_path, uint64_t 
 			nullptr, 0);
 }
 
-// Record the writer-mirrored path id for `p_res_path` on first sight and
-// bundle its source text once. Must be called from inside the emit lock,
-// immediately after the trace_writer_start / trace_writer_register_step call
-// that interns the same path, so ids stay in lockstep with paths.dat.
+// Bundle `p_res_path`'s source text once per PATH ID. Must be called from
+// inside the emit lock, immediately after the trace_writer_start /
+// trace_writer_register_step call that interns the same path, so the writer
+// already knows the path when we ask it for the id.
+//
+// The id is ASKED FOR, never counted. `trace_writer_current_path_id` returns
+// the id a bare `trace_writer_register_step(path, ...)` attributes a step to
+// right now — the newest version after a reload, the ordinary interned id
+// otherwise — and `CT_TW_INVALID_PATH_ID` for a path the writer has not seen.
+// An unknown path is skipped rather than guessed at: bundling source text
+// against an invented id would attach it to some other file.
 static void gdscript_ct_note_and_bundle_path_locked(const String &p_res_path) {
-	if (g_ct_bundled_path_ids.has(p_res_path)) {
+	CharString path_cs = p_res_path.utf8();
+	uint64_t path_id = trace_writer_current_path_id(g_ct_writer, path_cs.get_data());
+	if (path_id == CT_TW_INVALID_PATH_ID) {
+		return; // the writer does not know this path; do not invent an id for it
+	}
+	if (g_ct_bundled_path_ids.has(path_id)) {
 		return;
 	}
-	uint64_t path_id = g_ct_next_path_id++;
-	g_ct_bundled_path_ids.insert(p_res_path, path_id);
+	g_ct_bundled_path_ids.insert(path_id);
 	gdscript_ct_bundle_source_locked(p_res_path, path_id);
 }
 
@@ -475,7 +510,7 @@ void gdscript_ct_trace_step(const StringName &p_source, int64_t p_line) {
 		g_ct_started = true;
 		// Registers the first (pending) step at this real source line.
 		trace_writer_start(g_ct_writer, src_cs.get_data(), p_line);
-		gdscript_ct_note_and_bundle_path_locked(source_str); // first path -> id 0
+		gdscript_ct_note_and_bundle_path_locked(source_str);
 		g_ct_pending_owner = cur; // GF12: this thread owns the pending step
 		return;
 	}

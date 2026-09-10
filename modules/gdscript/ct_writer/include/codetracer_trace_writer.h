@@ -87,6 +87,22 @@ void codetracer_trace_writer_init(void);
 
 const char* trace_writer_last_error(void);
 
+/*
+ * Reset this thread's error buffer to "".
+ *
+ * trace_writer_last_error() is STICKY: nothing on a success path clears it,
+ * so a non-empty buffer does NOT mean "the call I just made failed" — it may
+ * be a message an earlier call left behind.  Clear it before a call whose
+ * error you intend to attribute, and assert it is empty at that point.
+ * Without this entry point that is not expressible from C, and a check that
+ * only asserts "non-empty" passes on a stale message.
+ *
+ * trace_writer_register_path_version and trace_writer_current_path_id clear
+ * it on entry themselves, so for those two a non-empty buffer afterwards is
+ * always that call's message.
+ */
+void trace_writer_clear_last_error(void);
+
 /* --------------------------------------------------------------------------
  * Lifecycle
  * -------------------------------------------------------------------------- */
@@ -107,6 +123,40 @@ int trace_writer_begin_paths(trace_writer_t handle, const char* path);
 int trace_writer_finish_paths(trace_writer_t handle);
 
 /* --------------------------------------------------------------------------
+ * In-memory container — the filesystem-free alternative to begin_events
+ *
+ * trace_writer_begin_events derives a .ct path from the events path it is
+ * given, and trace_writer_close opens that path and writes to it.  An embedder
+ * with no filesystem -- a wasm module, or a host that wants the bytes rather
+ * than a file -- calls trace_writer_begin_in_memory INSTEAD.  Everything
+ * between begin and close is identical; only where the container ends up
+ * differs.
+ *
+ * Call ONE of the two.  Both begins are idempotent no-ops on an already-open
+ * writer, so the second one made is REFUSED (non-zero, with a message naming
+ * the mode) rather than silently ignored.
+ *
+ * After trace_writer_close:
+ *
+ *     if (trace_writer_container_ready(w)) {
+ *         const uint8_t* p = trace_writer_container_ptr(w);
+ *         size_t         n = trace_writer_container_len(w);
+ *         ...                         // p is valid until trace_writer_free
+ *     }
+ *
+ * Read the READY flag rather than testing the length: an empty container is a
+ * legitimate result (a recording with no events still carries a meta.dat), so
+ * a zero length cannot stand in for "not finished yet".  The pointer is NULL
+ * for a zero-length container and the bytes are owned by the handle -- they
+ * are NOT to be freed by the caller, and they die with trace_writer_free.
+ * -------------------------------------------------------------------------- */
+
+int      trace_writer_begin_in_memory(trace_writer_t handle);
+int      trace_writer_container_ready(trace_writer_t handle);
+size_t   trace_writer_container_len(trace_writer_t handle);
+uint8_t* trace_writer_container_ptr(trace_writer_t handle);
+
+/* --------------------------------------------------------------------------
  * Tracing primitives
  * -------------------------------------------------------------------------- */
 
@@ -121,6 +171,108 @@ void trace_writer_set_interning_qualifier(trace_writer_t handle,
                                           const char* qualifier);
 void trace_writer_register_step(trace_writer_t handle,
                                 const char* path, int64_t line);
+
+/* --------------------------------------------------------------------------
+ * Per-file line counts (meta.dat bit 14) and versioned paths
+ *
+ * The first two entry points below have been exported by the FFI since the
+ * line-count table landed and were MISSING FROM THIS HEADER until GDH-M3.
+ * The consequence was concrete rather than cosmetic: this header is what the
+ * Godot fork vendors, so the fork could not turn bit 14 on at all, and every
+ * recording it produced laid every file out at the DefaultLinesPerFile
+ * stride — under which a step past a file's real end is addressed inside the
+ * NEXT file's range and read back as a (path, line) pair that was never
+ * recorded, with nothing for the reader to refuse it against.
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Opt this writer into recording a per-file line count in every paths.dat
+ * record (meta.dat bit 14).  Must be called BEFORE the first path is
+ * registered, and is refused on a column-aware writer.
+ *
+ * After this call every path must be registered through
+ * trace_writer_register_path_with_line_count: the implicit registration that
+ * trace_writer_register_step performs for an unseen path has no count to
+ * record and is refused by name.  A recorder that cannot count a file's lines
+ * passes the ceiling it wants the file laid out with (conventionally 100000),
+ * so the size the space uses is the size the container states.
+ *
+ * Returns 0 on success, non-zero on failure (see trace_writer_last_error).
+ */
+int trace_writer_enable_line_count_table(trace_writer_t handle);
+
+/*
+ * Register a source path together with the number of lines the file has,
+ * which sizes the file's slot in the line-only global position space.
+ * Only meaningful on a writer that called trace_writer_enable_line_count_table.
+ * A line_count of 0 is refused rather than defaulted: a file sized 0 would
+ * share its base with the next file.
+ *
+ * Returns 0 on success, non-zero on failure (see trace_writer_last_error).
+ */
+int trace_writer_register_path_with_line_count(trace_writer_t handle,
+                                               const char* path,
+                                               uint64_t line_count);
+
+/*
+ * The failure return of the two uint64_t-returning path entry points below.
+ * A path id is an index into paths.dat, so UINT64_MAX is not a value either
+ * call can legitimately produce.
+ */
+#define CT_TW_INVALID_PATH_ID ((uint64_t)0xFFFFFFFFFFFFFFFFULL)
+
+/*
+ * Register a NEW VERSION of an already-registered path and return THE
+ * WRITER'S OWN id for it.
+ *
+ * This is what a hot-reload host calls after an external observer tells it a
+ * source file changed.  It bypasses the interning lookup and always appends a
+ * paths.dat record whose payload is byte-identical to the earlier version's:
+ * the virtual path string is the same file, and only the INDEX discriminates
+ * the version.  Nothing is appended to, prefixed to, or interposed into the
+ * string, so a consumer that resolves a user-supplied path keeps resolving it
+ * after a reload.
+ *
+ * The new version gets its own correctly sized slot in the global position
+ * space, appended after every existing file, so addresses already emitted
+ * against the old version keep decoding to it.  Requires
+ * trace_writer_enable_line_count_table; without it a versioned record has
+ * nowhere to put its size and the refusal names the missing table.
+ *
+ * A subsequent bare trace_writer_register_step(handle, path, line) on that
+ * string resolves to the id returned here, so a recorder's hot path stays
+ * version-unaware — only the reload path is version-aware.
+ *
+ * Returns CT_TW_INVALID_PATH_ID on failure, with trace_writer_last_error set
+ * to a message naming the path.  The error buffer is cleared on entry.
+ */
+uint64_t trace_writer_register_path_version(trace_writer_t handle,
+                                            const char* path,
+                                            uint64_t line_count);
+
+/*
+ * The id a bare trace_writer_register_step(handle, path, ...) would attribute
+ * a step to right now: the newest registered version of `path` when it has
+ * been reloaded, and its ordinary interned id when it has not.
+ *
+ * THIS EXISTS SO A CALLER CAN DELETE ANY MIRROR OF THE WRITER'S INTERNING
+ * COUNTER, NOT SO IT CAN KEEP ONE IN SYNC.  A host that re-derives path ids
+ * by counting first sightings is correct only while the writer interns in
+ * first-seen order from 0, and trace_writer_register_path_version makes that
+ * false: from the first reload onward the mirror drifts, and every subsequent
+ * trace_writer_register_source_view attaches to the WRONG FILE, silently.
+ *
+ * This is a pure query — it never registers the path it is asked about.  A
+ * path this writer has never seen is a failure, not a fresh registration:
+ * answering with a newly minted id would put a file in paths.dat that the
+ * recording never executed, and under bit 14 would have to invent a size for
+ * it.
+ *
+ * Returns CT_TW_INVALID_PATH_ID on failure, with trace_writer_last_error set.
+ * The error buffer is cleared on entry.
+ */
+uint64_t trace_writer_current_path_id(trace_writer_t handle,
+                                      const char* path);
 
 size_t trace_writer_ensure_function_id(trace_writer_t handle,
     const char* name, const char* path, int64_t line);
@@ -164,35 +316,6 @@ void trace_writer_register_return_cbor(trace_writer_t handle,
 
 void trace_writer_register_special_event(trace_writer_t handle,
     int kind, const char* metadata, const char* content);
-
-/* --------------------------------------------------------------------------
- * Source-view bundling (§5.2)
- *
- * Bundle a `.gd` (or any) source's text into the container so a virtual
- * `res://` path resolves at replay. `path_id` is the writer-interned path
- * index (first-seen registration order, starting at 0). `view_kind` is
- * 0 = raw original source, 1 = prettier, 2 = black, 128+ vendor-specific.
- * `view_name` is a display name (need not be NUL-terminated — pass its
- * length). `sourcemap` may be NULL / length 0 for a raw identity bundle.
- *
- * Only the binary (multi-stream) backend supports source views. Returns the
- * new view's 0-based index on success, -1 on failure.
- *
- * NOTE (vendored): this declaration is preserved from the prior header
- * revision — the refreshed upstream header dropped it, but the symbol is
- * still exported by libcodetracer_trace_writer.a and the GDScript recorder
- * (gdscript_ct_trace.cpp §5.2) depends on it. See the SCsub note.
- * -------------------------------------------------------------------------- */
-
-int64_t trace_writer_register_source_view(trace_writer_t handle,
-    uint64_t path_id,
-    uint8_t view_kind,
-    const char* view_name,
-    size_t view_name_len,
-    const uint8_t* content,
-    size_t content_len,
-    const uint8_t* sourcemap,
-    size_t sourcemap_len);
 
 /* --------------------------------------------------------------------------
  * Request / interval spans (RS-M1)
@@ -272,6 +395,103 @@ int trace_writer_register_span(trace_writer_t handle,
  */
 int trace_writer_flush_spans(trace_writer_t handle);
 
+/* ------------------------------------------------------------------------
+ * Correlation markers
+ *
+ * Implemented ONCE here, as trace_writer_register_span is, so the ~20 CTFS
+ * recorders bind to it rather than each constructing the on-disk payload. A
+ * recorder whose field names drifted would write markers that are INVISIBLE
+ * rather than broken, and nothing would report an error.
+ *
+ * Every string is (pointer, length), never NUL-terminated: a host string may
+ * legally contain NUL (Ruby's can), and NUL-terminated marshalling both
+ * truncates it and, on that side, raises from rb_string_value_cstr — a known
+ * process-wedge regression.
+ *
+ * key_value / show_value must ALREADY be stringified UTF-8. This library
+ * never calls back into the host to render a value: a conversion that can
+ * raise must run before the binding takes the writer lock, because a host
+ * exception can longjmp past the lock guard's destructor and wedge the
+ * process permanently.
+ *
+ * A binding owns the no-op-when-not-recording behaviour. User code calls
+ * these unconditionally, and "no active recording" is not an error there.
+ *
+ * All return 0 on success and non-zero on failure; see
+ * trace_writer_last_error.
+ * ------------------------------------------------------------------------ */
+
+/*
+ * Intern a boundary label and write its id to *out_id.
+ *
+ * THE PRIMARY OPERATION, mirroring path interning. Call it ONCE per boundary,
+ * outside the hot path, then pass the integer to
+ * trace_writer_mark_correlation_by_id — so the per-crossing call does no
+ * string lookup, no interning and no allocation. If the string form were
+ * primary each recorder would grow its own label cache and they would drift.
+ */
+int trace_writer_ensure_marker_id(trace_writer_t handle,
+    const uint8_t* label, size_t label_len,
+    uint64_t* out_id);
+
+/*
+ * Declare a boundary crossing against an already-interned label id.
+ *
+ * key_text / show_text are the NAMES the two values were read under.
+ * show_text is load-bearing rather than cosmetic: a cross-process origin
+ * chain resumes its walk on that name in the sending recording, so a marker
+ * that drops it is visible with its history unreachable. Pass empty for the
+ * defaults ("key", and "show" when a show_value is present).
+ */
+int trace_writer_mark_correlation_by_id(trace_writer_t handle,
+    uint64_t marker_id,
+    const uint8_t* boundary_label, size_t boundary_label_len,
+    const uint8_t* direction, size_t direction_len,
+    const uint8_t* key_value, size_t key_value_len,
+    const uint8_t* show_value, size_t show_value_len,
+    const uint8_t* description, size_t description_len,
+    const uint8_t* key_text, size_t key_text_len,
+    const uint8_t* show_text, size_t show_text_len);
+
+/* Convenience wrapper: interns boundary_id, then forwards to _by_id. */
+int trace_writer_mark_correlation(trace_writer_t handle,
+    const uint8_t* direction, size_t direction_len,
+    const uint8_t* boundary_id, size_t boundary_id_len,
+    const uint8_t* key_value, size_t key_value_len,
+    const uint8_t* show_value, size_t show_value_len,
+    const uint8_t* description, size_t description_len,
+    const uint8_t* key_text, size_t key_text_len,
+    const uint8_t* show_text, size_t show_text_len);
+
+/*
+ * Declare that this recording covers a distributed-trace span, so a consumer
+ * holding an OTel (trace_id, span_id) can decide that with one index lookup
+ * instead of downloading and decoding the recording.
+ *
+ * trace_id is the 16 WIRE bytes and span_id the 8 WIRE bytes — NOT a hex
+ * rendering. The index keys on the wire bytes, so passing hex here builds an
+ * index keyed on something no consumer computes: present, correct-looking and
+ * permanently unqueryable. Use the _hex form below when the host's OTel API
+ * hands you hex; it is a wrapper over this one, so the conversion has a
+ * single implementation rather than one per recorder.
+ *
+ * This mints no marker payload and no I/O event: a span-coverage marker has
+ * no send/recv sense and no pairing domain, so forcing it into one would make
+ * the pairing index try to pair spans with each other.
+ */
+int trace_writer_mark_span_coverage(trace_writer_t handle,
+    const uint8_t* trace_id, size_t trace_id_len,
+    const uint8_t* span_id, size_t span_id_len,
+    uint64_t wall_time_unix_ns,
+    uint64_t monotonic_time_ns);
+
+/* Hex form: 32 hex characters for trace_id, 16 for span_id, either case. */
+int trace_writer_mark_span_coverage_hex(trace_writer_t handle,
+    const uint8_t* trace_id_hex, size_t trace_id_hex_len,
+    const uint8_t* span_id_hex, size_t span_id_hex_len,
+    uint64_t wall_time_unix_ns,
+    uint64_t monotonic_time_ns);
+
 /*
  * Open a native<->VM crossing span (Mixed-Trace-Debugging.md §3) and return its
  * minted span_id — the handle to pass to trace_writer_end_crossing.  The
@@ -306,6 +526,26 @@ uint64_t trace_writer_begin_crossing(trace_writer_t handle,
  * that is not the innermost open crossing.
  */
 int trace_writer_end_crossing(trace_writer_t handle, uint64_t span_id);
+
+/*
+ * Buffer an alternate source view for `path_id` (deminification support; spec
+ * "Alternate Source Views", codetracer-trace-format-spec/internal-files.md).
+ * `path_id` must already be registered. `view_kind`: 0 = raw, 1 = prettier_format,
+ * 2 = black_format, 3-127 reserved, 128+ vendor-specific. `view_name` need not be
+ * NUL-terminated (pass `view_name_len`). `content` is the formatted source bytes;
+ * `sourcemap` is Sourcemap V3 JSON bytes (may be NULL/empty for "no sourcemap").
+ * Multi-stream backend only. Returns the new view's 0-based index, or -1 on error
+ * (with last_error set) — a signed return distinguishes index 0 from an error.
+ */
+int64_t trace_writer_register_source_view(trace_writer_t handle,
+                                          uint64_t path_id,
+                                          uint8_t view_kind,
+                                          const char* view_name,
+                                          size_t view_name_len,
+                                          const uint8_t* content,
+                                          size_t content_len,
+                                          const uint8_t* sourcemap,
+                                          size_t sourcemap_len);
 
 /*
  * The exec-stream index the NEXT event registered on this writer will occupy —

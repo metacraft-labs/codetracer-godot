@@ -26,6 +26,19 @@ env_gdscript = env_modules.Clone()
 # (`nim c --app:staticlib --mm:arc --noMain -d:release
 #  --nimMainPrefix:codetracerTraceWriter --passC:-fPIC -p:src`), run inside
 # that repo's `nix develop` shell so libzstd's headers resolve.
+#
+# KNOWN GAP, GDH-M3 (2026-09-10): `ct_writer/libcodetracer_trace_writer.a`,
+# the macOS-arm64 fallback, is STALE. GDH-M3 added entry points that
+# gdscript_ct_trace.cpp now calls unconditionally — `trace_writer_current_path_id`
+# and `trace_writer_register_path_version` among them — and only the
+# `linuxbsd-x86_64/` archive was refreshed, because the milestone ran on a
+# Linux host and a macOS archive can only be produced on macOS. A macOS build
+# of this fork therefore FAILS TO LINK with undefined symbols for those names.
+# The fix is not a code change: regenerate the archive from
+# codetracer-trace-format-nim (`just build`) on a macOS arm64 host and replace
+# this file. `scripts/verify-gdh3-fork.sh` re-checks the exported symbols of
+# BOTH archives on every run and reports this by name rather than skipping it,
+# so the gap stays visible until it is closed.
 env_gdscript.Prepend(CPPPATH=[Dir("ct_writer/include").srcnode()])
 _ct_writer_dir = Dir("ct_writer").srcnode()
 _ct_writer_arch_dir = Dir("ct_writer/%s-%s" % (env["platform"], env["arch"])).srcnode()
