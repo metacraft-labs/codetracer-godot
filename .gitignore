@@ -401,3 +401,20 @@ $RECYCLE.BIN/
 # platform+arch; modules/gdscript/SCsub picks the matching one.
 !modules/gdscript/ct_writer/libcodetracer_trace_writer.a
 !modules/gdscript/ct_writer/*/libcodetracer_trace_writer.a
+
+# CodeTracer: ignore installed npm trees anywhere, not just under platform/web.
+# Upstream ignores `platform/web/node_modules/` only, which was accurate while
+# that was the sole npm consumer in the tree. This fork acquires one at the repo
+# root, and `git add -A` currently stages it.
+#
+# NOTE THE MISSING TRAILING SLASH, it is the whole point. The root
+# `node_modules` here is a SYMLINK into the nix store (843 packages, 295 MB
+# behind it), and git treats a symlink as a file, so the directory-only form
+# `node_modules/` does not match it — the accident would sail straight past the
+# obvious spelling of this rule. Without the slash the pattern covers the
+# symlink, a real npm-installed directory, and any depth.
+#
+# No file under any `node_modules` is tracked, in this fork or upstream, so this
+# shadows nothing. The upstream line above is left in place so this file stays
+# mergeable with upstream.
+node_modules
