@@ -1,0 +1,15 @@
+; CodeTracer GDScript recorder — GDH-M0 hot-reload falsifier project.
+;
+; A checked-in project.godot (rather than one generated on the fly like the GT1
+; corpus does in scripts/corpus-lib.sh) because GDH0's whole subject is a real
+; directory that can be overwritten underneath a running engine: the driver
+; copies THIS directory to a scratch project and rewrites `probe.gd` in it
+; mid-run. The project the `--path` argument names therefore has to be a
+; fixed, reviewable artifact.
+config_version=5
+
+[application]
+
+config/name="ct-gdh0-reload"
+run/main_scene=""
+config/features=PackedStringArray("4.6")
