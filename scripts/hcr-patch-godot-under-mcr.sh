@@ -6,13 +6,20 @@
 # whether that holds today. It runs the HCR1 demo under a live `ct-mcr record`
 # and publishes the same direct entry patch part-way through the recording.
 #
-# WHAT IS EXPECTED TO BE ABSENT. `CodePatchEvent` is HLX-M7 and is not
-# implemented, so no such event can be in the trace. This script therefore does
-# NOT assert its presence — but it also does not assert its absence by a bare
-# grep, because a grep that finds nothing is satisfied for free by a reader that
-# failed (`codetracer-specs/Testing/Verification-Harness-Traps.md`, trap 4).
-# It first establishes that the event stream is READABLE and non-empty, and only
-# then reports what the trace does and does not carry.
+# WHAT IS NOW REQUIRED TO BE PRESENT. `CodePatchEvent` is HLX-M7 and HAS LANDED,
+# so the trace must carry exactly one. It was not always so: before HLX-M7 this
+# script reported the event's ABSENCE, and reported it carefully, because a grep
+# that finds nothing is satisfied for free by a reader that failed
+# (`codetracer-specs/Testing/Verification-Harness-Traps.md`, trap 4). That
+# discipline is kept and still earns its place — the event dump is proved
+# COMPLETE (line count equal to the count `trace info` reports, never merely
+# non-empty) before anything is read out of it, which is now what stops a
+# truncated dump from hiding the event rather than what stopped an empty one
+# from vacuously "confirming" its absence.
+#
+# The field-by-field verification of the event — every digest recomputed from
+# independently obtained bytes, and the differential against an unpatched
+# control — is `scripts/record-and-verify-hcr-m7.sh`, which calls this script.
 #
 # Usage: scripts/hcr-patch-godot-under-mcr.sh [<output-dir>]
 # Environment: BIN, CT_MCR, CT_PRINT, REPROBUILD_DIR, PATCH_AFTER, MARKER_TIMEOUT_MS
@@ -226,12 +233,19 @@ else
 		check_fail "(C) the event dump has $EVENT_LINES lines but the trace reports $native_events events; the dump is INCOMPLETE, so its absences mean nothing"
 	else
 		log "(C) event dump is real AND complete: $EVENT_LINES lines == $native_events reported events"
-		if grep -qiE "codepatch|code_patch|patchapplied" "$OUT/trace-events.txt"; then
-			log "(C) the trace DOES carry a code-patch event (unexpected -- HLX-M7 is not implemented):"
-			grep -iE "codepatch|code_patch|patchapplied" "$OUT/trace-events.txt" | head -5
+		# HLX-M7 landed the CodePatchEvent, so this flipped from "report what
+		# is absent" to "require what must be present". The full field-by-field
+		# verification -- every digest recomputed from independently obtained
+		# bytes, and the differential against an unpatched control INVERTED --
+		# is `scripts/record-and-verify-hcr-m7.sh`, which calls this script for
+		# its patched arm. What is asserted HERE is only what this script can
+		# see on its own: the event exists, exactly once.
+		CODE_PATCH_LINES="$(grep -c " type=evCodePatch " "$OUT/trace-events.txt" || true)"
+		if [[ "$CODE_PATCH_LINES" -ne 1 ]]; then
+			check_fail "(C) the trace carries $CODE_PATCH_LINES evCodePatch events, expected exactly 1. Without it a reader cannot tell that the process's text changed mid-recording, and a replay past that point would reproduce the OLD code's semantics against the NEW code's events."
 		else
-			log "(C) the trace carries NO code-patch event, as expected: CodePatchEvent is HLX-M7 and is not implemented."
-			log "(C) A reader scanning this trace cannot tell that the process's text changed mid-recording."
+			log "(C) the trace carries the CodePatchEvent:"
+			grep " type=evCodePatch " "$OUT/trace-events.txt" | head -1
 		fi
 	fi
 fi
