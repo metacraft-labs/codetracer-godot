@@ -8,11 +8,17 @@ Two gates with deliberately different lifetimes (see
 GDH-M0):
 
   GDH-G0a  PERMANENT.  The engine really reloaded.  Asserted from the ENGINE'S
-           OWN STDOUT, independently of any trace.
-  GDH-G0b  A DATED SNAPSHOT, retired by GDH-M6.  What the container carries
-           today: ONE `paths.dat` entry for the fixture path, ONE raw source
-           view whose bytes are v1's, while post-reload steps decode to line
-           numbers that do not exist in v1 at all.
+           OWN STDOUT, independently of any trace.  This is the ONLY gate this
+           file still carries.
+
+GDH-G0b — the dated snapshot of what the container carried in 2026-09 — was
+DELETED by GDH-M6 on 2026-09-11, which is what this milestone's own text said
+would happen to it: "a test that asserts a defect must not be allowed to become
+furniture".  The long note at the point of deletion maps each of its claims onto
+the stronger gate that now makes it, in `scripts/verify_gdh6.py`.  Do not
+resurrect it; the defect it described no longer exists, and a run of it today
+would go red for the right reason and be indistinguishable from a run that went
+red for the wrong one.
 
 Every hand-derived value is in `scripts/EXPECTED-GDH0.md`.  Nothing about the
 FIXTURE is written into this file: the insertion height, the probe body's line
@@ -24,8 +30,8 @@ from them, never written into the verifier").
 NO MOCKS.  Real engine, real recorder, real container, real `ct-print`.  The
 one thing this file implements itself is a minimal READER of the CTFS
 container directory, because `ct-print` reports a source view's LENGTH but not
-its BYTES, and GDH-G0b's anti-vacuity clause requires the bytes to be
-hash-compared with the fixture.  `ct-print` also does not report `meta.dat`
+its BYTES, and the bytes have to be hash-compared with the fixture.  (The
+reader survives GDH-G0b's deletion because `verify_gdh6.py` imports it.)  `ct-print` also does not report `meta.dat`
 bit 14: `has_line_count_table` exists only in `codetracer_ct_print_lib.nim`,
 which the shipped `codetracer_ct_print.nim` does not import — so REBUILDING IT
 DOES NOT HELP, and a rebuild was tried (2026-09-10 review) rather than assumed:
@@ -35,9 +41,12 @@ DOES NOT HELP, and a rebuild was tried (2026-09-10 review) rather than assumed:
       --passL:"-L<nix-store>/zstd-1.5.7/lib -lzstd" \
       -o:ct-print src/codetracer_ct_print.nim        # 5.4 s, succeeds
 
-The rebuilt binary agrees with the checked-in one on every number GDH-G0b
-asserts (paths 1, source_views 1, 299 dump lines) and adds neither the bytes
-nor the flag, so the reader below stays.  `CT_PRINT=` selects either.
+The rebuilt binary agreed with the checked-in one on every number GDH-G0b
+asserted (paths 1, source_views 1, 299 dump lines) and added neither the bytes
+nor the flag, which is why the reader below exists at all.  `CT_PRINT=`
+selects either.  (`ct-print` DOES report both today — GDH-M6 measured
+`has_line_count_table` and `path_versions` straight out of its header — but a
+source view's bytes are still length-only there.)
 
 The reader is a reimplementation of
 `codetracer-trace-format-nim/src/codetracer_ctfs/container.nim`
@@ -63,9 +72,9 @@ Subcommands
         peer.  DIES rather than recording a run whose overwrite did not land.
 
   verify_gdh0.py verify <outdir> <v1.gd> <v2.gd> --arm <arm> [--expect-g0a-red]
-        Assert GDH-G0a and (for arms that carry a container) GDH-G0b.
-        `--expect-g0a-red` inverts the G0a verdict: the arm exists to prove the
-        gate can fail, so a GREEN G0a there is the harness's own failure.
+        Assert GDH-G0a.  `--expect-g0a-red` inverts the verdict: the arm exists
+        to prove the gate can fail, so a GREEN G0a there is the harness's own
+        failure.
 """
 from __future__ import annotations
 
@@ -332,9 +341,9 @@ class CtfsContainer:
         bit 4 (column-aware) and without bit 14 (line-count table) writes — a
         record IS the payload bytes, with the offset table supplying the length
         (`interning_table.nim:62-88`).  Decoding it here rather than trusting
-        `ct-print` gives GDH-G0b a SECOND, independent reader for its central
-        claim, so "one path entry" is a measurement two instruments agree on
-        rather than one instrument's opinion.
+        `ct-print` gives a SECOND, independent reader for the same claim, so a
+        path count is a measurement two instruments agree on rather than one
+        instrument's opinion.  GDH-M6's gates rely on exactly that.
         """
         return [rec.decode("utf-8") for rec in self._variable_records("paths")]
 
@@ -958,188 +967,99 @@ def check_g0a(ck: Checker, facts: dict, record: dict, obs: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GDH-G0b — what the container carries today.
+# GDH-G0b WAS HERE, AND IT IS GONE ON PURPOSE (GDH-M6, 2026-09-11).
+#
+# GDH-M0 shipped TWO gates with deliberately different lifetimes.  GDH-G0a —
+# "the engine really reloaded", asserted from the engine's own stdout — is
+# PERMANENT and is still above.  GDH-G0b was a DATED SNAPSHOT OF A DEFECT: it
+# asserted that the container carried exactly ONE `paths.dat` entry for a file
+# that ran in two versions, ONE raw source view whose bytes were v1's, v2's
+# text nowhere in the container, and post-reload steps decoding to line numbers
+# that do not exist in v1 at all — 129 of 196 of them, silently.
+#
+# GDH-M0's own text is why it is being deleted rather than kept and inverted:
+#
+#     "A test that asserts a defect must not be allowed to become furniture;
+#      GDH-M6's deliverables include deleting this arm and replacing it with
+#      GDH-G1/G2/G3."
+#
+# Deleting a test is otherwise forbidden in this tree.  This is the one case
+# where it is MANDATED, and only because a strictly stronger gate replaces it.
+# Here is the replacement, claim for claim, so a reviewer can check that
+# nothing G0b measured has simply stopped being measured:
+#
+#   G0b claim                        | now asserted by
+#   ---------------------------------+--------------------------------------
+#   exactly one paths.dat entry for  | gdh6_both_versions_retrievable_end_to_
+#   a file that ran in two versions  | end — THREE entries, all carrying the
+#                                    | IDENTICAL res:// string, differing only
+#                                    | by index (GDH-G1 + GDH-G2)
+#   exactly one raw source view,     | the same gate — one raw view PER
+#   whose bytes are v1's             | VERSION, each hash-compared at run time
+#                                    | against its own fixture file
+#   v2's text occurs nowhere in the  | inverted by the same gate: every
+#   container                        | version's bytes are present and
+#                                    | distinct.  The byte-scan's positive
+#                                    | twin survives as the view-kind check
+#   steps decode to lines that do    | gdh6_no_step_is_attributed_to_the_wrong
+#   not exist in the file the        | _version — an ORDERED BIJECTION between
+#   container carries, silently      | the engine's printed tokens and the
+#                                    | decoded steps, plus a TEXT half that
+#                                    | requires each step's own source view to
+#                                    | carry the right bytes AT the decoded
+#                                    | line (GDH-G3)
+#   the reload is not discoverable   | gdh6_reload_is_discoverable_end_to_end
+#   in the container                 | — two TagSourceReload markers whose
+#                                    | contents are cross-tied to the steps on
+#                                    | either side (GDH-G7)
+#
+# COMPLETED AT REVIEW (2026-09-11).  The table above is the SUBSTANTIVE
+# mapping and it held up — but a claim-for-claim audit found FOUR of G0b's
+# smaller assertions that the replacement did not in fact make, so for one
+# commit they were claims nothing made.  A mapping that is 90% right is how a
+# deletion quietly loses coverage, and "strictly stronger" has to mean every
+# claim, not every important claim.  All four are now in
+# `gdh6_both_versions_retrievable_end_to_end`, which went from 10 assertions
+# to 14 (and its control likewise):
+#
+#   G0b claim                        | restored as
+#   ---------------------------------+--------------------------------------
+#   meta.dat bit 5                   | asserted directly.  "The view stream
+#   (FlagHasAlternateSourceViews)     | decoded" and "the flag says it is
+#   is set                           | there" are different statements
+#   the container's own paths.dat    | asserted directly (2 assertions: the
+#   decodes to what ct-print         | path list, and the record count vs
+#   reports, and the count matches   | `counts.paths`).  GDH-M6 reads
+#   `counts.paths`                   | paths.dat with one reader and steps
+#                                    | with another and had never compared
+#                                    | them; a self-consistent reader is not
+#                                    | the same as two agreeing
+#   the raw view NAMES the res://    | asserted directly.  Keying views by
+#   path                             | `path_id` is the right key, but a view
+#                                    | on the right id under someone else's
+#                                    | name is invisible to an id-only check
+#
+# NOT restored, and this one is deliberate: G0b's byte SCAN ("v2's first probe
+# token occurs nowhere in the container", with a v1 probe as its positive
+# twin).  It was a NEGATIVE check needing a twin to prove the scanner could
+# see anything; the replacement hash-compares every version's COMPLETE bytes
+# against its own fixture, which is positive, exact, and cannot pass by
+# failing to look.  The claim is subsumed, not dropped.
+#
+# Those live in `scripts/verify_gdh6.py`, driven by
+# `scripts/record-and-verify-gdh6.sh`, with their hand-derived numbers in
+# `scripts/EXPECTED-GDH6.md`.  All four gates were GREEN at review over **98**
+# assertions on this host (90 before the four were restored).
+#
+# `CtfsContainer` and `_varint` BELOW ARE NOT DEAD CODE.  `verify_gdh6.py`
+# imports both from this module, deliberately, so that there is ONE CTFS
+# reader in this tree rather than a second one that can drift — and this one
+# carries the offset-table validation that makes an under-reported record
+# count raise instead of answering.  `ct_print_events` went with GDH-G0b;
+# GDH-M6 has its own, which adds the source-reload term to the completeness
+# arithmetic.
 # ---------------------------------------------------------------------------
 
-
-def ct_print_events(ct_print: str, ct: str, dest: str) -> tuple[dict, list[dict], int]:
-    with open(dest, "w") as handle:
-        proc = subprocess.run([ct_print, "--events", ct], stdout=handle,
-                              stderr=subprocess.PIPE, timeout=600)
-    if proc.returncode != 0:
-        die("`ct-print --events %s` failed (rc=%d): %s"
-            % (ct, proc.returncode, proc.stderr.decode("utf-8", "replace")))
-    raw = open(dest, encoding="utf-8").read().splitlines()
-    if not raw:
-        die("`ct-print --events` produced no output for %s" % ct)
-    header = json.loads(raw[0])
-    events = [json.loads(line) for line in raw[1:]]
-    return header, events, len(raw)
-
-
-def check_g0b(ck: Checker, facts: dict, record: dict, obs: dict,
-              header: dict, events: list[dict], dump_lines: int,
-              container: CtfsContainer) -> None:
-    counts = header["counts"]
-
-    # --- anti-vacuity 1: the DUMP IS COMPLETE ------------------------------
-    # `--events` emits one header line, one line per step, TWO per call
-    # (call_entry + call_exit) and one per io event.  Asserting the exact
-    # arithmetic — never `lines > 0` — is the EXPECTED-HCR1.md rule, adopted
-    # campaign-wide: a dump truncated by `head` satisfies a grep as well as a
-    # complete one.
-    expected_lines = 1 + counts["steps"] + 2 * counts["calls"] + counts["io_events"]
-    ck.eq(dump_lines, expected_lines,
-          "the --events dump is COMPLETE: its line count equals "
-          "1 + steps(%d) + 2*calls(%d) + io(%d)"
-          % (counts["steps"], counts["calls"], counts["io_events"]))
-    ck.eq(len(events), dump_lines - 1, "every non-header line parsed as an event")
-
-    # --- anti-vacuity 2: the SCAN REACHED THE CONTAINER --------------------
-    names = container.names()
-    ck.ck("srcviews.dat" in names and "srcviews.off" in names,
-          "the container carries `srcviews.dat` / `srcviews.off` under their "
-          "REAL names — the spec's `source_views.dat` is unfindable because "
-          "base40 truncates it, and a scan for it finds nothing and passes "
-          "(trap 4).  Directory: %r" % (names,))
-    ck.ck("paths.dat" in names, "the container carries `paths.dat`")
-
-    # Two independent readers must agree, or the count below is one
-    # instrument's opinion rather than a measurement.
-    raw_paths = container.paths()
-    ck.eq(raw_paths, header["paths"],
-          "the container's own paths.dat decodes to exactly what ct-print "
-          "reports — two independent readers agreeing")
-    ck.eq(len(raw_paths), counts["paths"],
-          "and its record count matches the header's `counts.paths`")
-
-    # --- anti-vacuity 3: paths exist AND the fixture path is among them ----
-    paths = header["paths"]
-    ck.ck(counts["paths"] >= 1, "the decode produced at least one path")
-    ck.ck("res://probe.gd" in paths,
-          "the fixture's res:// path is among the decoded paths (%r) — "
-          "asserted BEFORE the count, because a decode that produced no paths "
-          "at all would satisfy `not two` for free" % (paths,))
-
-    # --- THE SNAPSHOT ------------------------------------------------------
-    ck.eq(counts["paths"], 1,
-          "TODAY the container carries exactly ONE paths.dat entry for a file "
-          "that ran in TWO versions")
-    ck.eq(paths, ["res://probe.gd"], "and that entry is the fixture's path")
-
-    views = container.source_views()
-    ck.ck(len(views) >= 1, "the srcviews stream decoded at least one view")
-    raw_views = [v for v in views if v["view_kind"] == 0]
-    ck.eq(len(raw_views), 1,
-          "exactly ONE raw (view_kind == 0) source view is attached")
-    if raw_views:
-        view = raw_views[0]
-        ck.eq(view["path_id"], 0, "the raw view is attached to path id 0")
-        ck.eq(view["view_name"], "res://probe.gd", "the view names the res:// path")
-        ck.ck(len(view["content"]) > 0, "the view's bytes are NON-EMPTY")
-        got = hashlib.sha256(view["content"]).hexdigest()
-        ck.eq(got, facts["v1_sha256"],
-              "the view's bytes hash-equal probe_v1.gd as read by the harness")
-        ck.ck(got != facts["v2_sha256"],
-              "and they are NOT v2's — v2's text is nowhere in the container")
-
-    # --- the byte scan, with its positive twin -----------------------------
-    # A "must not contain" over a haystack the scanner cannot read passes for
-    # free.  The v1 probe is the twin: break the scan and it goes red first.
-    blob = container.data
-    v1_needle = facts["v1_tokens"][0].encode()
-    v2_needle = facts["v2_tokens"][0].encode()
-    n_v1 = blob.count(v1_needle)
-    n_v2 = blob.count(v2_needle)
-    ck.ck(n_v1 >= 1,
-          "POSITIVE TWIN: v1's first probe token %r occurs %d time(s) in the "
-          "container's raw bytes — the scan can see source text at all"
-          % (v1_needle.decode(), n_v1))
-    ck.eq(n_v2, 0,
-          "v2's first probe token %r occurs nowhere in the container"
-          % v2_needle.decode())
-    v1_full = open(facts["v1_path"], "rb").read()
-    ck.eq(blob.count(v1_full), 1,
-          "v1's complete text occurs exactly once in the container")
-
-    # --- the steps say otherwise ------------------------------------------
-    steps = [e for e in events if e["kind"] == "step"]
-    ck.eq(len(steps), counts["steps"], "every declared step was decoded")
-    ck.ck(all(s["path_id"] == 0 for s in steps),
-          "every step is attributed to path id 0 — the ONLY path there is")
-    v1_lines = facts["v1_lines"]
-    past_end = [s for s in steps if s["line"] > v1_lines]
-    within = [s for s in steps if s["line"] <= v1_lines]
-
-    if not record["reload_sent"] or not record["overwrite_requested"]:
-        ck.eq(len(past_end), 0,
-              "CONTROL ARM: every step lies inside v1's %d lines" % v1_lines)
-        return
-
-    ck.ck(len(within) > 0, "the pre-reload steps are non-empty")
-    ck.ck(len(past_end) > 0,
-          "THE DEFECT: %d steps decode to a line PAST THE END of the only "
-          "source the container carries (v1 has %d lines)"
-          % (len(past_end), v1_lines))
-    # Both halves can legitimately be EMPTY on a run where the reload silently
-    # did not take (measured: a `core:reload_scripts` addressed to an
-    # unregistered `thread_id` is dropped by `_poll_messages` without a word).
-    # The two assertions above already record that as a failure; computing
-    # min()/max() over the empty half here would raise instead, which aborts
-    # the check before `expect_count` runs and turns a clean RED verdict into a
-    # traceback.  The assertion is made either way, so the count is unchanged.
-    if past_end and within:
-        first_past = min(s["step_index"] for s in past_end)
-        last_within = max(s["step_index"] for s in within)
-        ck.ck(first_past > last_within,
-              "the two line regimes do not interleave: the last in-range step "
-              "is #%d and the first out-of-range step is #%d — exactly one "
-              "crossing" % (last_within, first_past))
-    else:
-        ck.ck(False,
-              "the two line regimes cannot be compared: %d step(s) lie inside "
-              "v1's %d lines and %d lie past its end, so there is no crossing "
-              "to check" % (len(within), v1_lines, len(past_end)))
-
-    expected_v2_body = [n + facts["shift"] for n in facts["v1_probe_body_lines"]]
-    ck.eq(sorted(facts["v2_probe_body_lines"]), sorted(expected_v2_body),
-          "v2's probe body lines are v1's shifted by the measured insertion")
-    ck.ck(all(line > v1_lines for line in facts["v2_probe_body_lines"]),
-          "every one of v2's probe body lines is outside v1's file")
-
-    # --- and they agree, in count, with what the ENGINE printed ------------
-    versions = []
-    per_tick: dict[int, list[str]] = {}
-    for tick, token in obs["observations"]:
-        per_tick.setdefault(tick, []).append(token)
-    for tick in range(1, facts["ticks"] + 1):
-        got = per_tick.get(tick, [])
-        versions.append("v1" if got == facts["v1_tokens"]
-                        else "v2" if got == facts["v2_tokens"] else "?")
-    n_v1_ticks, n_v2_ticks = versions.count("v1"), versions.count("v2")
-    steps_at_v1_body = sum(1 for s in steps
-                           if s["line"] in facts["v1_probe_body_lines"])
-    steps_at_v2_body = sum(1 for s in steps
-                           if s["line"] in facts["v2_probe_body_lines"])
-    ck.eq(steps_at_v1_body, n_v1_ticks * len(facts["v1_probe_body_lines"]),
-          "the trace records exactly %d steps on v1's probe body — one per "
-          "body line per v1 tick the ENGINE printed" % (n_v1_ticks * len(facts["v1_probe_body_lines"])))
-    ck.eq(steps_at_v2_body, n_v2_ticks * len(facts["v2_probe_body_lines"]),
-          "and exactly %d on v2's — one per body line per v2 tick"
-          % (n_v2_ticks * len(facts["v2_probe_body_lines"])))
-
-    # --- why `checkLineWithinFile` never fired -----------------------------
-    flags = container.meta_flags()
-    has_line_count_table = bool(flags & 0x4000)
-    ck.eq(has_line_count_table, False,
-          "meta.dat bit 14 (FlagHasLineCountTable) is CLEAR, which is why "
-          "`checkLineWithinFile` (multi_stream_writer.nim:401-431) returned ok "
-          "for every one of those out-of-range lines instead of refusing them: "
-          "with no line-count table the writer sizes every file at "
-          "DefaultLinesPerFile (100000) and has no bound to test against.  The "
-          "mis-attribution is therefore SILENT, not a hard error")
-    ck.ck(bool(flags & 0x0020),
-          "meta.dat bit 5 (FlagHasAlternateSourceViews) is set")
 
 
 # ---------------------------------------------------------------------------
@@ -1154,15 +1074,15 @@ def cmd_fixture(args) -> int:
 
 
 # Trap 4c: each gate's assertion count, per arm, WRITTEN FROM A RUN
-# (2026-09-10, this host).  The arms differ legitimately — the control arm's
-# GDH-G0a stops once it has established "one version, no transition", and only
-# the arms that carry a meaningful container run GDH-G0b — so the fingerprint
-# is per (gate, arm) rather than a single number.  A branch that stops making
+# (2026-09-10, this host; re-measured 2026-09-11 after GDH-G0b's deletion and
+# unchanged, because deleting a gate does not change the remaining one's
+# claims).  The arms differ legitimately — the control arm's GDH-G0a stops once
+# it has established "one version, no transition" — so the fingerprint is per
+# (gate, arm) rather than a single number.  A branch that stops making
 # claims now goes RED instead of quietly making fewer of them.
 EXPECTED_ASSERTIONS = {
     "fixture": {"reload": 12, "control": 12, "wrongtarget": 12, "identical": 10},
     "g0a": {"reload": 16, "control": 9, "wrongtarget": 16, "identical": 16},
-    "g0b": {"reload": 31, "control": 23},
 }
 
 
@@ -1188,17 +1108,15 @@ def cmd_verify(args) -> int:
     g0a.expect_count(EXPECTED_ASSERTIONS["g0a"][arm])
     g0a_green = g0a.report()
 
-    g0b_green = True
     if args.check_g0b:
-        if not record["ct"] or not os.path.exists(record["ct"]):
-            die("arm %s produced no container at %r" % (record["arm"], record["ct"]))
-        header, events, dump_lines = ct_print_events(
-            args.ct_print, record["ct"], os.path.join(out_dir, "events.jsonl"))
-        container = CtfsContainer(record["ct"])
-        g0b = Checker("arm %s: GDH-G0b (what the container carries today)" % arm)
-        check_g0b(g0b, facts, record, obs, header, events, dump_lines, container)
-        g0b.expect_count(EXPECTED_ASSERTIONS["g0b"][arm])
-        g0b_green = g0b.report()
+        # A stale caller must FAIL, not silently do less.  `--check-g0b` used
+        # to select a whole second gate; a driver that still passes it would
+        # otherwise run half of what it thinks it is running and report a pass
+        # — which is exactly the silent-skip shape this campaign keeps finding.
+        die("--check-g0b names GDH-G0b, which GDH-M6 DELETED on 2026-09-11. "
+            "Its claims are now made by gdh6_both_versions_retrievable_end_to_"
+            "end and gdh6_no_step_is_attributed_to_the_wrong_version; run "
+            "scripts/record-and-verify-gdh6.sh. Drop the flag from the caller.")
 
     if args.expect_g0a_red:
         # The arm exists to prove GDH-G0a can go red.  A GREEN G0a here means
@@ -1212,7 +1130,7 @@ def cmd_verify(args) -> int:
               % record["arm"], file=sys.stderr)
         return 0
 
-    return 0 if (fixture_green and g0a_green and g0b_green) else 1
+    return 0 if (fixture_green and g0a_green) else 1
 
 
 def main() -> int:
@@ -1242,7 +1160,10 @@ def main() -> int:
     p.add_argument("v1")
     p.add_argument("v2")
     p.add_argument("--ct-print", required=True)
-    p.add_argument("--check-g0b", action="store_true")
+    # Retained ONLY so a stale caller gets a named refusal instead of an
+    # "unrecognized arguments" traceback.  See cmd_verify.
+    p.add_argument("--check-g0b", action="store_true",
+                   help="REMOVED by GDH-M6; passing it is now an error")
     p.add_argument("--expect-g0a-red", action="store_true")
     p.set_defaults(func=cmd_verify)
 
