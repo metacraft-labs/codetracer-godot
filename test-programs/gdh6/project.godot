@@ -1,0 +1,14 @@
+; CodeTracer GDScript recorder — GDH-M6 reload-timing project.
+;
+; A checked-in project.godot, for the same reason GDH-M0's is checked in: the
+; driver copies THIS directory to a scratch project and rewrites `probe.gd`
+; inside it (or has the engine rewrite it, which is the point of GDH-M6) while
+; the engine is running. The directory `--path` names has to be a fixed,
+; reviewable artifact.
+config_version=5
+
+[application]
+
+config/name="ct-gdh6-reload"
+run/main_scene=""
+config/features=PackedStringArray("4.6")
