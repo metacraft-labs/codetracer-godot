@@ -73,6 +73,13 @@ eval "$PROFILE_TEXT"
 # though the SConstruct asserts the compile side again on its own.
 [[ -n "${HCR_PATCHABLE_CCFLAGS:-}" ]]   || die "HCR_PATCHABLE_CCFLAGS came back empty"
 [[ -n "${HCR_PATCHABLE_LINKFLAGS:-}" ]] || die "HCR_PATCHABLE_LINKFLAGS came back empty"
+# NOTE, because this is the obvious place to add one and it is the wrong place:
+# a falsifier-arm define does NOT go in the engine-wide CCFLAGS. Changing them
+# invalidates every object in the tree, so an armed build becomes a FULL rebuild
+# (thirdparty/embree and all) — measured on 2026-09-11 while bringing up
+# GDH-M5's arms. `CT_GDH5_FALSIFY` in `modules/gdscript/SCsub` scopes the define
+# to the one module that needs it, and an armed build is then one translation
+# unit plus a relink.
 log "profile CCFLAGS  : $HCR_PATCHABLE_CCFLAGS"
 log "profile LINKFLAGS: $HCR_PATCHABLE_LINKFLAGS"
 export HCR_PATCHABLE_CCFLAGS HCR_PATCHABLE_LINKFLAGS

@@ -8,6 +8,25 @@ Import("env_modules")
 
 env_gdscript = env_modules.Clone()
 
+# --- GDH-M5 falsifier arms ---------------------------------------------
+# `CT_GDH5_FALSIFY` names a mutation to compile into the recorder's reload
+# path, and it is applied to THIS MODULE'S environment only.
+#
+# It is scoped here rather than added to the global CCFLAGS for a measured
+# reason: a change to the engine-wide CCFLAGS invalidates every object in the
+# tree, so the first version of the GDH-M5 arm runner triggered a FULL rebuild
+# (thirdparty/embree and all) per arm — four of them, about an hour. Scoped to
+# `env_gdscript`, an armed build is one translation unit plus a relink, ~20 s.
+#
+# It is empty in every ordinary build. `scripts/record-and-verify-gdh5.sh` is
+# its only user, and it prints the value so an armed binary cannot be mistaken
+# for a plain one.
+_ct_gdh5_falsify = os.environ.get("CT_GDH5_FALSIFY", "")
+if _ct_gdh5_falsify:
+    print("CodeTracer GDH-M5 FALSIFIER ARM: -D%s (this is NOT a plain build)"
+          % _ct_gdh5_falsify)
+    env_gdscript.Append(CPPDEFINES=[_ct_gdh5_falsify])
+
 # --- CodeTracer G2: link the CTFS writer static lib ---------------------
 # The C-ABI header (compile-time) and libcodetracer_trace_writer.a
 # (link-time) come from codetracer-trace-format-nim, vendored under
