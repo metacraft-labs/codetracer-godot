@@ -53,6 +53,13 @@
 #endif
 
 #include "modules/modules_enabled.gen.h" // For regex.
+#if defined(CT_HCR_AGENT_ENABLED) && defined(MODULE_GDSCRIPT_ENABLED)
+// GDH-M5: the per-frame reload safe point. Must come AFTER
+// modules_enabled.gen.h — MODULE_GDSCRIPT_ENABLED is defined there, and a
+// guard that reads it earlier is silently false while the call site further
+// down is compiled.
+#include "modules/gdscript/gdscript_ct_trace.h"
+#endif
 #ifdef MODULE_REGEX_ENABLED
 #include "modules/regex/regex.h"
 #endif
@@ -986,6 +993,20 @@ void OS_LinuxBSD::run() {
 	while (true) {
 		GodotProfileFrameMark;
 		GodotProfileZone("OS_LinuxBSD::run");
+#if defined(CT_HCR_AGENT_ENABLED) && defined(MODULE_GDSCRIPT_ENABLED)
+		// GDH-M5, design §5.6.1 — the poll point the ENGINE chooses.
+		//
+		// Here, between `Main::iteration()` calls, is the only moment at which
+		// no GDScript frame is executing and no step's values are in flight. A
+		// `sourceChanged` that arrived on the agent's own thread mid-step is
+		// queued and applied here; a polled agent is drained here. Both paths
+		// take the recorder's emit lock for the whole of the apply (§5.6.2).
+		//
+		// Costs one predictable-branch call per frame when no agent is running:
+		// `repro_hcr_agent_poll` returns immediately with no socket configured,
+		// and the queue check is one mutexed pointer read.
+		gdscript_ct_hcr_safe_point();
+#endif
 		DisplayServer::get_singleton()->process_events(); // get rid of pending events
 #ifdef SDL_ENABLED
 		if (joypad_sdl) {

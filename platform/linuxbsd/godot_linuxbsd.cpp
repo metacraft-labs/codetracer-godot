@@ -55,6 +55,16 @@
 // the variable is unset — so an engine built this way behaves exactly like an
 // unpatched one under every ordinary run.
 #include "repro_hcr_agent.h"
+
+#include "modules/modules_enabled.gen.h" // For gdscript.
+#ifdef MODULE_GDSCRIPT_ENABLED
+// GDH-M5: the recorder's `sourceChanged` handler must be registered BEFORE the
+// agent starts, because the hello — and therefore the advertised
+// `source-reload` capability — is built at connect time. The module's own
+// registration happens inside `Main::setup`, which is later than here, so the
+// install call lives beside the agent start instead.
+#include "modules/gdscript/gdscript_ct_trace.h"
+#endif
 #endif
 
 #if defined(__x86_64) || defined(__x86_64__)
@@ -123,13 +133,37 @@ int main(int argc, char *argv[]) {
 	// coordinator was configured".
 	{
 		const char *hcr_profile = repro_hcr_agent_default_support_profile();
-		int hcr_rc = repro_hcr_agent_start_from_env(hcr_profile, nullptr, 0);
+#ifdef MODULE_GDSCRIPT_ENABLED
+		// GDH-M5. Registering the handler is also what makes the agent
+		// advertise `source-reload`, so a build without the GDScript recorder
+		// advertises nothing and refuses a `sourceChanged` by name — which is
+		// the honest answer for a host that cannot reload a script.
+		gdscript_ct_hcr_install_source_reload_handler();
+#endif
+		// GDH-M5, design §5.6.1: "a poll point the engine chooses". Set
+		// `REPRO_HCR_AGENT_POLL=1` and the agent is serviced from
+		// `OS_LinuxBSD::run()` between `Main::iteration()` calls instead of
+		// from its own detached thread.
+		//
+		// It is OPT-IN rather than the new default on purpose. The detached
+		// thread is what HLX's live-patch drivers
+		// (`scripts/hcr-patch-godot-linux.sh`,
+		// `scripts/record-and-verify-hcr-m7.sh`) drive today, and a reload
+		// campaign has no business changing when a native patch is applied.
+		const char *hcr_poll = getenv("REPRO_HCR_AGENT_POLL");
+		const bool hcr_polled = hcr_poll != nullptr && hcr_poll[0] != '\0' &&
+				hcr_poll[0] != '0';
+		int hcr_rc = hcr_polled
+				? repro_hcr_agent_start_polling_from_env(hcr_profile, nullptr, 0)
+				: repro_hcr_agent_start_from_env(hcr_profile, nullptr, 0);
 		if (getenv("REPRO_HCR_AGENT_SOCKET") != nullptr) {
 			fprintf(stderr,
-					"[ct-hcr] agent start rc=%d profile=%s direct_patch=%d membarrier_sync_core=%d\n",
+					"[ct-hcr] agent start rc=%d profile=%s direct_patch=%d membarrier_sync_core=%d polled=%d source_reload=%d\n",
 					hcr_rc, hcr_profile,
 					repro_hcr_agent_host_supports_direct_patch(),
-					repro_hcr_agent_host_membarrier_sync_core());
+					repro_hcr_agent_host_membarrier_sync_core(),
+					hcr_polled ? 1 : 0,
+					repro_hcr_agent_advertises_source_reload());
 		}
 	}
 #endif

@@ -1287,6 +1287,427 @@ public:
 	virtual bool wants_local_tracking() const override { return true; }
 };
 
+#if defined(CT_HCR_AGENT_ENABLED)
+// ===========================================================================
+// GDH-M5 — the engine reloads, from a point the RECORDER controls.
+//
+// Design: codetracer-specs/Planned-Features/
+//         GDScript-Hot-Reload-Multi-Version-Sources.md §5.2, §5.3, §5.6.
+//
+// No new reload machinery. §5.1 measured that Godot's own path is already in a
+// headless `template_debug` build: `GDScriptLanguage::reload_scripts` is
+// `#ifdef DEBUG_ENABLED` (gdscript.cpp:2421/:2555), not TOOLS_ENABLED, and it
+// re-reads the `.gd` from disk at :2509 before recompiling. What this file adds
+// is the TIMING — a reload applied where the recorder can bracket it — and the
+// REPORTING of what that reload does not preserve.
+//
+// Three things are load-bearing and each is here because the obvious
+// alternative is wrong:
+//
+//  1. `reload_scripts`, not `GDScript::reload()`. `reload()` alone parses the
+//     in-memory `source` member (gdscript.cpp:820) and never re-reads disk, so
+//     it would recompile v1 and report success. `reload_scripts` is the wrapper
+//     that calls `load_source_code` first.
+//  2. The apply happens at a SAFE POINT the engine chooses, never where the
+//     notification landed. A `sourceChanged` delivered on the agent's own
+//     thread while the VM is mid-step is queued and the answering thread waits;
+//     `gdscript_ct_hcr_safe_point()` applies it between frames and wakes the
+//     waiter. §5.6.3: a pending step's values would otherwise attach across the
+//     boundary.
+//  3. What the reload did not preserve is MEASURED and reported, not asserted.
+//     Static values are read before and after and compared by name, so "a
+//     static was lost" is evidence rather than a literal in a status field —
+//     which is the `oldCodeRetained: true` defect this campaign keeps finding.
+// ===========================================================================
+
+#include "gdscript.h"
+#include "core/io/resource.h"
+
+#include <condition_variable>
+#include <memory>
+
+extern "C" {
+#include "repro_hcr_agent.h"
+}
+
+namespace {
+
+struct CtReloadRequest {
+	// Request.
+	String res_path;
+	Vector<uint8_t> content;
+	unsigned int generation = 0;
+
+	// Result, filled at the safe point.
+	bool done = false;
+	bool applied = false;
+	const char *reason = nullptr;
+	String detail;
+	uint64_t path_id = 0;
+	uint64_t step_index = 0;
+	Vector<String> unpreserved;
+	int deferred_frames = 0;
+};
+
+std::mutex g_ct_reload_mutex;
+std::condition_variable g_ct_reload_cv;
+
+// A SHARED pointer, not a raw one to the waiting thread's stack.
+//
+// The first version queued `&req` from the agent thread's frame and had the
+// waiter clear the queue on timeout. That is a use-after-free with a 30-second
+// fuse: the safe point takes the pointer under the lock, releases the lock to
+// do the apply (which writes a file and recompiles a script, so it is not
+// quick), and if the waiter timed out in that window the object it is writing
+// into has already been destroyed. Shared ownership makes a timeout mean
+// "stop waiting", not "delete what the other thread is using".
+std::shared_ptr<CtReloadRequest> g_ct_reload_queued;
+
+// Counters the gates read off stderr. They are the harness's evidence that the
+// deferral path was ENTERED, which the milestone's `anti_vacuity` requires:
+// a run in which the race window never opened must fail loudly rather than be
+// reported as a pass over a reload that was never deferred.
+int g_ct_reload_applied_count = 0;
+int g_ct_reload_deferred_count = 0;
+
+// True only inside `gdscript_ct_hcr_safe_point()`. It is what distinguishes
+// "the engine chose this moment" from "a notification happened to arrive now".
+bool g_ct_in_safe_point = false;
+
+// `static_variables_indices` is private to GDScript and we are not a friend, so
+// the values are read through the public property surface —
+// `GDScript::_get_property_list` (gdscript.cpp:1048-1072) enumerates exactly
+// the static variables of the script and its bases, and `GDScript::_get`
+// (:954-:1000) resolves them. That is the same surface `MyClass.my_static`
+// uses, so what is measured here is what the program itself would see.
+void ct_collect_statics(const Ref<Script> &p_script, List<StringName> &r_names,
+		List<Variant> &r_values) {
+	if (p_script.is_null()) {
+		return;
+	}
+	List<PropertyInfo> props;
+	p_script->get_property_list(&props);
+	for (const PropertyInfo &pi : props) {
+		// `Object::get_property_list` merges the ClassDB properties of
+		// Object/Resource/Script — `source_code`, `resource_path`, `script`,
+		// `script/source` — with `GDScript::_get_property_list`'s statics.
+		// Only the latter carry `PROPERTY_USAGE_SCRIPT_VARIABLE`
+		// (gdscript_compiler.cpp:2877, set on every script-declared variable
+		// before it is filed into `static_variables_indices`).
+		//
+		// This filter is here because its absence was CAUGHT, not anticipated:
+		// without it, `source_code` changed across the reload — of course it
+		// did, the file was rewritten — and was reported as a lost static. The
+		// no-statics control arm of `gdh5_unpreserved_state_is_reported` went
+		// red on it, which is exactly what that arm is for: a report that names
+		// a loss on a script with no statics is the `oldCodeRetained: true`
+		// shape, and it would have shipped looking like a measurement.
+		if ((pi.usage & PROPERTY_USAGE_SCRIPT_VARIABLE) == 0) {
+			continue;
+		}
+		bool valid = false;
+		Variant value = p_script->get(pi.name, &valid);
+		if (!valid) {
+			continue;
+		}
+		r_names.push_back(pi.name);
+		r_values.push_back(value);
+	}
+}
+
+// Apply one queued reload. MUST be called with `g_ct_mutex` held (the emit
+// lock, §5.6.2) and from the engine's safe point.
+void ct_apply_reload_locked(CtReloadRequest &req) {
+	// 1. The bytes the notification carried become the bytes on disk, because
+	//    `reload_scripts` re-reads from disk (gdscript.cpp:2509). Writing them
+	//    here rather than trusting a path handle is §4.3's "content travels
+	//    with the notification": a handle races the next edit.
+	{
+		Error err = OK;
+		Ref<FileAccess> fa = FileAccess::open(req.res_path, FileAccess::WRITE, &err);
+		if (fa.is_null() || err != OK) {
+			req.applied = false;
+			req.reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+			req.detail = "cannot open " + req.res_path + " for writing (err " + itos((int)err) + ")";
+			return;
+		}
+		if (!req.content.is_empty()) {
+			fa->store_buffer(req.content.ptr(), req.content.size());
+		}
+		fa->flush();
+	}
+
+	// 2. The script must already be loaded. A `core:reload_scripts` addressed
+	//    to a never-loaded path takes no effect and says nothing — GDH-M0's
+	//    `wrongtarget` arm measured exactly that — so an unloaded path is
+	//    refused BY NAME here instead of quietly doing nothing.
+	Ref<Resource> res = ResourceCache::get_ref(req.res_path);
+	Ref<Script> scr = res;
+	if (scr.is_null()) {
+		req.applied = false;
+		req.reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+		req.detail = "no loaded script at " + req.res_path +
+				"; a reload addressed to a path the engine never loaded takes no effect";
+		return;
+	}
+
+	List<StringName> names;
+	List<Variant> before;
+	ct_collect_statics(scr, names, before);
+
+	// 3. Godot's own supported path, soft. §5.2: `reload_scripts` is the
+	//    wrapper that re-reads disk; `GDScript::reload()` alone is not.
+#if defined(CT_GDH5_FALSIFY_SCRIPT_RELOAD_ONLY)
+	// FALSIFIER ARM (gdh5_in_process_reload_matches_the_remote_debugger_path):
+	// call `GDScript::reload()` directly. It parses the IN-MEMORY `source`
+	// member (gdscript.cpp:820) and never re-reads disk, so the program keeps
+	// running v1 while every call reports success. This arm exists because
+	// `reload()` is the obvious-looking call and is the wrong one — the gate
+	// must go red by finding v1's tokens after the reload, measured against
+	// Godot's own `core:reload_scripts` oracle.
+	{
+		Ref<GDScript> gd = scr;
+		if (gd.is_valid()) {
+			(void)gd->reload(/*p_keep_state=*/true);
+		}
+	}
+#else
+	Array scripts;
+	scripts.push_back(scr);
+	GDScriptLanguage::get_singleton()->reload_scripts(scripts, /*p_soft_reload=*/true);
+#endif
+
+	// 4. What did not survive, measured rather than asserted.
+	List<StringName> names_after;
+	List<Variant> after;
+	ct_collect_statics(scr, names_after, after);
+	{
+		const List<StringName>::Element *ne = names.front();
+		const List<Variant>::Element *be = before.front();
+		for (; ne && be; ne = ne->next(), be = be->next()) {
+			bool found = false;
+			Variant now;
+			const List<StringName>::Element *na = names_after.front();
+			const List<Variant>::Element *va = after.front();
+			for (; na && va; na = na->next(), va = va->next()) {
+				if (na->get() == ne->get()) {
+					found = true;
+					now = va->get();
+					break;
+				}
+			}
+			if (!found) {
+				req.unpreserved.push_back("static-variable-removed:" + String(ne->get()));
+			} else if (now != be->get()) {
+				// §5.3: `_save_old_static_data` / `_restore_old_static_data` are
+				// TOOLS_ENABLED-only (gdscript.cpp:808-812, :892-901), so a
+				// `template_debug` build re-defaults every static through
+				// `_static_init()`. That is a real behavioural divergence from
+				// the editor and it is reported, never silently absorbed.
+				req.unpreserved.push_back("static-variable-lost:" + String(ne->get()) +
+						":" + String(be->get()) + "->" + String(now));
+			}
+		}
+	}
+
+	// §4.3's recording coordinates, so the coordinator can correlate its view of
+	// the reload with the trace without parsing the container. They are asked
+	// for, never counted: `trace_writer_next_step_index` is the writer's own
+	// counter and not a count of `register_step` calls.
+	req.path_id = 0;
+	req.step_index = 0;
+	if (g_ct_writer != nullptr) {
+		CharString path_cs = req.res_path.utf8();
+		uint64_t id = trace_writer_current_path_id(g_ct_writer, path_cs.get_data());
+		req.path_id = (id == CT_TW_INVALID_PATH_ID) ? 0 : id;
+		req.step_index = trace_writer_next_step_index(g_ct_writer);
+	}
+
+#if defined(CT_GDH5_FALSIFY_UNCONDITIONAL_LOSS)
+	// FALSIFIER ARM (gdh5_unpreserved_state_is_reported): report a
+	// static-variable loss whether or not the script has statics, and whether
+	// or not anything changed. This is the `oldCodeRetained: true` shape — an
+	// unconditional literal in a status field — and it is here to keep that out
+	// of a report the whole milestone rests on. The gate must go red on the
+	// no-statics CONTROL fixture, which has nothing to lose.
+	req.unpreserved.clear();
+	req.unpreserved.push_back("static-variable-lost:counter:reported-unconditionally");
+#endif
+	req.applied = true;
+	req.reason = nullptr;
+	g_ct_reload_applied_count++;
+}
+
+} // namespace
+
+// The agent's handler. Runs on whichever thread the agent services the socket
+// on: the polling thread when `repro_hcr_agent_poll` drives it (which IS the
+// safe point), or the agent's own detached thread in the default start mode.
+static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
+		const char *language,
+		const repro_hcr_source_changed_file *file,
+		repro_hcr_source_reload_outcome *out) {
+	(void)ctx;
+	(void)reload_id;
+	(void)language;
+
+	// These outlive the call: the agent reads them out of `out` after we
+	// return, so they cannot be stack buffers.
+	static CharString s_detail;
+	static CharString s_digest;
+	static CharString s_unpreserved[REPRO_HCR_AGENT_MAX_UNPRESERVED];
+
+	CtReloadRequest req;
+	std::shared_ptr<CtReloadRequest> shared;
+	req.res_path = String::utf8(file->source_path);
+	req.generation = file->generation;
+	req.content.resize((int)file->content_length);
+	if (file->content_length > 0) {
+		memcpy(req.content.ptrw(), file->content, file->content_length);
+	}
+
+	if (g_ct_in_safe_point) {
+		// Already at the point the engine chose: apply under the emit lock.
+		CtEmitLock lk;
+		if (!lk.engaged) {
+			// Reentrancy guard engaged means we are INSIDE the emit path. That
+			// must never happen at the safe point, and is reported rather than
+			// worked around.
+			out->applied = 0;
+			out->reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+			out->detail = "the safe point was reached from inside the recorder's emit path";
+			return -1;
+		}
+		ct_apply_reload_locked(req);
+	} else {
+		// §5.6.3 — a step may be pending. Queue and WAIT for the engine's own
+		// safe point. The coordinator still gets exactly one answer; it simply
+		// arrives after the reload was applied, which is what "deferred to the
+		// next safe point, never applied mid-step" means on the wire.
+		std::unique_lock<std::mutex> lock(g_ct_reload_mutex);
+		if (g_ct_reload_queued) {
+			out->applied = 0;
+			out->reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+			out->detail = "another reload is already queued for the next safe point";
+			return -1;
+		}
+		shared = std::make_shared<CtReloadRequest>(req);
+		g_ct_reload_queued = shared;
+		g_ct_reload_deferred_count++;
+		fprintf(stderr, "[ct-gdh5] reload deferred to the next safe point: %s gen=%u\n",
+				shared->res_path.utf8().get_data(), shared->generation);
+		fflush(stderr);
+		// Bounded: a safe point that never comes must be a named failure, not a
+		// stall in the host's reply.
+		if (!g_ct_reload_cv.wait_for(lock, std::chrono::seconds(30),
+					[&shared] { return shared->done; })) {
+			// Drop OUR reference only. The safe point may still be inside the
+			// apply and still owns its own.
+			g_ct_reload_queued.reset();
+			out->applied = 0;
+			out->reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+			out->detail = "no engine safe point was reached within 30 s";
+			return -1;
+		}
+		// Read the outcome out of the shared object the safe point filled in.
+		req = *shared;
+	}
+
+	s_detail = req.detail.utf8();
+	out->detail = s_detail.get_data();
+	out->path_index = req.path_id;
+	out->step_index = req.step_index;
+	out->applied_line_count = 0; // the agent counts the bytes it verified
+
+	{
+		// The digest the HOST recomputed over the bytes it applied, not an echo
+		// of the request. `repro_hcr_agent_sha256_hex` refuses if its own FIPS
+		// self-test fails, so a digest that cannot be shown to be one is never
+		// reported as one.
+		char hex[65];
+		if (repro_hcr_agent_sha256_hex(req.content.ptr(), (size_t)req.content.size(),
+					hex, sizeof(hex)) == 0) {
+			s_digest = (String("sha256:") + String(hex)).utf8();
+			out->applied_digest = s_digest.get_data();
+		}
+	}
+
+	int reported = 0;
+	for (int i = 0; i < req.unpreserved.size() && reported < REPRO_HCR_AGENT_MAX_UNPRESERVED; i++) {
+		s_unpreserved[reported] = req.unpreserved[i].utf8();
+		out->unpreserved[reported] = s_unpreserved[reported].get_data();
+		reported++;
+	}
+	out->unpreserved_count = reported;
+
+	if (!req.applied) {
+		out->applied = 0;
+		out->reason = req.reason != nullptr ? req.reason
+										   : REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+		return -1;
+	}
+	out->applied = 1;
+	out->reason = "";
+	fprintf(stderr,
+			"[ct-gdh5] reload applied: %s gen=%u path_id=%llu step_index=%llu unpreserved=%d deferred=%d\n",
+			req.res_path.utf8().get_data(), req.generation,
+			(unsigned long long)req.path_id, (unsigned long long)req.step_index,
+			reported, g_ct_reload_deferred_count);
+	for (int i = 0; i < reported; i++) {
+		fprintf(stderr, "[ct-gdh5]   unpreserved: %s\n", out->unpreserved[i]);
+	}
+	fflush(stderr);
+	return 0;
+}
+
+void gdscript_ct_hcr_install_source_reload_handler() {
+	// Registering the handler is what makes the agent advertise
+	// `source-reload`. The two are one act on purpose (design §4.4): a host
+	// that advertised the capability with nothing to serve it would produce a
+	// recording in which post-reload steps are attributed to v1 with nothing
+	// saying so — worse than refusing the session.
+	(void)repro_hcr_agent_set_source_reload_handler(gdscript_ct_hcr_source_reload, nullptr);
+}
+
+void gdscript_ct_hcr_safe_point() {
+	// 1. Apply anything the agent thread queued while the VM was mid-step.
+	{
+		std::shared_ptr<CtReloadRequest> req;
+		{
+			std::lock_guard<std::mutex> lock(g_ct_reload_mutex);
+			req = g_ct_reload_queued;
+		}
+		// Holding `req` here is what keeps the object alive across the apply
+		// even if the waiting thread gives up on it — see the note on
+		// `g_ct_reload_queued`.
+		if (req) {
+			{
+				CtEmitLock lk;
+				if (lk.engaged) {
+					ct_apply_reload_locked(*req);
+				} else {
+					req->applied = false;
+					req->reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+					req->detail = "the emit lock was not available at the safe point";
+				}
+			}
+			{
+				std::lock_guard<std::mutex> lock(g_ct_reload_mutex);
+				req->done = true;
+				g_ct_reload_queued.reset();
+			}
+			g_ct_reload_cv.notify_all();
+		}
+	}
+
+	// 2. Drain the polled agent, if the process is running one. `g_ct_in_safe_point`
+	//    is what tells the handler it may apply where it stands.
+	g_ct_in_safe_point = true;
+	(void)repro_hcr_agent_poll_nonblocking();
+	g_ct_in_safe_point = false;
+}
+#endif // CT_HCR_AGENT_ENABLED
+
 // Registered once, from initialize_gdscript_module() BEFORE the GDScriptLanguage
 // constructor runs (so track_locals is forced on in time). No-op unless
 // CT_GDSCRIPT_TRACE is set, so a build that includes this consumer behaves like
