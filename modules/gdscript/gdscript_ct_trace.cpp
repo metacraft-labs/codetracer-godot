@@ -101,6 +101,14 @@ static bool g_ct_inited = false;   // init attempted?
 static bool g_ct_disabled = false; // tracing off (env unset or init failed)
 static bool g_ct_started = false;  // trace_writer_start emitted the first step?
 
+// GDH-M6: is meta.dat bit 14 (the per-file line-count table) on for this
+// writer, and which path STRINGS have been given a recorded size? Declared
+// here because `gdscript_ct_ensure_writer` below turns the table on; the long
+// note explaining both, and the helpers that maintain them, are further down
+// beside the source-bundling code they sit next to.
+static bool g_ct_line_count_table = false;
+static HashSet<String> g_ct_sized_paths;
+
 // GF12: WRITER THREAD-SAFETY (resolves GDScript-Recorder.md open question #3).
 //
 // When GDScript runs on a worker thread (Thread.start / WorkerThreadPool.add_task)
@@ -366,6 +374,37 @@ static bool gdscript_ct_ensure_writer() {
 		return false;
 	}
 
+	// GDH-M6: pin the recording identity when asked to.
+	//
+	// Without a pin the writer mints a fresh UUIDv7 per recording, so NO TWO
+	// RECORDINGS OF THE SAME PROGRAM ARE EVER BYTE-IDENTICAL — measured on
+	// 2026-09-11, two runs of this engine over one fixture differed in exactly
+	// 16 bytes and all sixteen were the id. `gdh6_corpus_is_unchanged` asks
+	// whether this campaign altered any corpus recording, and that question is
+	// unanswerable without this: the milestone forbids excluding byte ranges
+	// from the comparison (an exclusion list grows one entry at a time and each
+	// entry is invisible), so the identity has to be made equal rather than
+	// ignored.
+	//
+	// It is OPT-IN and it is REPORTED. A recording produced under a pinned id
+	// is not a normal recording — two of them are indistinguishable — so a run
+	// must never be able to carry one silently.
+	{
+		const char *pinned = getenv("CT_RECORDING_ID");
+		if (pinned != nullptr && pinned[0] != '\0') {
+			trace_writer_clear_last_error();
+			if (trace_writer_set_recording_id(g_ct_writer, pinned) == 0) {
+				fprintf(stderr, "[ct-gdh6] recording id PINNED to %s "
+								"(CT_RECORDING_ID); this recording is "
+								"deliberately not unique\n", pinned);
+			} else {
+				fprintf(stderr, "[ct-gdh6] recording id pin REFUSED (%s): %s\n",
+						pinned, trace_writer_last_error());
+			}
+			fflush(stderr);
+		}
+	}
+
 	// The .ct lands in the directory of the events path:
 	//   <out_dir>/gdscript_trace.ct
 	String events_path = String::utf8(out_dir).path_join("events.bin");
@@ -381,6 +420,47 @@ static bool gdscript_ct_ensure_writer() {
 	trace_writer_set_interning_qualifier(g_ct_writer, "gdscript");
 	trace_writer_begin_events(g_ct_writer, events_cs.get_data());
 	trace_writer_begin_paths(g_ct_writer, "");
+
+	// GDH-M6: the line-count table, and ONLY when a reload can arrive. See the
+	// long note above `g_ct_line_count_table`. `enable_line_count_table` must
+	// run before the first path is registered, which is why it is here rather
+	// than at the first step.
+	//
+	// The result is reported either way. A build in which the call was made
+	// and REFUSED, and a build in which it was never made, look identical from
+	// the container — and the second is the falsifier arm for the corpus gate,
+	// so they must not be allowed to look identical from the log either.
+	{
+		const char *agent_socket = getenv("REPRO_HCR_AGENT_SOCKET");
+		bool reload_possible = agent_socket != nullptr && agent_socket[0] != '\0';
+#if defined(CT_GDH6_FALSIFY_ALWAYS_LINE_COUNT_TABLE)
+		// FALSIFIER ARM (gdh6_corpus_is_unchanged): set the new meta.dat bit
+		// UNCONDITIONALLY. Every container in the GT1 corpus then changes —
+		// paths.dat records grow a count and the position space is laid out
+		// from recorded sizes rather than the DefaultLinesPerFile stride —
+		// while every GDH-M6 gate stays green, because a reload session had
+		// the bit on anyway. It is the cheapest way to ship the feature and
+		// the one that breaks every recording that never reloads.
+		reload_possible = true;
+#endif
+		if (reload_possible) {
+			trace_writer_clear_last_error();
+			if (trace_writer_enable_line_count_table(g_ct_writer) == 0) {
+				g_ct_line_count_table = true;
+				fprintf(stderr, "[ct-gdh6] line-count table ENABLED (meta.dat bit 14); "
+								"a reload can mint a path version\n");
+			} else {
+				fprintf(stderr, "[ct-gdh6] line-count table REFUSED: %s\n",
+						trace_writer_last_error());
+			}
+		} else {
+			fprintf(stderr, "[ct-gdh6] line-count table off: no "
+							"REPRO_HCR_AGENT_SOCKET, so no reload can arrive and "
+							"this recording needs no path versions\n");
+		}
+		fflush(stderr);
+	}
+
 	atexit(gdscript_ct_close);
 	return true;
 }
@@ -450,12 +530,154 @@ static void gdscript_ct_ensure_types() {
 // than emitting empty text.
 static HashSet<uint64_t> g_ct_bundled_path_ids;
 
+// ===========================================================================
+// GDH-M6 — the line-count table (meta.dat bit 14) and minted path versions.
+//
+// A reload can only be attributed if the reloaded file gets a SECOND
+// paths.dat record, and `trace_writer_register_path_version` requires the
+// line-count table: without it both versions would be laid out at the
+// DefaultLinesPerFile stride, no bound could be enforced against either, and
+// the mis-attribution would be silent — which is precisely the defect GDH-M0
+// measured (129 of 196 steps decoding to lines 45-57 of a file the container
+// states is 40 lines long, with nothing reporting it).
+//
+// TWO CONSEQUENCES SHAPE WHERE THE SWITCH GOES.
+//
+//  1. The table changes the bytes of EVERY container the writer produces —
+//     paths.dat records grow a count, and the global position space is laid
+//     out from the recorded sizes instead of the stride. Turning it on
+//     unconditionally would change every recording in the GT1 corpus, which
+//     is exactly what `gdh6_corpus_is_unchanged`'s first falsifier arm is
+//     ("set the new meta.dat bit unconditionally"). So it is on only when a
+//     reload can ARRIVE: `REPRO_HCR_AGENT_SOCKET` is what makes the in-target
+//     agent connect out to a coordinator, and a process no coordinator is
+//     attached to has no reload to record.
+//
+//  2. Under the table the IMPLICIT path registration that
+//     `trace_writer_register_step` performs for an unseen path is REFUSED by
+//     name (it has no count to record). So every path must be registered
+//     through `trace_writer_register_path_with_line_count` BEFORE the first
+//     step that mentions it — `gdscript_ct_ensure_path_sized_locked` below,
+//     called from the step hook ahead of `trace_writer_start` /
+//     `trace_writer_register_step`.
+//
+// `g_ct_sized_paths` is keyed by the path STRING and is not a mirror of the
+// writer's ids — it answers "have I given this file a size yet", which does
+// not change when a reload mints a new version of it. GDH-M3 deleted the id
+// mirror and nothing here reintroduces one: every id is still ASKED FOR.
+//
+// (The two variables themselves are declared beside `g_ct_writer` at the top
+// of the file, because `gdscript_ct_ensure_writer` — which turns the table on
+// — runs before this point in the translation unit.)
+// ===========================================================================
+
+// The ceiling the C header names for a file whose lines cannot be counted
+// ("conventionally 100000"). It is recorded as the file's size, so the size
+// the space uses is the size the container states — an honest over-estimate
+// rather than an inferred one. It is NEVER the quiet default: the one call
+// site reports on stderr when it falls back.
+static const uint64_t CT_LINE_COUNT_CEILING = 100000;
+
+#if defined(CT_GDH6_FALSIFY_STALE_LINE_COUNT)
+// Only the falsifier arm needs to remember the size the PREVIOUS version was
+// recorded with; the shipped recorder never looks backwards, because the count
+// it records is always computed from the bytes it is about to install. The
+// variable is compiled in only under the arm so that a build without it cannot
+// be carrying half of one.
+static uint64_t g_ct_gdh6_last_recorded_lines = 0;
+#endif
+
+// The number of ADDRESSABLE lines in `p_bytes`, i.e. the largest 1-based line
+// number the file reaches. `checkLineWithinFile` refuses `line > count`, so
+// this bound is inclusive.
+//
+// A file ending in a newline has exactly as many lines as it has newlines
+// (`wc -l`); one that does not has one more. Getting this wrong in the safe
+// direction would be invisible — an over-estimate simply leaves unused space —
+// so it is computed rather than approximated, and 0 is lifted to 1 because
+// `register_path_with_line_count` refuses a 0-line file (it would share its
+// base with the next one).
+static uint64_t gdscript_ct_addressable_lines(const uint8_t *p_bytes, int64_t p_size) {
+	if (p_bytes == nullptr || p_size <= 0) {
+		return 1;
+	}
+	uint64_t newlines = 0;
+	for (int64_t i = 0; i < p_size; i++) {
+		if (p_bytes[i] == '\n') {
+			newlines++;
+		}
+	}
+	uint64_t lines = (p_bytes[p_size - 1] == '\n') ? newlines : newlines + 1;
+	return lines == 0 ? 1 : lines;
+}
+
+// Give `p_res_path` a recorded size before any step interns it. A no-op when
+// the line-count table is off, which is every recording that is not part of a
+// reload session — so the ordinary step/path streams are untouched.
+static void gdscript_ct_ensure_path_sized_locked(const String &p_res_path) {
+	if (!g_ct_line_count_table || g_ct_writer == nullptr) {
+		return;
+	}
+	if (g_ct_sized_paths.has(p_res_path)) {
+		return;
+	}
+	g_ct_sized_paths.insert(p_res_path);
+
+	Error err = OK;
+	Vector<uint8_t> bytes = FileAccess::get_file_as_bytes(p_res_path, &err);
+	uint64_t lines = CT_LINE_COUNT_CEILING;
+	bool counted = false;
+	if (err == OK && !bytes.is_empty()) {
+		lines = gdscript_ct_addressable_lines(bytes.ptr(), (int64_t)bytes.size());
+		counted = true;
+	}
+	CharString path_cs = p_res_path.utf8();
+	trace_writer_clear_last_error();
+	int rc = trace_writer_register_path_with_line_count(
+			g_ct_writer, path_cs.get_data(), lines);
+	if (rc != 0) {
+		// A refused sizing means every step on this file is about to be
+		// refused too (the implicit registration has no count), and those
+		// steps would simply never appear. That must not be silent — it is
+		// the shape of defect this whole campaign exists to remove.
+		fprintf(stderr, "[ct-gdh6] REFUSED sizing %s at %llu line(s): %s\n",
+				path_cs.get_data(), (unsigned long long)lines,
+				trace_writer_last_error());
+		fflush(stderr);
+		return;
+	}
+#if defined(CT_GDH6_FALSIFY_STALE_LINE_COUNT)
+	g_ct_gdh6_last_recorded_lines = lines;
+#endif
+	fprintf(stderr, "[ct-gdh6] sized %s = %llu line(s) (%s)\n",
+			path_cs.get_data(), (unsigned long long)lines,
+			counted ? "counted" : "CEILING: the file could not be read");
+	fflush(stderr);
+}
+
 static void gdscript_ct_bundle_source_locked(const String &p_res_path, uint64_t p_path_id) {
 	Error err = OK;
 	Vector<uint8_t> bytes = FileAccess::get_file_as_bytes(p_res_path, &err);
 	if (err != OK || bytes.is_empty()) {
 		return; // unreadable / empty — skip; do not bundle empty source
 	}
+#if defined(CT_GDH6_FALSIFY_STALE_SOURCE_VIEW)
+	// FALSIFIER ARM (gdh6_no_step_is_attributed_to_the_wrong_version, arm 4):
+	// attach the FIRST version's bytes under every path id, leaving every path
+	// id and every step line correct. The container then carries the right
+	// NUMBER of views, one per version, each on the right path id — and every
+	// one of them renders v1. The line-number half of the gate passes
+	// completely; only the TEXT half can see it, which is why the text half
+	// exists. A swap is the same defect with a shorter reach, so the arm takes
+	// the stronger form.
+	{
+		static Vector<uint8_t> s_first_bytes;
+		if (s_first_bytes.is_empty()) {
+			s_first_bytes = bytes;
+		}
+		bytes = s_first_bytes;
+	}
+#endif
 	CharString name_cs = p_res_path.utf8();
 	// view_kind 0 = raw original source; NULL sourcemap = identity bundle.
 	trace_writer_register_source_view(
@@ -484,6 +706,22 @@ static void gdscript_ct_note_and_bundle_path_locked(const String &p_res_path) {
 	if (path_id == CT_TW_INVALID_PATH_ID) {
 		return; // the writer does not know this path; do not invent an id for it
 	}
+#if defined(CT_GDH6_FALSIFY_STRING_KEYED_BUNDLE)
+	// FALSIFIER ARM (gdh6_both_versions_retrievable_end_to_end): restore the
+	// STRING-keyed early return GDH-M3 deleted. A reloaded file's string has
+	// been seen before, so its text is never bundled and the container carries
+	// ONE source view for a file that ran in three versions. This is the
+	// shipping behaviour GDH-M0 measured, and it is why that gate is phrased
+	// on source-view BYTES rather than on path entries alone: the path entries
+	// are all still there under this arm.
+	{
+		static HashSet<String> s_bundled_strings;
+		if (s_bundled_strings.has(p_res_path)) {
+			return;
+		}
+		s_bundled_strings.insert(p_res_path);
+	}
+#endif
 	if (g_ct_bundled_path_ids.has(path_id)) {
 		return;
 	}
@@ -506,6 +744,10 @@ void gdscript_ct_trace_step(const StringName &p_source, int64_t p_line) {
 
 	String source_str = String(p_source);
 	CharString src_cs = source_str.utf8();
+	// GDH-M6: under the line-count table the implicit registration these two
+	// calls would perform for an unseen path is refused by name, so the file's
+	// size is recorded FIRST. A no-op when the table is off.
+	gdscript_ct_ensure_path_sized_locked(source_str);
 	if (unlikely(!g_ct_started)) {
 		g_ct_started = true;
 		// Registers the first (pending) step at this real source line.
@@ -1323,8 +1565,10 @@ public:
 #include "gdscript.h"
 #include "core/io/resource.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <memory>
+#include <thread> // GDH-M6: the safe point's test-settable apply delay
 
 extern "C" {
 #include "repro_hcr_agent.h"
@@ -1347,6 +1591,14 @@ struct CtReloadRequest {
 	uint64_t step_index = 0;
 	Vector<String> unpreserved;
 	int deferred_frames = 0;
+
+	// GDH-M6 recording coordinates. `path_id` above is the id post-reload (the
+	// version the steps that follow resolve to); these three say what the
+	// marker recorded, so a coordinator can correlate its view of the reload
+	// with the container without parsing it.
+	uint64_t old_path_id = 0;
+	uint64_t reload_ordinal = 0; // 0 == no marker was emitted
+	uint64_t in_flight_frames = 0;
 };
 
 std::mutex g_ct_reload_mutex;
@@ -1361,7 +1613,106 @@ std::condition_variable g_ct_reload_cv;
 // quick), and if the waiter timed out in that window the object it is writing
 // into has already been destroyed. Shared ownership makes a timeout mean
 // "stop waiting", not "delete what the other thread is using".
+#if defined(CT_GDH6_FALSIFY_RAW_POINTER_QUEUE)
+// FALSIFIER ARM (gdh6_a_timed_out_deferral_does_not_outlive_its_request):
+// restore the ORIGINAL raw pointer into the waiting thread's frame, with the
+// waiter clearing it on timeout. The safe point takes the pointer under the
+// lock, releases the lock to do the apply — which writes a file and recompiles
+// a script, so it is not quick — and a timeout inside that window destroys the
+// object the safe point is still writing into. A use-after-free with a
+// 30-second fuse, which is exactly why it must be killed by AddressSanitizer's
+// REPORT and not by a crash: a fuse this long usually does not blow on demand,
+// and an arm that "detects" a defect by segfaulting has not been distinguished
+// from any other way of dying.
+CtReloadRequest *g_ct_reload_queued = nullptr;
+#else
 std::shared_ptr<CtReloadRequest> g_ct_reload_queued;
+#endif
+
+#if defined(CT_GDH6_FALSIFY_MARKER_OUTSIDE_LOCK)
+// FALSIFIER ARM (gdh6_reload_is_discoverable_end_to_end) — ADDED AT GDH-M6's
+// REVIEW, 2026-09-11.
+//
+// `include/codetracer_trace_writer.h` states the constraint this arm breaks,
+// in the entry's own prose:
+//
+//     "Ordering matters and is not enforceable from here: emit the marker from
+//      the SAME critical section that applies the reload […]. A marker emitted
+//      from a different lock hold can be separated from its apply by any
+//      number of steps, and the container then states a boundary the execution
+//      did not have."
+//
+// That is a named hazard with, as of the review, NO falsifier. Every other
+// GDH-M6 arm attacks the marker's CONTENT (zeroed payload, no marker at all,
+// no version minted); none attacks its POSITION, and position is the whole
+// reason the marker exists rather than being inferred from `paths.dat`. An
+// implementer who moved the emission out of `ct_apply_reload_locked` — which
+// is a natural refactor, since the apply is long and the emission is not —
+// would break the gate's central cross-tie and nothing would have gone red.
+//
+// The mutation is the refactor, done faithfully rather than caricatured: the
+// marker is still emitted, still exactly once, still with the correct ids,
+// generation, ordinal and in-flight count. It is emitted from the NEXT safe
+// point instead of this one — one `Main::iteration()` later — so the new
+// version's steps for that frame are written BEFORE the marker that announces
+// it. Everything a presence check or a content check looks at is still right.
+// Only the POSITION is wrong, and the gate must go red on the cross-tie:
+// `before[-1].path_id` is then the NEW id, not the old one.
+struct CtDeferredMarker {
+	bool pending = false;
+	ct_tw_source_reload_change change{};
+	uint64_t in_flight_frames = 0;
+};
+CtDeferredMarker g_ct_deferred_marker;
+#endif
+
+// GDH-M6: how long the answering thread waits for the engine's safe point.
+//
+// The shipping value is 30 s. It is TEST-SETTABLE because the gate that grades
+// the timeout path has to reach the timeout, and a gate that takes half a
+// minute to answer is a gate that gets disabled — and a disabled gate is not a
+// gate. The override is read once, from the environment, and is reported in
+// the timeout message itself so a run can never be read as having waited the
+// shipping bound when it did not.
+int ct_reload_wait_seconds() {
+	static int cached = -1;
+	if (cached >= 0) {
+		return cached;
+	}
+	cached = 30;
+	const char *raw = getenv("CT_GDH6_RELOAD_WAIT_SECONDS");
+	if (raw != nullptr && raw[0] != '\0') {
+		int parsed = atoi(raw);
+		if (parsed > 0) {
+			cached = parsed;
+		}
+	}
+	return cached;
+}
+
+// GDH-M6: an artificial delay INSIDE the safe point's apply, in milliseconds.
+//
+// The use-after-free this guards against lives in the window between the safe
+// point releasing the emit lock to do its work and the waiter's bound
+// expiring. That window is real but short, so a gate that waited for it to
+// occur naturally would be a flaky gate. Widening it on request is what makes
+// the race deterministic; it is off unless the variable is set, and the safe
+// point reports when it is honouring it.
+int ct_safe_point_delay_ms() {
+	static int cached = -1;
+	if (cached >= 0) {
+		return cached;
+	}
+	cached = 0;
+	const char *raw = getenv("CT_GDH6_SAFE_POINT_DELAY_MS");
+	if (raw != nullptr && raw[0] != '\0') {
+		int parsed = atoi(raw);
+		if (parsed > 0) {
+			cached = parsed;
+		}
+	}
+	return cached;
+}
 
 // Counters the gates read off stderr. They are the harness's evidence that the
 // deferral path was ENTERED, which the milestone's `anti_vacuity` requires:
@@ -1521,6 +1872,146 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 		uint64_t id = trace_writer_current_path_id(g_ct_writer, path_cs.get_data());
 		req.path_id = (id == CT_TW_INVALID_PATH_ID) ? 0 : id;
 		req.step_index = trace_writer_next_step_index(g_ct_writer);
+
+		// ===============================================================
+		// GDH-M6 — MINT THE VERSION AND EMIT THE MARKER, HERE.
+		//
+		// "Here" is load-bearing. This runs inside `ct_apply_reload_locked`,
+		// which the caller entered holding the EMIT LOCK, and the disk write
+		// plus `reload_scripts` above have already happened. So the marker's
+		// position in the step stream is the position of the apply: no step
+		// can be emitted between them, and the container cannot state a
+		// boundary the execution did not have.
+		//
+		// Order within the block matters too. `register_path_version` must
+		// come first, because `registerSourceReload` refuses
+		// `old_path_id == new_path_id` — a reload that minted no new index
+		// cannot attribute its post-reload steps to the version that ran
+		// them. After it, a bare `trace_writer_register_step` on the same
+		// string resolves to the NEW id, so the recorder's hot path stays
+		// version-unaware; only this path is version-aware.
+		//
+		// Every refusal below is REPORTED, never swallowed. A reload that
+		// applied but recorded nothing is the exact shape GDH-M0 measured,
+		// and it must not be reachable silently from here.
+		// ===============================================================
+#if defined(CT_GDH6_FALSIFY_NO_VERSION_MINTED)
+		// FALSIFIER ARM (gdh6_no_step_is_attributed_to_the_wrong_version,
+		// arm 1): apply the reload and mint NO path version. Every post-reload
+		// step then resolves, by the writer's ordinary interning, to v1's path
+		// id — which is exactly the state GDH-M0 measured and the state this
+		// milestone exists to leave. The reload itself still happens: the file
+		// is rewritten, the script is recompiled, the program plainly prints
+		// v2's and v3's tokens, and the acknowledgement says `applied`. Only
+		// the TRACE is wrong, and only about which version ran.
+		//
+		// It also takes the marker down with it, necessarily rather than
+		// incidentally: `registerSourceReload` refuses `old == new`, so a
+		// version that was never minted has no transition to record. The
+		// driver aims this arm at the attribution gate and states that it
+		// reddens the discoverability gate too, rather than hiding it.
+		const bool ct_gdh6_mint_versions = false;
+#else
+		const bool ct_gdh6_mint_versions = true;
+#endif
+		if (!ct_gdh6_mint_versions) {
+			req.unpreserved.push_back(
+					"source-version-not-minted:CT_GDH6_FALSIFY_NO_VERSION_MINTED");
+		} else if (id == CT_TW_INVALID_PATH_ID) {
+			// The writer has never seen this file — it was reloaded before it
+			// ever executed. There is no old version to transition FROM, so
+			// there is nothing truthful to record. Say so.
+			req.unpreserved.push_back(
+					"source-version-not-minted:the recorder has never seen " +
+					req.res_path + ", so there is no old path id to record a "
+								   "transition from");
+		} else if (!g_ct_line_count_table) {
+			req.unpreserved.push_back(
+					"source-version-not-minted:this writer has no line-count "
+					"table (meta.dat bit 14), so a second paths.dat record "
+					"would carry no size and both versions would share the "
+					"DefaultLinesPerFile stride");
+		} else {
+			uint64_t new_lines = gdscript_ct_addressable_lines(
+					req.content.ptr(), (int64_t)req.content.size());
+#if defined(CT_GDH6_FALSIFY_STALE_LINE_COUNT)
+			// FALSIFIER ARM (gdh6_no_step_is_attributed_to_the_wrong_version,
+			// arm 5): register the new version with the OLD version's line
+			// count. The paths.dat entries are all there, the ids are all
+			// right, the marker is well formed — and the new version's slot
+			// in the position space is the wrong SIZE, so every one of its
+			// lines past the old file's end has no address inside its own
+			// slot. Under the line-count table the writer refuses those steps
+			// (checkLineWithinFile), so they vanish rather than addressing
+			// into the next file, and the gate sees it as a cardinality
+			// mismatch. The distinction matters and the harness reports it:
+			// without the table, the same mistake would have SILENTLY spilled
+			// into the next file's range, which is the GDH-M0 defect.
+			if (g_ct_gdh6_last_recorded_lines != 0) {
+				new_lines = g_ct_gdh6_last_recorded_lines;
+			}
+#endif
+			trace_writer_clear_last_error();
+			uint64_t new_id = trace_writer_register_path_version(
+					g_ct_writer, path_cs.get_data(), new_lines);
+			if (new_id == CT_TW_INVALID_PATH_ID) {
+				req.unpreserved.push_back(
+						String("source-version-not-minted:") +
+						String::utf8(trace_writer_last_error()));
+			} else {
+				req.old_path_id = id;
+				req.path_id = new_id;
+				// Frames still executing the OLD version's bytecode, MEASURED.
+				// `g_ct_crossing_stack` is the recorder's own LIFO of open
+				// GDScript frames, maintained at exactly the sites the
+				// writer's call/return records are. At an engine safe point it
+				// is empty and this is 0 — but it is read rather than assumed,
+				// because design §5.4 says steps belonging to in-flight frames
+				// legitimately appear after the marker carrying the OLD id,
+				// and a consumer must not read the marker as a clean cut on
+				// the strength of a literal.
+				req.in_flight_frames = (uint64_t)g_ct_crossing_stack.size();
+				ct_tw_source_reload_change change;
+				change.old_path_id = id;
+				change.new_path_id = new_id;
+				change.generation = (uint64_t)req.generation;
+				trace_writer_clear_last_error();
+#if defined(CT_GDH6_FALSIFY_NO_MARKER)
+				// FALSIFIER ARM (gdh6_reload_is_discoverable_end_to_end):
+				// mint the version and emit NO marker. Every path index is
+				// correct, every step is attributed to the version that ran
+				// it, and a consumer could still INFER a transition by
+				// scanning paths.dat for a repeated string. The gate must
+				// still go red, because design §6.3.1 requires the boundary
+				// to be RECORDED: an inference cannot say where in the step
+				// stream the transition happened, which ids it ran between,
+				// or which wire generation was installed. This arm is the
+				// whole reason that gate exists separately from GDH-G3.
+				uint64_t ordinal = 0;
+				(void)change;
+#elif defined(CT_GDH6_FALSIFY_MARKER_OUTSIDE_LOCK)
+				// FALSIFIER ARM (see the note on `g_ct_deferred_marker`):
+				// hand the marker to the NEXT safe point instead of emitting
+				// it here. Nothing about its contents changes — only the lock
+				// hold it is emitted from, which is precisely what the C
+				// header says is not enforceable from its side.
+				g_ct_deferred_marker.change = change;
+				g_ct_deferred_marker.in_flight_frames = req.in_flight_frames;
+				g_ct_deferred_marker.pending = true;
+				uint64_t ordinal = 1; // not the writer's; the arm is about position
+#else
+				uint64_t ordinal = trace_writer_register_source_reload(
+						g_ct_writer, &change, 1, req.in_flight_frames);
+#endif
+				if (ordinal == CT_TW_INVALID_RELOAD_ORDINAL) {
+					req.unpreserved.push_back(
+							String("source-reload-marker-refused:") +
+							String::utf8(trace_writer_last_error()));
+				} else {
+					req.reload_ordinal = ordinal;
+				}
+			}
+		}
 	}
 
 #if defined(CT_GDH5_FALSIFY_UNCONDITIONAL_LOSS)
@@ -1566,7 +2057,20 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 		memcpy(req.content.ptrw(), file->content, file->content_length);
 	}
 
-	if (g_ct_in_safe_point) {
+#if defined(CT_GDH6_FALSIFY_APPLY_WHERE_IT_LANDS)
+	// FALSIFIER ARM (gdh5_reload_is_refused_while_a_step_is_pending): remove
+	// the pending-step guard and apply the reload WHERE THE NOTIFICATION
+	// LANDED, on the agent's own thread, whether or not the VM is mid-step.
+	// The emit lock still serialises the writer, so nothing crashes — the
+	// recorder's single pending-step slot is simply flushed in the middle of a
+	// step whose values have not all arrived, and the marker lands between a
+	// step and its values. The gate must go red by finding that split IN THE
+	// CONTAINER, not by observing that a guard was not called.
+	const bool ct_gdh6_defer_to_safe_point = false;
+#else
+	const bool ct_gdh6_defer_to_safe_point = true;
+#endif
+	if (g_ct_in_safe_point || !ct_gdh6_defer_to_safe_point) {
 		// Already at the point the engine chose: apply under the emit lock.
 		CtEmitLock lk;
 		if (!lk.engaged) {
@@ -1591,26 +2095,49 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 			out->detail = "another reload is already queued for the next safe point";
 			return -1;
 		}
+		const int bound_s = ct_reload_wait_seconds();
+#if defined(CT_GDH6_FALSIFY_RAW_POINTER_QUEUE)
+		// FALSIFIER ARM: queue a pointer into THIS FRAME and let the waiter
+		// clear it on timeout. See the note on `g_ct_reload_queued`.
+		g_ct_reload_queued = &req;
+		CtReloadRequest *watched = &req;
+#else
 		shared = std::make_shared<CtReloadRequest>(req);
 		g_ct_reload_queued = shared;
+		std::shared_ptr<CtReloadRequest> watched = shared;
+#endif
 		g_ct_reload_deferred_count++;
 		fprintf(stderr, "[ct-gdh5] reload deferred to the next safe point: %s gen=%u\n",
-				shared->res_path.utf8().get_data(), shared->generation);
+				watched->res_path.utf8().get_data(), watched->generation);
 		fflush(stderr);
 		// Bounded: a safe point that never comes must be a named failure, not a
-		// stall in the host's reply.
-		if (!g_ct_reload_cv.wait_for(lock, std::chrono::seconds(30),
-					[&shared] { return shared->done; })) {
+		// stall in the host's reply. The bound is reported in the message, so a
+		// run under a test override cannot be read as having waited 30 s.
+		if (!g_ct_reload_cv.wait_for(lock, std::chrono::seconds(bound_s),
+					[&watched] { return watched->done; })) {
+#if defined(CT_GDH6_FALSIFY_RAW_POINTER_QUEUE)
+			// The waiter DELETES what the other thread is using: it clears the
+			// queue and then returns, destroying `req` — which the safe point
+			// is still writing into.
+			g_ct_reload_queued = nullptr;
+#else
 			// Drop OUR reference only. The safe point may still be inside the
 			// apply and still owns its own.
 			g_ct_reload_queued.reset();
+#endif
 			out->applied = 0;
 			out->reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
-			out->detail = "no engine safe point was reached within 30 s";
+			static CharString s_timeout;
+			s_timeout = (String("no engine safe point was reached within ") +
+					itos(bound_s) + " s").utf8();
+			out->detail = s_timeout.get_data();
+			fprintf(stderr, "[ct-gdh6] deferral TIMED OUT: no engine safe point "
+							"was reached within %d s\n", bound_s);
+			fflush(stderr);
 			return -1;
 		}
-		// Read the outcome out of the shared object the safe point filled in.
-		req = *shared;
+		// Read the outcome out of the object the safe point filled in.
+		req = *watched;
 	}
 
 	s_detail = req.detail.utf8();
@@ -1653,6 +2180,19 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 			req.res_path.utf8().get_data(), req.generation,
 			(unsigned long long)req.path_id, (unsigned long long)req.step_index,
 			reported, g_ct_reload_deferred_count);
+	// GDH-M6: the marker's own coordinates, on their own line so a harness can
+	// match them without parsing the line above. `ordinal=0` means NO marker
+	// was emitted and is printed as such rather than omitted — a missing line
+	// and a zero are different findings and the `unpreserved` entries above
+	// say which refusal produced it.
+	fprintf(stderr,
+			"[ct-gdh6] reload marker: ordinal=%llu old_path_id=%llu new_path_id=%llu "
+			"in_flight_frames=%llu writer_reload_count=%llu\n",
+			(unsigned long long)req.reload_ordinal,
+			(unsigned long long)req.old_path_id,
+			(unsigned long long)req.path_id,
+			(unsigned long long)req.in_flight_frames,
+			(unsigned long long)trace_writer_source_reload_count(g_ct_writer));
 	for (int i = 0; i < reported; i++) {
 		fprintf(stderr, "[ct-gdh5]   unpreserved: %s\n", out->unpreserved[i]);
 	}
@@ -1672,15 +2212,30 @@ void gdscript_ct_hcr_install_source_reload_handler() {
 void gdscript_ct_hcr_safe_point() {
 	// 1. Apply anything the agent thread queued while the VM was mid-step.
 	{
+#if defined(CT_GDH6_FALSIFY_RAW_POINTER_QUEUE)
+		CtReloadRequest *req = nullptr;
+#else
 		std::shared_ptr<CtReloadRequest> req;
+#endif
 		{
 			std::lock_guard<std::mutex> lock(g_ct_reload_mutex);
 			req = g_ct_reload_queued;
 		}
 		// Holding `req` here is what keeps the object alive across the apply
 		// even if the waiting thread gives up on it — see the note on
-		// `g_ct_reload_queued`.
+		// `g_ct_reload_queued`. Under the raw-pointer arm it keeps nothing
+		// alive, which is the defect.
 		if (req) {
+			// GDH-M6 test hook: widen the window between taking the request
+			// and finishing with it, so the waiter's bound can expire while
+			// the apply is in flight. Off unless asked for.
+			const int delay_ms = ct_safe_point_delay_ms();
+			if (delay_ms > 0) {
+				fprintf(stderr, "[ct-gdh6] safe point holding the apply for %d ms "
+								"(CT_GDH6_SAFE_POINT_DELAY_MS)\n", delay_ms);
+				fflush(stderr);
+				std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+			}
 			{
 				CtEmitLock lk;
 				if (lk.engaged) {
@@ -1694,11 +2249,35 @@ void gdscript_ct_hcr_safe_point() {
 			{
 				std::lock_guard<std::mutex> lock(g_ct_reload_mutex);
 				req->done = true;
+#if defined(CT_GDH6_FALSIFY_RAW_POINTER_QUEUE)
+				g_ct_reload_queued = nullptr;
+#else
 				g_ct_reload_queued.reset();
+#endif
 			}
 			g_ct_reload_cv.notify_all();
 		}
 	}
+
+#if defined(CT_GDH6_FALSIFY_MARKER_OUTSIDE_LOCK)
+	// FALSIFIER ARM (see `g_ct_deferred_marker`). Emit the marker the apply
+	// handed over, from THIS safe point's lock hold rather than the apply's.
+	// One `Main::iteration()` has run in between, so the new version's steps
+	// for that frame are already in the stream and the marker lands after
+	// them. The emission itself is correct in every other respect, which is
+	// the point: a gate that checked the marker's presence, its count, its
+	// ordinals, its ids, its generation and its in-flight count — all of them
+	// — would still be green here.
+	if (g_ct_deferred_marker.pending) {
+		g_ct_deferred_marker.pending = false;
+		CtEmitLock lk;
+		if (lk.engaged) {
+			(void)trace_writer_register_source_reload(
+					g_ct_writer, &g_ct_deferred_marker.change, 1,
+					g_ct_deferred_marker.in_flight_frames);
+		}
+	}
+#endif
 
 	// 2. Drain the polled agent, if the process is running one. `g_ct_in_safe_point`
 	//    is what tells the handler it may apply where it stands.

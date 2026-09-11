@@ -27,6 +27,39 @@ if _ct_gdh5_falsify:
           % _ct_gdh5_falsify)
     env_gdscript.Append(CPPDEFINES=[_ct_gdh5_falsify])
 
+# --- GDH-M6 falsifier arms ---------------------------------------------
+# Same mechanism, same scope, same reason. `CT_GDH6_FALSIFY` may name MORE
+# than one mutation, comma-separated, because two of GDH-M6's gates are
+# graded against the same recording and an arm aimed at one of them has to
+# be shown not to have reddened the other by accident.
+_ct_gdh6_falsify = os.environ.get("CT_GDH6_FALSIFY", "")
+if _ct_gdh6_falsify:
+    for _arm in [a.strip() for a in _ct_gdh6_falsify.split(",") if a.strip()]:
+        print("CodeTracer GDH-M6 FALSIFIER ARM: -D%s (this is NOT a plain build)"
+              % _arm)
+        env_gdscript.Append(CPPDEFINES=[_arm])
+
+# --- GDH-M6 AddressSanitizer, scoped to this module ---------------------
+# `gdh6_a_timed_out_deferral_does_not_outlive_its_request` is killed by the
+# SANITIZER'S REPORT, never by a crash: the defect it guards is a
+# use-after-free with a 30-second fuse, and a fuse that long usually does not
+# blow on demand. So the recorder's translation unit is built with
+# `-fsanitize=address` and the engine is linked against the runtime.
+#
+# Scoped to `env_gdscript` for the compile and to `env` for the link, exactly
+# as the writer's static library is: an engine-wide `-fsanitize=address`
+# invalidates every object in the tree and costs a full rebuild (measured at
+# 813 s while bringing GDH-M5's arms up), whereas this is one translation unit
+# plus a relink.
+#
+# `detect_leaks=0` is NOT set here. The gate sets ASAN_OPTIONS itself, so the
+# choice is visible in the harness rather than baked into the binary.
+if os.environ.get("CT_GDH6_ASAN", "") not in ("", "0"):
+    print("CodeTracer GDH-M6: -fsanitize=address on modules/gdscript "
+          "(this is NOT a plain build)")
+    env_gdscript.Append(CCFLAGS=["-fsanitize=address", "-fno-omit-frame-pointer"])
+    env.Append(LINKFLAGS=["-fsanitize=address"])
+
 # --- CodeTracer G2: link the CTFS writer static lib ---------------------
 # The C-ABI header (compile-time) and libcodetracer_trace_writer.a
 # (link-time) come from codetracer-trace-format-nim, vendored under

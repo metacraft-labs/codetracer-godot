@@ -160,6 +160,36 @@ uint8_t* trace_writer_container_ptr(trace_writer_t handle);
  * Tracing primitives
  * -------------------------------------------------------------------------- */
 
+/*
+ * Pin the recording's canonical UUIDv7 identity (M-REC-1, spec §3).
+ *
+ * MISSING FROM THIS HEADER UNTIL GDH-M6, and the omission had the same shape
+ * as the one GDH-M3 fixed for the versioned-path calls: the entry point has
+ * been exported by the FFI since M-REC-1, this header is what the Godot fork
+ * vendors, so the fork could not pin an identity — and WITHOUT A PIN NO TWO
+ * RECORDINGS OF THE SAME PROGRAM ARE EVER BYTE-IDENTICAL. Measured on
+ * 2026-09-11 and re-measured at review: two runs of one engine over one
+ * fixture differ ONLY inside the 36-character UUIDv7 stored in meta.dat, and
+ * in nothing else in the container — no timestamp, no hash, no offset. The
+ * NUMBER of differing bytes is not a constant (16 and 21 on two separate
+ * pairs); it is just how many characters two random UUIDv7s happen to
+ * disagree on, so do not write a check against it. The localisation is the
+ * fact: pin the id and the containers are equal, byte for byte. Any gate that
+ * asks whether a change altered a recording is unrunnable until a caller can
+ * say "use this id".
+ *
+ * MUST be called BEFORE trace_writer_begin_events / begin_in_memory: the
+ * constructors resolve the identity themselves, so a writer that is already
+ * open is REFUSED rather than silently rewritten.
+ *
+ * An empty string is refused rather than treated as "mint one" — a caller
+ * whose own id is missing must find that out, not have it papered over.
+ *
+ * Returns 0 on success, non-zero on refusal (see trace_writer_last_error).
+ */
+int trace_writer_set_recording_id(trace_writer_t handle,
+                                  const char* recording_id);
+
 void trace_writer_start(trace_writer_t handle, const char* path, int64_t line);
 void trace_writer_set_workdir(trace_writer_t handle, const char* workdir);
 /* IC-M2: stamp a fully-qualified-key origin namespace (the VM language, e.g.
@@ -274,6 +304,91 @@ uint64_t trace_writer_register_path_version(trace_writer_t handle,
 uint64_t trace_writer_current_path_id(trace_writer_t handle,
                                       const char* path);
 
+/* --------------------------------------------------------------------------
+ * Source-reload markers (GDH-M6 — design §6.3)
+ *
+ * The marker is what makes a reload DISCOVERABLE in the container rather
+ * than inferable from the path indices.  A consumer scanning paths.dat for
+ * a repeated string can guess that a reload happened; it cannot say WHEN in
+ * the step stream, WHICH ids the transition ran between, or which wire
+ * generation the new content carried.  Design §6.3.1 requires the marker for
+ * that reason, so a host that mints a path version and emits no marker has
+ * done half the job.
+ *
+ * Ordering matters and is not enforceable from here: emit the marker from
+ * the SAME critical section that applies the reload, after
+ * trace_writer_register_path_version has minted `new_path_id`.  A marker
+ * emitted from a different lock hold can be separated from its apply by any
+ * number of steps, and the container then states a boundary the execution
+ * did not have.
+ * -------------------------------------------------------------------------- */
+
+/*
+ * One file's transition across a reload boundary.  Three uint64s, no
+ * padding, so a caller can build the array as a plain C struct literal.
+ */
+typedef struct {
+    /* The paths.dat id this file's steps resolved to BEFORE the reload. */
+    uint64_t old_path_id;
+    /*
+     * The id they resolve to after — the value
+     * trace_writer_register_path_version returned.  MUST differ from
+     * old_path_id: a reload that minted no new index cannot attribute its
+     * post-reload steps to the version that ran them, and the call is
+     * refused by name rather than recording a marker that says nothing.
+     */
+    uint64_t new_path_id;
+    /*
+     * The WIRE generation from the observer's notification.  Generation 1 is
+     * the content the process started with, so a reload's generation is 2 or
+     * more and a literal 1 is refused as a protocol error.  Deliberately off
+     * by one from the container-side version ordinal.
+     */
+    uint64_t generation;
+} ct_tw_source_reload_change;
+
+/*
+ * The failure return of trace_writer_register_source_reload.  reload_ordinal
+ * is 1-based and monotonic within a trace, so 0 is not a value a successful
+ * call can produce.
+ */
+#define CT_TW_INVALID_RELOAD_ORDINAL ((uint64_t)0)
+
+/*
+ * Emit a TagSourceReload marker at the current point in the execution stream
+ * and return its 1-based reload_ordinal.
+ *
+ * `changed` must point to `changed_count` entries and `changed_count` must be
+ * non-zero: a marker that records a reload without recording what it changed
+ * cannot be told apart from one whose files were lost.
+ *
+ * `in_flight_frames` is the number of frames still executing the OLD
+ * version's code when the marker was emitted (design §5.4).  Steps belonging
+ * to those frames legitimately appear after the marker carrying the OLD path
+ * id, so this is RECORDED rather than implied — a consumer must not read the
+ * marker as a clean cut.  Pass 0 only when it really is one.
+ *
+ * The ordinal is the WRITER'S own count, not a caller-supplied number, so a
+ * second reload cannot repeat the first's.
+ *
+ * Returns CT_TW_INVALID_RELOAD_ORDINAL (0) on failure, with
+ * trace_writer_last_error set to a message naming the refusal.  The error
+ * buffer is CLEARED on entry, so a non-empty buffer afterwards is always this
+ * call's message and never a stale one.
+ */
+uint64_t trace_writer_register_source_reload(
+    trace_writer_t handle,
+    const ct_tw_source_reload_change* changed,
+    size_t changed_count,
+    uint64_t in_flight_frames);
+
+/*
+ * Markers emitted on this writer so far.  A host asserts against this rather
+ * than against a counter of its own call sites: the two disagree exactly when
+ * a call was refused, which is the case worth catching.
+ */
+uint64_t trace_writer_source_reload_count(trace_writer_t handle);
+
 size_t trace_writer_ensure_function_id(trace_writer_t handle,
     const char* name, const char* path, int64_t line);
 
@@ -309,6 +424,24 @@ void trace_writer_register_variable_cbor(trace_writer_t handle,
     const char* name,
     const uint8_t* cbor_data,
     size_t cbor_len);
+
+/* Record `target_name = <rvalue>` on the step currently being buffered.
+ *
+ * `rvalue_cbor` / `rvalue_cbor_len` carry the serde-CBOR encoding of
+ * `codetracer_trace_types::RValue` (adjacently tagged: `{"kind":…,"data":…}`).
+ * `pass_by` is the `PassBy` discriminant in declaration order:
+ * 0 = Value, 1 = Reference.
+ *
+ * The record reaches the trace as a tag-9 `Assignment` value-stream event
+ * (trace-events.md §"Value Stream Events") inside the step's value record.
+ *
+ * Returns 0 on success, 1 on failure (see trace_writer_last_error).
+ */
+int trace_writer_register_assignment(trace_writer_t handle,
+    const char* target_name,
+    uint8_t pass_by,
+    const uint8_t* rvalue_cbor,
+    size_t rvalue_cbor_len);
 
 void trace_writer_register_return_cbor(trace_writer_t handle,
     const uint8_t* cbor_data,
