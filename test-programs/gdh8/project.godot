@@ -1,0 +1,13 @@
+; CodeTracer GDScript recorder — GDH-M8 failure-semantics project.
+;
+; A checked-in project.godot, for the same reason GDH-M0's and GDH-M6's are
+; checked in: the driver copies THIS directory to a scratch project and either
+; rewrites `probe.gd` inside it or has the engine do so, and the directory
+; `--path` names has to be a fixed, reviewable artifact.
+config_version=5
+
+[application]
+
+config/name="ct-gdh8-failure-semantics"
+run/main_scene=""
+config/features=PackedStringArray("4.6")
