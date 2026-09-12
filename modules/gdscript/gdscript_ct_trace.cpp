@@ -86,6 +86,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring> // GDH-M8: strcmp, for the fault-injection stage name
 #include <mutex> // GF12: serialize the shared writer/encoder across worker threads
 #include <vector> // MT3: LIFO stack of open native<->VM crossing span ids
 
@@ -655,11 +656,56 @@ static void gdscript_ct_ensure_path_sized_locked(const String &p_res_path) {
 	fflush(stderr);
 }
 
-static void gdscript_ct_bundle_source_locked(const String &p_res_path, uint64_t p_path_id) {
-	Error err = OK;
-	Vector<uint8_t> bytes = FileAccess::get_file_as_bytes(p_res_path, &err);
-	if (err != OK || bytes.is_empty()) {
-		return; // unreadable / empty — skip; do not bundle empty source
+// Attach `p_bytes` as `p_path_id`'s raw source view.
+//
+// GDH-M8 (design §8.1 step 4) split this out of the disk-reading wrapper below
+// so the reload sequence can bundle THE BYTES IT VERIFIED rather than whatever
+// is on disk when the next step happens to run. The two callers want different
+// sources for the same act and the difference is load-bearing:
+//
+//   * the ordinary recorder path has no bytes of its own — the file has been on
+//     disk since before the process started — so it reads them;
+//   * the reload path HAS the bytes, already digest-checked by the agent
+//     (repro_hcr_agent.c:2316-2371), and reading the file back instead would
+//     re-open a TOCTOU window the digest exists to close (§8.2).
+//
+// Returns false when nothing was bundled, so a caller that must not continue
+// without the view can tell. The old wrapper's silent `return` on an unreadable
+// file is preserved for the recorder path, where a missing view is a degraded
+// rendering rather than an incoherent trace.
+#if !defined(CT_GDH8_NO_INJECTION_HOOK)
+// GDH-M8's fault-injection latch for §8.1 step 4.
+//
+// Once the injection has fired at the bundle stage, source-view registration
+// stays refused for the rest of the process. That is FAITHFULNESS, not
+// convenience: a writer that refuses a source view refuses it again at the next
+// step, and a hook that failed exactly once is rescued by the recorder's own
+// lazy bundler — `gdscript_ct_note_and_bundle_path_locked` re-reads the file
+// from disk at the first step after the reload and attaches the view the
+// injection had just prevented.
+//
+// MEASURED. Written one-shot first, the falsifier arm
+// `CT_GDH8_FALSIFY_CONTINUE_AFTER_FAILURE` went red on the ABSENCE of a refusal
+// message and NOT on "steps whose path id has no source view", which is the
+// container incoherence its milestone entry requires it to be killed by. The
+// driver's named-kill check is what caught it.
+//
+// It is set only from `ct_gdh8_inject_at`'s caller, which is inert unless
+// `CT_GDH8_INJECT_FAILURE` names a stage, and the whole latch is compiled out
+// by `CT_GDH8_NO_INJECTION_HOOK` — which is the build the inertness gate
+// compares against, byte for byte.
+static bool g_ct_gdh8_source_views_poisoned = false;
+#endif
+
+static bool gdscript_ct_bundle_bytes_locked(const String &p_res_path,
+		uint64_t p_path_id, Vector<uint8_t> bytes) {
+#if !defined(CT_GDH8_NO_INJECTION_HOOK)
+	if (unlikely(g_ct_gdh8_source_views_poisoned)) {
+		return false;
+	}
+#endif
+	if (bytes.is_empty()) {
+		return false;
 	}
 #if defined(CT_GDH6_FALSIFY_STALE_SOURCE_VIEW)
 	// FALSIFIER ARM (gdh6_no_step_is_attributed_to_the_wrong_version, arm 4):
@@ -680,13 +726,25 @@ static void gdscript_ct_bundle_source_locked(const String &p_res_path, uint64_t 
 #endif
 	CharString name_cs = p_res_path.utf8();
 	// view_kind 0 = raw original source; NULL sourcemap = identity bundle.
-	trace_writer_register_source_view(
+	trace_writer_clear_last_error();
+	int64_t view_index = trace_writer_register_source_view(
 			g_ct_writer,
 			p_path_id,
 			/*view_kind=*/0,
 			name_cs.get_data(), (size_t)name_cs.length(),
 			bytes.ptr(), (size_t)bytes.size(),
 			nullptr, 0);
+	// A signed return distinguishes index 0 from an error (see the header).
+	return view_index >= 0;
+}
+
+static void gdscript_ct_bundle_source_locked(const String &p_res_path, uint64_t p_path_id) {
+	Error err = OK;
+	Vector<uint8_t> bytes = FileAccess::get_file_as_bytes(p_res_path, &err);
+	if (err != OK || bytes.is_empty()) {
+		return; // unreadable / empty — skip; do not bundle empty source
+	}
+	(void)gdscript_ct_bundle_bytes_locked(p_res_path, p_path_id, bytes);
 }
 
 // Bundle `p_res_path`'s source text once per PATH ID. Must be called from
@@ -1563,6 +1621,14 @@ public:
 // ===========================================================================
 
 #include "gdscript.h"
+// GDH-M8, design §8.1 step 2: the new content is COMPILED — parsed and
+// analyzed — before anything is touched. `GDScript::reload()` is not the call
+// for that: it installs the result, which is the opposite of a pre-check, and
+// GDH-M5's `CT_GDH5_FALSIFY_SCRIPT_RELOAD_ONLY` arm already established it is
+// the wrong call here for a neighbouring reason. The parser and the analyzer
+// used directly answer "is this a program?" without making it the program.
+#include "gdscript_analyzer.h"
+#include "gdscript_parser.h"
 #include "core/io/resource.h"
 
 #include <chrono>
@@ -1766,37 +1832,618 @@ void ct_collect_statics(const Ref<Script> &p_script, List<StringName> &r_names,
 	}
 }
 
-// Apply one queued reload. MUST be called with `g_ct_mutex` held (the emit
-// lock, §5.6.2) and from the engine's safe point.
-void ct_apply_reload_locked(CtReloadRequest &req) {
-	// 1. The bytes the notification carried become the bytes on disk, because
-	//    `reload_scripts` re-reads from disk (gdscript.cpp:2509). Writing them
-	//    here rather than trusting a path handle is §4.3's "content travels
-	//    with the notification": a handle races the next edit.
-	{
-		Error err = OK;
-		Ref<FileAccess> fa = FileAccess::open(req.res_path, FileAccess::WRITE, &err);
-		if (fa.is_null() || err != OK) {
-			req.applied = false;
-			req.reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
-			req.detail = "cannot open " + req.res_path + " for writing (err " + itos((int)err) + ")";
-			return;
-		}
-		if (!req.content.is_empty()) {
-			fa->store_buffer(req.content.ptr(), req.content.size());
-		}
-		fa->flush();
+// ===========================================================================
+// GDH-M8 — design §8.1, the ordering and the recovery contract.
+// ===========================================================================
+
+// §8.1 step 2. Does `p_content` COMPILE, as a GDScript at `p_res_path`?
+//
+// The check must not install anything: a v2 that does not parse has to leave
+// the engine running v1, and a pre-check that swapped the script in to find out
+// would have already lost that. `GDScript::reload()` parses the IN-MEMORY
+// `source` member and then compiles into `this`, so it is unusable here.
+//
+// What IS used is the same pair `GDScript::reload()` itself uses, in the same
+// order, on a stack-local parser: `GDScriptParser::parse` (gdscript.cpp:816-820,
+// whose failure is the ERR_PARSE_ERROR at :822-830) then `GDScriptAnalyzer::
+// analyze` (:832-846, a second ERR_PARSE_ERROR). Both are run, because a file
+// that tokenizes but does not resolve is just as unrunnable as one that does
+// not tokenize, and Godot names both the same way.
+//
+// GDScriptCompiler is deliberately NOT run. It compiles INTO a GDScript object,
+// which is precisely the installation this check exists to avoid; its own
+// failure mode is `ERR_COMPILATION_FAILED` (:862) and it is reached, on the
+// real script, by `reload_scripts` at step 6. A compile error that the analyzer
+// does not catch therefore still reaches the engine — that residue is recorded
+// in the milestone rather than papered over here, because closing it means
+// compiling into a throwaway GDScript and that has its own installation
+// hazards (`GDScriptCache`, inner classes, `make_scripts`).
+//
+// Returns true when the content is a program. On false, `r_detail` names the
+// first error with its line, so the refusal is diagnosable from the wire.
+bool ct_gdscript_content_compiles(const String &p_res_path,
+		const Vector<uint8_t> &p_content, String &r_detail) {
+	String source;
+	if (!p_content.is_empty()) {
+		source = String::utf8((const char *)p_content.ptr(), p_content.size());
 	}
 
-	// 2. The script must already be loaded. A `core:reload_scripts` addressed
-	//    to a never-loaded path takes no effect and says nothing — GDH-M0's
-	//    `wrongtarget` arm measured exactly that — so an unloaded path is
-	//    refused BY NAME here instead of quietly doing nothing.
+	GDScriptParser parser;
+	Error err = parser.parse(source, p_res_path, /*p_for_completion=*/false);
+	if (err != OK) {
+		const List<GDScriptParser::ParserError>::Element *e = parser.get_errors().front();
+		r_detail = "the new content does not parse as GDScript";
+		if (e != nullptr) {
+			r_detail += ": line " + itos(e->get().line) + ": " + e->get().message;
+		}
+		return false;
+	}
+
+	GDScriptAnalyzer analyzer(&parser);
+	err = analyzer.analyze();
+	if (err != OK) {
+		const List<GDScriptParser::ParserError>::Element *e = parser.get_errors().front();
+		r_detail = "the new content parses but does not analyze";
+		if (e != nullptr) {
+			r_detail += ": line " + itos(e->get().line) + ": " + e->get().message;
+		}
+		return false;
+	}
+	return true;
+}
+
+#if !defined(CT_GDH8_NO_INJECTION_HOOK)
+// The fault-injection hook of `gdh8_a_failure_after_registration_closes_the_
+// trace_rather_than_continuing`.
+//
+// §8.1 says a failure at steps 4-6 is not recoverable by continuing. There is
+// no way to grade that with a test double: a double would prove the harness's
+// ordering rather than the product's, so the failure has to be injected into
+// the shipped path. That makes the hook a PRODUCTION SURFACE, and the milestone
+// accepts it on one condition — it must be inert unless explicitly armed, and
+// its inertness must be MEASURED rather than asserted in a comment.
+//
+// So: it is off unless `CT_GDH8_INJECT_FAILURE` names a stage; it reads the
+// variable once; it prints when it fires; and `CT_GDH8_NO_INJECTION_HOOK`
+// compiles it out entirely, so a harness can show that an unarmed build with
+// the hook produces a container byte-identical to a build without it. A
+// campaign that added a supported way to corrupt a trace would not have
+// improved on the defect it was fixing.
+//
+// Stages, spelled as §8.1 numbers them:
+//   "bundle"  — step 4, after the version is minted and before its view exists
+//   "marker"  — step 5, after the view and before the boundary is recorded
+//   "swap"    — step 6, after the trace is committed and before the engine is
+const char *ct_gdh8_injected_stage() {
+	static const char *cached = nullptr;
+	static bool read_once = false;
+	if (!read_once) {
+		read_once = true;
+		const char *raw = getenv("CT_GDH8_INJECT_FAILURE");
+		if (raw != nullptr && raw[0] != '\0') {
+			cached = raw;
+		}
+	}
+	return cached;
+}
+
+bool ct_gdh8_inject_at(const char *p_stage) {
+	const char *armed = ct_gdh8_injected_stage();
+	if (armed == nullptr || strcmp(armed, p_stage) != 0) {
+		return false;
+	}
+	fprintf(stderr, "[ct-gdh8] FAULT INJECTED at design §8.1 stage \"%s\" "
+					"(CT_GDH8_INJECT_FAILURE); this build carries the "
+					"injection hook and it is ARMED\n", p_stage);
+	fflush(stderr);
+	return true;
+}
+#else
+bool ct_gdh8_inject_at(const char *) { return false; }
+#endif
+
+// §8.1's recovery contract: "a failure at 4-6 is NOT recoverable by continuing:
+// the recorder closes the trace with a recorded reason and the engine continues
+// unreloaded, which is a degraded session with a coherent trace rather than a
+// normal session with a wrong one."
+//
+// Implemented exactly that way. The reason is written INTO the container as an
+// events-stream record before the streams are finished, so it survives to a
+// reader rather than living only on the session's stderr — a trace that stops
+// for a reason nobody can recover from it is the `oldCodeRetained: true` shape
+// one layer down. Then the writer is closed and recording is DISABLED, so no
+// step after this point can be attributed to a version the container half
+// registered.
+//
+// MUST be called with the emit lock held.
+void ct_close_trace_with_reason(const String &p_stage, const String &p_detail) {
+#if defined(CT_GDH8_FALSIFY_CLOSE_WITHOUT_REASON)
+	// FALSIFIER ARM, added by the GDH-M8 REVIEW 2026-09-12 (gdh8_a_failure_
+	// after_registration_closes_the_trace_rather_than_continuing): CLOSE THE
+	// TRACE, and record no reason in it.
+	//
+	// Why this arm and not another. §8.1's contract has two halves — "closes
+	// the trace" AND "with a recorded reason" — and only the first half had an
+	// arm. `CT_GDH8_FALSIFY_CONTINUE_AFTER_FAILURE` breaks the close and is
+	// killed by the orphaned-source-view check; NOTHING killed the second half,
+	// so the claim "the reason the recording stopped is RECORDED IN THE
+	// CONTAINER" had never been shown to be able to go red. This arm is
+	// precisely the difference: the trace still closes, still decodes, still
+	// carries no orphaned id, the wire answer is still `trace-closed` with the
+	// stage in `detail`, and the engine still keeps running v1 — every other
+	// claim in the gate stays green. What is gone is the one thing a READER of
+	// the container could have used: the recording simply stops, and why it
+	// stopped lives only on a session's stderr, which no consumer has. That is
+	// the `oldCodeRetained: true` shape one layer down, and it is exactly the
+	// silent degradation this campaign exists to prevent.
+	//
+	// It must go red ON THAT CLAIM and on no other.
+	fprintf(stderr, "[ct-gdh8] CT_GDH8_FALSIFY_CLOSE_WITHOUT_REASON: closing "
+					"the trace WITHOUT writing the reason into the container\n");
+	fflush(stderr);
+#else
+	if (g_ct_writer != nullptr) {
+		CharString meta_cs = p_stage.utf8();
+		CharString content_cs = ("codetracer: the recording was closed at design "
+								 "§8.1 stage " + p_stage +
+				" because the reload could not be completed coherently: " +
+				p_detail).utf8();
+		trace_writer_register_special_event(g_ct_writer, FFI_EVENT_ERROR,
+				meta_cs.get_data(), content_cs.get_data());
+	}
+#endif
+	fprintf(stderr, "[ct-gdh8] CLOSING THE TRACE at §8.1 stage %s: %s\n",
+			p_stage.utf8().get_data(), p_detail.utf8().get_data());
+	fflush(stderr);
+	gdscript_ct_close();
+	// Nothing more is recorded. `g_ct_inited` stays true and `g_ct_writer` is
+	// null, so `gdscript_ct_ensure_writer` answers false on every later hook
+	// without trying to build a second writer over the closed container.
+	g_ct_disabled = true;
+}
+
+#if defined(CT_GDH8_FALSIFY_CONTINUE_AFTER_FAILURE)
+// FALSIFIER ARM (gdh8_a_failure_after_registration_closes_the_trace_rather_
+// than_continuing): on a failure at §8.1 steps 4-6, REPORT it and keep
+// recording instead of closing. The version has been minted, so every step
+// after this point is attributed to a path id whose source view was never
+// written — and the container then holds steps against a version it has only
+// half registered. The gate must go red by finding that incoherence IN THE
+// CONTAINER, not by observing that a close was not called.
+const bool ct_gdh8_close_on_late_failure = false;
+#else
+const bool ct_gdh8_close_on_late_failure = true;
+#endif
+
+// The failure verdict for §8.1 steps 4-6, in one place so every site reaches
+// the same end state: the trace is closed with the reason recorded in it, the
+// engine is left UNRELOADED, and the coordinator is told by name.
+//
+// Returns TRUE when the caller must abort — which is what it always does in a
+// shipping build. It returns false only under the falsifier arm, which is what
+// "continue instead of closing" means.
+bool ct_reload_fail_after_registration(CtReloadRequest &req, const String &p_stage,
+		const String &p_detail) {
+	if (!ct_gdh8_close_on_late_failure) {
+		// THE FALSIFIER ARM. Keep going, and keep recording. The version is
+		// minted and every step after this point is attributed to it, so the
+		// container ends up holding steps against a path id whose source view
+		// was never written — an incoherence detectable IN THE CONTAINER,
+		// which is where the gate must find it.
+		fprintf(stderr, "[ct-gdh8] CT_GDH8_FALSIFY_CONTINUE_AFTER_FAILURE: "
+						"NOT closing the trace after a §8.1 stage %s failure "
+						"(%s); the recording continues against a "
+						"half-registered version\n",
+				p_stage.utf8().get_data(), p_detail.utf8().get_data());
+		fflush(stderr);
+		return false;
+	}
+	req.applied = false;
+	req.reason = REPRO_HCR_RELOAD_REASON_TRACE_CLOSED;
+	req.detail = "design §8.1 step " + p_stage +
+			" failed after the trace had committed to the new version, so the "
+			"recording was closed rather than continued: " +
+			p_detail;
+	ct_close_trace_with_reason(p_stage, p_detail);
+	return true;
+}
+
+// §8.1 STEP 5, on its own because one falsifier arm has to run it apart from
+// step 3. MUST be called with the emit lock held, from the same critical
+// section as the apply: a marker emitted from a different lock hold can be
+// separated from its apply by any number of steps, and the container then
+// states a boundary the execution did not have.
+bool ct_reload_emit_marker_locked(CtReloadRequest &req, uint64_t p_old_id,
+		uint64_t p_new_id) {
+	// --- §8.1 STEP 5. Record the boundary.
+	//
+	// Frames still executing the OLD version's bytecode, MEASURED.
+	// `g_ct_crossing_stack` is the recorder's own LIFO of open GDScript frames,
+	// maintained at exactly the sites the writer's call/return records are. At
+	// an engine safe point it is empty and this is 0 — but it is read rather
+	// than assumed, because design §5.4 says steps belonging to in-flight
+	// frames legitimately appear after the marker carrying the OLD id, and a
+	// consumer must not read the marker as a clean cut on the strength of a
+	// literal.
+	req.in_flight_frames = (uint64_t)g_ct_crossing_stack.size();
+	ct_tw_source_reload_change change;
+	change.old_path_id = p_old_id;
+	change.new_path_id = p_new_id;
+	change.generation = (uint64_t)req.generation;
+	trace_writer_clear_last_error();
+#if defined(CT_GDH6_FALSIFY_NO_MARKER)
+	// FALSIFIER ARM (gdh6_reload_is_discoverable_end_to_end): mint the version
+	// and emit NO marker. Every path index is correct, every step is attributed
+	// to the version that ran it, and a consumer could still INFER a transition
+	// by scanning paths.dat for a repeated string. The gate must still go red,
+	// because design §6.3.1 requires the boundary to be RECORDED: an inference
+	// cannot say where in the step stream the transition happened, which ids it
+	// ran between, or which wire generation was installed. This arm is the whole
+	// reason that gate exists separately from GDH-G3.
+	//
+	// GDH-M8 NOTE: this arm must NOT take the §8.1 recovery path. It models a
+	// host that never asked for a marker, not a writer that refused one, and
+	// turning it into a trace-closing failure would stop it reproducing the
+	// defect the discoverability gate is aimed at.
+	(void)change;
+	req.reload_ordinal = 0;
+	return true;
+#elif defined(CT_GDH6_FALSIFY_MARKER_OUTSIDE_LOCK)
+	// FALSIFIER ARM (see the note on `g_ct_deferred_marker`): hand the marker to
+	// the NEXT safe point instead of emitting it here. Nothing about its
+	// contents changes — only the lock hold it is emitted from, which is
+	// precisely what the C header says is not enforceable from its side.
+	g_ct_deferred_marker.change = change;
+	g_ct_deferred_marker.in_flight_frames = req.in_flight_frames;
+	g_ct_deferred_marker.pending = true;
+	req.reload_ordinal = 1; // not the writer's; the arm is about position
+	return true;
+#else
+	if (ct_gdh8_inject_at("marker")) {
+		if (ct_reload_fail_after_registration(req, "5 (emit the boundary marker)",
+					"injected failure at §8.1 step 5")) {
+			return false;
+		}
+		return true; // falsifier arm only: no marker, and the reload proceeds
+	}
+	uint64_t ordinal = trace_writer_register_source_reload(
+			g_ct_writer, &change, 1, req.in_flight_frames);
+	if (ordinal == CT_TW_INVALID_RELOAD_ORDINAL) {
+		// A refused marker is a §8.1 step 5 failure: the version exists and
+		// carries a view, and the container would state a transition it cannot
+		// locate. Not recoverable by continuing.
+		if (ct_reload_fail_after_registration(req, "5 (emit the boundary marker)",
+					String("the boundary marker was refused: ") +
+							String::utf8(trace_writer_last_error()))) {
+			return false;
+		}
+		return true;
+	}
+	req.reload_ordinal = ordinal;
+	return true;
+#endif
+
+}
+
+// §8.1 steps 3-5, under the emit lock, at an engine safe point, and BEFORE the
+// engine swap. Returns true when the caller may proceed to step 6.
+//
+// `g_ct_writer` is non-null (the caller checked): a process that is not
+// recording has no trace half to run and goes straight to the swap.
+//
+// Order within the block matters. `register_path_version` must come first,
+// because `registerSourceReload` refuses `old_path_id == new_path_id` — a
+// reload that minted no new index cannot attribute its post-reload steps to the
+// version that ran them. After it, a bare `trace_writer_register_step` on the
+// same string resolves to the NEW id, so the recorder's hot path stays
+// version-unaware; only this path is version-aware.
+//
+// Every refusal is REPORTED, never swallowed. A reload that applied but
+// recorded nothing is the exact shape GDH-M0 measured.
+bool ct_reload_register_in_trace_locked(CtReloadRequest &req, bool p_emit_marker) {
+	CharString path_cs = req.res_path.utf8();
+	// §4.3's recording coordinates, so the coordinator can correlate its view
+	// of the reload with the trace without parsing the container. They are
+	// asked for, never counted: `trace_writer_next_step_index` is the writer's
+	// own counter and not a count of `register_step` calls.
+	uint64_t id = trace_writer_current_path_id(g_ct_writer, path_cs.get_data());
+	req.path_id = (id == CT_TW_INVALID_PATH_ID) ? 0 : id;
+	req.step_index = trace_writer_next_step_index(g_ct_writer);
+
+#if defined(CT_GDH6_FALSIFY_NO_VERSION_MINTED)
+	// FALSIFIER ARM (gdh6_no_step_is_attributed_to_the_wrong_version, arm 1):
+	// apply the reload and mint NO path version. Every post-reload step then
+	// resolves, by the writer's ordinary interning, to v1's path id — which is
+	// exactly the state GDH-M0 measured and the state this milestone exists to
+	// leave. The reload itself still happens: the file is rewritten, the script
+	// is recompiled, the program plainly prints v2's and v3's tokens, and the
+	// acknowledgement says `applied`. Only the TRACE is wrong, and only about
+	// which version ran.
+	//
+	// It also takes the marker down with it, necessarily rather than
+	// incidentally: `registerSourceReload` refuses `old == new`, so a version
+	// that was never minted has no transition to record. The driver aims this
+	// arm at the attribution gate and states that it reddens the
+	// discoverability gate too, rather than hiding it.
+	//
+	// GDH-M8 NOTE. This arm must keep RETURNING TRUE — it is the "applied but
+	// recorded nothing" state, and an arm that started refusing the reload
+	// instead would stop reproducing the defect it names.
+	req.unpreserved.push_back(
+			"source-version-not-minted:CT_GDH6_FALSIFY_NO_VERSION_MINTED");
+	return true;
+#else
+	if (id == CT_TW_INVALID_PATH_ID) {
+		// The writer has never seen this file — it was reloaded before it ever
+		// executed. There is no old version to transition FROM, so there is
+		// nothing truthful to record, and equally nothing INCOHERENT about
+		// continuing: the file will be interned fresh at its first step, in one
+		// version, exactly as it would have been without the reload. §8.1's
+		// invariant is not violated, so this reports and proceeds.
+		req.unpreserved.push_back(
+				"source-version-not-minted:the recorder has never seen " +
+				req.res_path + ", so there is no old path id to record a "
+							   "transition from");
+		return true;
+	}
+	if (!g_ct_line_count_table) {
+		// This one IS §8.1's forbidden state and until GDH-M8 it proceeded
+		// anyway. Without the table a second paths.dat record carries no size,
+		// so the recording CANNOT represent a second version — and the reload
+		// would then run v2 while every one of its steps was attributed to v1.
+		// "A trace that cannot represent the new version must not be allowed to
+		// have one": refuse, keep v1 live, nothing touched.
+		req.applied = false;
+		req.reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+		req.detail = "writer-refused/line-count-table: this writer has no "
+					 "line-count table (meta.dat bit 14), so a second paths.dat "
+					 "record would carry no size and both versions would share "
+					 "the DefaultLinesPerFile stride; the reload is refused "
+					 "rather than applied against a trace that cannot express it";
+		return false;
+	}
+
+	// --- §8.1 STEP 3. Mint the version. A refusal here is a CLEAN abort.
+	uint64_t new_lines = gdscript_ct_addressable_lines(
+			req.content.ptr(), (int64_t)req.content.size());
+#if defined(CT_GDH6_FALSIFY_STALE_LINE_COUNT)
+	// FALSIFIER ARM (gdh6_no_step_is_attributed_to_the_wrong_version, arm 5):
+	// register the new version with the OLD version's line count. The paths.dat
+	// entries are all there, the ids are all right, the marker is well formed —
+	// and the new version's slot in the position space is the wrong SIZE, so
+	// every one of its lines past the old file's end has no address inside its
+	// own slot. Under the line-count table the writer refuses those steps
+	// (checkLineWithinFile), so they vanish rather than addressing into the next
+	// file, and the gate sees it as a cardinality mismatch. The distinction
+	// matters and the harness reports it: without the table, the same mistake
+	// would have SILENTLY spilled into the next file's range, which is the
+	// GDH-M0 defect.
+	if (g_ct_gdh6_last_recorded_lines != 0) {
+		new_lines = g_ct_gdh6_last_recorded_lines;
+	}
+#endif
+	trace_writer_clear_last_error();
+	uint64_t new_id = trace_writer_register_path_version(
+			g_ct_writer, path_cs.get_data(), new_lines);
+	if (new_id == CT_TW_INVALID_PATH_ID) {
+		// §8.1 step 3: "If the writer refuses, ABORT the reload and keep v1
+		// live." Until GDH-M8 this appended a string to `unpreserved` and fell
+		// through to `applied = true`, which left v2 on disk AND live in the
+		// engine AND reported applied, carrying v1's path id — §8.1's forbidden
+		// third state, reached through the failure path instead of the order.
+		req.applied = false;
+		req.reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+		req.detail = String("writer-refused/path-version: ") +
+				String::utf8(trace_writer_last_error());
+		return false;
+	}
+	req.old_path_id = id;
+	req.path_id = new_id;
+
+	// --- §8.1 STEP 4. Bundle the new source view against the new id, FROM THE
+	// BYTES THE AGENT VERIFIED.
+	//
+	// Until GDH-M8 the view was bundled lazily, at the first step AFTER the
+	// reload, by reading the file back off disk
+	// (`gdscript_ct_note_and_bundle_path_locked`). Two things were wrong with
+	// that and both go away here: between the marker and the next step the
+	// container named a version whose text it did not carry, and the text it
+	// eventually carried was whatever was on disk at that later moment rather
+	// than the bytes whose digest was checked.
+	//
+	// Recording the id in `g_ct_bundled_path_ids` is what keeps the lazy path
+	// from bundling it a second time; that path is still the one that bundles
+	// the FIRST version of every file, which is not a reload and has no
+	// notification to take bytes from.
+	bool bundle_injected = ct_gdh8_inject_at("bundle");
+#if !defined(CT_GDH8_NO_INJECTION_HOOK)
+	if (bundle_injected) {
+		// See `g_ct_gdh8_source_views_poisoned`: the modelled failure persists,
+		// so the recorder's lazy bundler cannot quietly undo it.
+		g_ct_gdh8_source_views_poisoned = true;
+	}
+#endif
+	if (bundle_injected ||
+			!gdscript_ct_bundle_bytes_locked(req.res_path, new_id, req.content)) {
+		if (ct_reload_fail_after_registration(req, "4 (bundle the new source view)",
+					String("the new version's source view could not be attached "
+						   "to path id ") +
+							itos((int64_t)new_id) + ": " +
+							String::utf8(trace_writer_last_error()))) {
+			return false;
+		}
+		// Falsifier arm only: fall through with NO view for `new_id`.
+	} else {
+		g_ct_bundled_path_ids.insert(new_id);
+	}
+
+	if (!p_emit_marker) {
+		// FALSIFIER ARM `CT_GDH8_FALSIFY_MINT_BEFORE_COMPILE` only: mint the
+		// version and its view here, and leave the boundary marker to the
+		// caller, which emits it after the compile check. The arm reorders ONE
+		// thing — the mint relative to §8.1's verification — and must not
+		// incidentally delete the marker as well, or it would redden gates it
+		// is not aimed at and would not have been shown to discriminate.
+		req.reload_ordinal = 0;
+		return true;
+	}
+	return ct_reload_emit_marker_locked(req, id, new_id);
+#endif // CT_GDH6_FALSIFY_NO_VERSION_MINTED
+}
+
+// Apply one queued reload. MUST be called with `g_ct_mutex` held (the emit
+// lock, §5.6.2) and from the engine's safe point.
+//
+// THE ORDER IS THE SUBSTANCE. Design §8.1:
+//
+//   1. verify the bytes against snapshotDigest and lineCount  [in the AGENT]
+//   2. compile the new script; refuse on parse error
+//   3. register the versioned path in the TRACE; refuse and keep v1 live
+//   4. bundle the new source view against the new id
+//   5. emit the TagSourceReload marker
+//   6. swap the engine's script resource
+//   7. reply
+//
+// Trace registration precedes the engine swap because a trace that cannot
+// represent the new version must not be allowed to have one. The reverse order
+// — which is what this function did until GDH-M8 — produces a running engine
+// whose execution the recording cannot express, the silent misattribution the
+// campaign exists to prevent.
+//
+// Steps 1-3 are a CLEAN REFUSAL: nothing has been touched, the engine is still
+// running v1, the container is exactly what it would have been had the
+// notification never arrived. Steps 4-6 are not recoverable by continuing; see
+// `ct_close_trace_with_reason`.
+void ct_apply_reload_locked(CtReloadRequest &req) {
+	req.path_id = 0;
+	req.step_index = 0;
+
+#if defined(CT_GDH8_FALSIFY_WRITE_BEFORE_COMPILE)
+	// FALSIFIER ARM, added by the GDH-M8 REVIEW 2026-09-12
+	// (gdh8_refused_reload_leaves_a_coherent_trace): PUT THE DISK WRITE BACK
+	// WHERE IT WAS. Until GDH-M8 storing the notification's bytes was the FIRST
+	// thing this function did, so a refusal at any later point left v1 gone from
+	// disk while the engine went on running it from memory. Deviation (a) of the
+	// audit names that move as half of its fix.
+	//
+	// It had NO ARM, and the review measured why that mattered: nothing else in
+	// the verifier can see it. The raw source view is bundled from disk at the
+	// FIRST step, long before any reload, so it still holds v1; the engine keeps
+	// running v1 from memory whatever is on disk; the container is unchanged;
+	// stdout is unchanged. This arm is killed only by `assert_disk_holds`, which
+	// the review added for it.
+	//
+	// It reddens TWO gates and that is stated rather than glossed: `refused`
+	// (the refusal left v2_bad on disk) and `close` (the trace-closing failure
+	// left v2_ok on disk though step 6 never ran). Those are the SAME property
+	// asserted in two places, not collateral damage — the digest gate, whose
+	// refusal happens in the agent before this function is reached at all, stays
+	// green.
+	{
+		Error werr = OK;
+		Ref<FileAccess> wfa = FileAccess::open(req.res_path, FileAccess::WRITE, &werr);
+		if (wfa.is_valid() && werr == OK && !req.content.is_empty()) {
+			wfa->store_buffer(req.content.ptr(), req.content.size());
+			wfa->flush();
+		}
+		fprintf(stderr, "[ct-gdh8] CT_GDH8_FALSIFY_WRITE_BEFORE_COMPILE: wrote "
+						"%s to disk BEFORE the compile check\n",
+				req.res_path.utf8().get_data());
+		fflush(stderr);
+	}
+#endif
+
+	// -------- FALSIFIER ARMS of gdh8_refused_reload_leaves_a_coherent_trace --
+	//
+	// The milestone names two, and both are the SAME mistake at two depths:
+	// touch the trace before the content has been shown to be usable.
+	//
+	//   CT_GDH8_FALSIFY_MARKER_BEFORE_COMPILE  — arm 1, "emit the
+	//     `TagSourceReload` before attempting the compile". The container then
+	//     claims a reload that did not happen and the gate must go red on the
+	//     MARKER COUNT.
+	//   CT_GDH8_FALSIFY_MINT_BEFORE_COMPILE    — arm 2. The entry's wording is
+	//     "register the versioned path before verifying the digest"; the digest
+	//     is verified in the AGENT, before this handler is called at all, so
+	//     "before the verification that precedes it in §8.1" is the faithful
+	//     reading here and step 2 (the compile) is that verification. The
+	//     container then carries TWO entries, one of which nothing ever
+	//     executed, and the gate must go red on the ENTRY COUNT.
+	//
+	// Both leave the reload itself refused — the compile check below still
+	// fires — so what they change is only what the CONTAINER says, which is
+	// what the gate reads.
+	bool ct_gdh8_registered_early = false;
+#if defined(CT_GDH8_FALSIFY_MARKER_BEFORE_COMPILE) || \
+		defined(CT_GDH8_FALSIFY_MINT_BEFORE_COMPILE)
+	if (g_ct_writer != nullptr) {
+#if defined(CT_GDH8_FALSIFY_MARKER_BEFORE_COMPILE)
+		const bool ct_gdh8_arm_emits_marker = true;
+#else
+		const bool ct_gdh8_arm_emits_marker = false;
+#endif
+		if (!ct_reload_register_in_trace_locked(req, ct_gdh8_arm_emits_marker)) {
+			return;
+		}
+		ct_gdh8_registered_early = true;
+	}
+#endif
+
+	// ---------------------------------------------------------------------
+	// §8.1 STEP 1 — verify the bytes against `snapshotDigest` and `lineCount`.
+	//
+	// ALREADY DONE, and done in the right place: the agent verifies both before
+	// this handler is ever reached (`repro_hcr_agent.c:2316-2371`, refusing an
+	// algorithm it cannot implement rather than skipping the check). Nothing is
+	// repeated here — a second, independent verification in the host would be
+	// two implementations of one rule, which is how they drift.
+	// ---------------------------------------------------------------------
+
+	// ---------------------------------------------------------------------
+	// §8.1 STEP 2 — COMPILE THE NEW SCRIPT. Refuse on parse error.
+	//
+	// NOTHING HAS BEEN TOUCHED AT THIS POINT. In particular the bytes have NOT
+	// been written to disk: until GDH-M8 that write was the first thing this
+	// function did, so a refusal at any later step left v1 gone from disk while
+	// the engine went on running it from memory. The write is now step 6.
+	//
+	// Before GDH-M8 there was no compile step AT ALL. `reload_scripts` returns
+	// void (gdscript.h:633) and drops `GDScript::reload()`'s Error on the floor
+	// (gdscript.cpp:2511), so an unparseable v2 was written to disk, handed to
+	// the engine, and acknowledged `applied` with a boundary marker and a fresh
+	// path version already in the container. `REPRO_HCR_RELOAD_REASON_PARSE_
+	// ERROR` had existed in the agent's vocabulary the whole time with zero
+	// uses anywhere under modules/gdscript/.
+	// ---------------------------------------------------------------------
+	{
+		String why;
+		if (!ct_gdscript_content_compiles(req.res_path, req.content, why)) {
+			req.applied = false;
+			req.reason = REPRO_HCR_RELOAD_REASON_PARSE_ERROR;
+			req.detail = why;
+			fprintf(stderr, "[ct-gdh8] REFUSED (parse-error) %s gen=%u: %s\n",
+					req.res_path.utf8().get_data(), req.generation,
+					why.utf8().get_data());
+			fflush(stderr);
+			return;
+		}
+	}
+
+	// The script must already be loaded. A `core:reload_scripts` addressed to a
+	// never-loaded path takes no effect and says nothing — GDH-M0's
+	// `wrongtarget` arm measured exactly that — so an unloaded path is refused
+	// BY NAME here instead of quietly doing nothing.
+	//
+	// GDH-M8 gave it its OWN name. It used to answer `writer-refused`, which
+	// was the reason string for six unrelated conditions; a gate asserting
+	// `reason == "writer-refused"` was satisfied by any of them, and "the trace
+	// writer refused" and "the engine has never heard of this file" have
+	// nothing in common and different fixes.
 	Ref<Resource> res = ResourceCache::get_ref(req.res_path);
 	Ref<Script> scr = res;
 	if (scr.is_null()) {
 		req.applied = false;
-		req.reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+		req.reason = REPRO_HCR_RELOAD_REASON_SCRIPT_NOT_LOADED;
 		req.detail = "no loaded script at " + req.res_path +
 				"; a reload addressed to a path the engine never loaded takes no effect";
 		return;
@@ -1806,8 +2453,77 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	List<Variant> before;
 	ct_collect_statics(scr, names, before);
 
-	// 3. Godot's own supported path, soft. §5.2: `reload_scripts` is the
-	//    wrapper that re-reads disk; `GDScript::reload()` alone is not.
+	// ---------------------------------------------------------------------
+	// §8.1 STEPS 3-5 — the TRACE half, and it runs BEFORE the engine swap.
+	//
+	// "A trace that cannot represent the new version must not be allowed to
+	// have one." Steps 3-5 mint the version, bundle its source view against the
+	// new id from the bytes step 1 verified, and record the boundary. A refusal
+	// at step 3 is a clean abort with v1 still live; a failure at 4 or 5 is not
+	// recoverable by continuing and closes the trace.
+	//
+	// "Here" is still load-bearing for the marker's POSITION: this runs inside
+	// the emit lock, at an engine safe point, so no step can be emitted between
+	// the marker and the new path becoming current, and the container cannot
+	// state a boundary the execution did not have.
+	// ---------------------------------------------------------------------
+	if (!ct_gdh8_registered_early && g_ct_writer != nullptr) {
+		if (!ct_reload_register_in_trace_locked(req, /*p_emit_marker=*/true)) {
+			return; // refused or closed; `req` already says which
+		}
+	}
+#if defined(CT_GDH8_FALSIFY_MINT_BEFORE_COMPILE)
+	// The mint-before-compile arm minted above WITHOUT a marker; record the
+	// boundary now, so that on a SUCCESSFUL reload the container this arm
+	// produces is identical to the correct one and the arm's only effect is
+	// the one it names. An arm that also lost the marker would redden gates it
+	// is not aimed at, and would not have been shown to discriminate.
+	//
+	// `!= 0` is NOT the test: path ids are 0-based and the fixture is usually
+	// id 0, so a zero check would skip the marker exactly on the first file
+	// registered — which is what it did when this arm was first written, and
+	// the driver caught it as "reddens gates it is not aimed at".
+	if (ct_gdh8_registered_early && req.path_id != req.old_path_id) {
+		if (!ct_reload_emit_marker_locked(req, req.old_path_id, req.path_id)) {
+			return;
+		}
+	}
+#endif
+
+	// ---------------------------------------------------------------------
+	// §8.1 STEP 6 — SWAP THE ENGINE'S SCRIPT RESOURCE.
+	//
+	// The bytes the notification carried become the bytes on disk, because
+	// `reload_scripts` re-reads from disk (gdscript.cpp:2509). Writing them
+	// here rather than trusting a path handle is §4.3's "content travels with
+	// the notification": a handle races the next edit.
+	// ---------------------------------------------------------------------
+	if (ct_gdh8_inject_at("swap") &&
+			ct_reload_fail_after_registration(req, "6 (swap the engine's script)",
+					"injected failure at §8.1 step 6")) {
+		return;
+	}
+	{
+		Error err = OK;
+		Ref<FileAccess> fa = FileAccess::open(req.res_path, FileAccess::WRITE, &err);
+		if (fa.is_null() || err != OK) {
+			// The trace has already committed to v2 (steps 3-5 are done), so
+			// this is a §8.1 steps 4-6 failure and not a clean refusal: the
+			// container names a version the engine will never run. Close it.
+			(void)ct_reload_fail_after_registration(req,
+					"6 (swap the engine's script)",
+					"cannot open " + req.res_path + " for writing (err " +
+							itos((int)err) + ")");
+			return;
+		}
+		if (!req.content.is_empty()) {
+			fa->store_buffer(req.content.ptr(), req.content.size());
+		}
+		fa->flush();
+	}
+
+	// Godot's own supported path, soft. §5.2: `reload_scripts` is the wrapper
+	// that re-reads disk; `GDScript::reload()` alone is not.
 #if defined(CT_GDH5_FALSIFY_SCRIPT_RELOAD_ONLY)
 	// FALSIFIER ARM (gdh5_in_process_reload_matches_the_remote_debugger_path):
 	// call `GDScript::reload()` directly. It parses the IN-MEMORY `source`
@@ -1828,7 +2544,7 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	GDScriptLanguage::get_singleton()->reload_scripts(scripts, /*p_soft_reload=*/true);
 #endif
 
-	// 4. What did not survive, measured rather than asserted.
+	// What did not survive, measured rather than asserted.
 	List<StringName> names_after;
 	List<Variant> after;
 	ct_collect_statics(scr, names_after, after);
@@ -1857,159 +2573,6 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 				// the editor and it is reported, never silently absorbed.
 				req.unpreserved.push_back("static-variable-lost:" + String(ne->get()) +
 						":" + String(be->get()) + "->" + String(now));
-			}
-		}
-	}
-
-	// §4.3's recording coordinates, so the coordinator can correlate its view of
-	// the reload with the trace without parsing the container. They are asked
-	// for, never counted: `trace_writer_next_step_index` is the writer's own
-	// counter and not a count of `register_step` calls.
-	req.path_id = 0;
-	req.step_index = 0;
-	if (g_ct_writer != nullptr) {
-		CharString path_cs = req.res_path.utf8();
-		uint64_t id = trace_writer_current_path_id(g_ct_writer, path_cs.get_data());
-		req.path_id = (id == CT_TW_INVALID_PATH_ID) ? 0 : id;
-		req.step_index = trace_writer_next_step_index(g_ct_writer);
-
-		// ===============================================================
-		// GDH-M6 — MINT THE VERSION AND EMIT THE MARKER, HERE.
-		//
-		// "Here" is load-bearing. This runs inside `ct_apply_reload_locked`,
-		// which the caller entered holding the EMIT LOCK, and the disk write
-		// plus `reload_scripts` above have already happened. So the marker's
-		// position in the step stream is the position of the apply: no step
-		// can be emitted between them, and the container cannot state a
-		// boundary the execution did not have.
-		//
-		// Order within the block matters too. `register_path_version` must
-		// come first, because `registerSourceReload` refuses
-		// `old_path_id == new_path_id` — a reload that minted no new index
-		// cannot attribute its post-reload steps to the version that ran
-		// them. After it, a bare `trace_writer_register_step` on the same
-		// string resolves to the NEW id, so the recorder's hot path stays
-		// version-unaware; only this path is version-aware.
-		//
-		// Every refusal below is REPORTED, never swallowed. A reload that
-		// applied but recorded nothing is the exact shape GDH-M0 measured,
-		// and it must not be reachable silently from here.
-		// ===============================================================
-#if defined(CT_GDH6_FALSIFY_NO_VERSION_MINTED)
-		// FALSIFIER ARM (gdh6_no_step_is_attributed_to_the_wrong_version,
-		// arm 1): apply the reload and mint NO path version. Every post-reload
-		// step then resolves, by the writer's ordinary interning, to v1's path
-		// id — which is exactly the state GDH-M0 measured and the state this
-		// milestone exists to leave. The reload itself still happens: the file
-		// is rewritten, the script is recompiled, the program plainly prints
-		// v2's and v3's tokens, and the acknowledgement says `applied`. Only
-		// the TRACE is wrong, and only about which version ran.
-		//
-		// It also takes the marker down with it, necessarily rather than
-		// incidentally: `registerSourceReload` refuses `old == new`, so a
-		// version that was never minted has no transition to record. The
-		// driver aims this arm at the attribution gate and states that it
-		// reddens the discoverability gate too, rather than hiding it.
-		const bool ct_gdh6_mint_versions = false;
-#else
-		const bool ct_gdh6_mint_versions = true;
-#endif
-		if (!ct_gdh6_mint_versions) {
-			req.unpreserved.push_back(
-					"source-version-not-minted:CT_GDH6_FALSIFY_NO_VERSION_MINTED");
-		} else if (id == CT_TW_INVALID_PATH_ID) {
-			// The writer has never seen this file — it was reloaded before it
-			// ever executed. There is no old version to transition FROM, so
-			// there is nothing truthful to record. Say so.
-			req.unpreserved.push_back(
-					"source-version-not-minted:the recorder has never seen " +
-					req.res_path + ", so there is no old path id to record a "
-								   "transition from");
-		} else if (!g_ct_line_count_table) {
-			req.unpreserved.push_back(
-					"source-version-not-minted:this writer has no line-count "
-					"table (meta.dat bit 14), so a second paths.dat record "
-					"would carry no size and both versions would share the "
-					"DefaultLinesPerFile stride");
-		} else {
-			uint64_t new_lines = gdscript_ct_addressable_lines(
-					req.content.ptr(), (int64_t)req.content.size());
-#if defined(CT_GDH6_FALSIFY_STALE_LINE_COUNT)
-			// FALSIFIER ARM (gdh6_no_step_is_attributed_to_the_wrong_version,
-			// arm 5): register the new version with the OLD version's line
-			// count. The paths.dat entries are all there, the ids are all
-			// right, the marker is well formed — and the new version's slot
-			// in the position space is the wrong SIZE, so every one of its
-			// lines past the old file's end has no address inside its own
-			// slot. Under the line-count table the writer refuses those steps
-			// (checkLineWithinFile), so they vanish rather than addressing
-			// into the next file, and the gate sees it as a cardinality
-			// mismatch. The distinction matters and the harness reports it:
-			// without the table, the same mistake would have SILENTLY spilled
-			// into the next file's range, which is the GDH-M0 defect.
-			if (g_ct_gdh6_last_recorded_lines != 0) {
-				new_lines = g_ct_gdh6_last_recorded_lines;
-			}
-#endif
-			trace_writer_clear_last_error();
-			uint64_t new_id = trace_writer_register_path_version(
-					g_ct_writer, path_cs.get_data(), new_lines);
-			if (new_id == CT_TW_INVALID_PATH_ID) {
-				req.unpreserved.push_back(
-						String("source-version-not-minted:") +
-						String::utf8(trace_writer_last_error()));
-			} else {
-				req.old_path_id = id;
-				req.path_id = new_id;
-				// Frames still executing the OLD version's bytecode, MEASURED.
-				// `g_ct_crossing_stack` is the recorder's own LIFO of open
-				// GDScript frames, maintained at exactly the sites the
-				// writer's call/return records are. At an engine safe point it
-				// is empty and this is 0 — but it is read rather than assumed,
-				// because design §5.4 says steps belonging to in-flight frames
-				// legitimately appear after the marker carrying the OLD id,
-				// and a consumer must not read the marker as a clean cut on
-				// the strength of a literal.
-				req.in_flight_frames = (uint64_t)g_ct_crossing_stack.size();
-				ct_tw_source_reload_change change;
-				change.old_path_id = id;
-				change.new_path_id = new_id;
-				change.generation = (uint64_t)req.generation;
-				trace_writer_clear_last_error();
-#if defined(CT_GDH6_FALSIFY_NO_MARKER)
-				// FALSIFIER ARM (gdh6_reload_is_discoverable_end_to_end):
-				// mint the version and emit NO marker. Every path index is
-				// correct, every step is attributed to the version that ran
-				// it, and a consumer could still INFER a transition by
-				// scanning paths.dat for a repeated string. The gate must
-				// still go red, because design §6.3.1 requires the boundary
-				// to be RECORDED: an inference cannot say where in the step
-				// stream the transition happened, which ids it ran between,
-				// or which wire generation was installed. This arm is the
-				// whole reason that gate exists separately from GDH-G3.
-				uint64_t ordinal = 0;
-				(void)change;
-#elif defined(CT_GDH6_FALSIFY_MARKER_OUTSIDE_LOCK)
-				// FALSIFIER ARM (see the note on `g_ct_deferred_marker`):
-				// hand the marker to the NEXT safe point instead of emitting
-				// it here. Nothing about its contents changes — only the lock
-				// hold it is emitted from, which is precisely what the C
-				// header says is not enforceable from its side.
-				g_ct_deferred_marker.change = change;
-				g_ct_deferred_marker.in_flight_frames = req.in_flight_frames;
-				g_ct_deferred_marker.pending = true;
-				uint64_t ordinal = 1; // not the writer's; the arm is about position
-#else
-				uint64_t ordinal = trace_writer_register_source_reload(
-						g_ct_writer, &change, 1, req.in_flight_frames);
-#endif
-				if (ordinal == CT_TW_INVALID_RELOAD_ORDINAL) {
-					req.unpreserved.push_back(
-							String("source-reload-marker-refused:") +
-							String::utf8(trace_writer_last_error()));
-				} else {
-					req.reload_ordinal = ordinal;
-				}
 			}
 		}
 	}
@@ -2078,8 +2641,11 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 			// must never happen at the safe point, and is reported rather than
 			// worked around.
 			out->applied = 0;
-			out->reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
-			out->detail = "the safe point was reached from inside the recorder's emit path";
+			// GDH-M8: `host-busy`, not `writer-refused`. The trace writer was
+			// never asked anything; the HOST could not take the request now.
+			out->reason = REPRO_HCR_RELOAD_REASON_HOST_BUSY;
+			out->detail = "host-busy/reentrancy: the safe point was reached from "
+						  "inside the recorder's emit path";
 			return -1;
 		}
 		ct_apply_reload_locked(req);
@@ -2091,8 +2657,9 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 		std::unique_lock<std::mutex> lock(g_ct_reload_mutex);
 		if (g_ct_reload_queued) {
 			out->applied = 0;
-			out->reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
-			out->detail = "another reload is already queued for the next safe point";
+			out->reason = REPRO_HCR_RELOAD_REASON_HOST_BUSY;
+			out->detail = "host-busy/queue-occupied: another reload is already "
+						  "queued for the next safe point";
 			return -1;
 		}
 		const int bound_s = ct_reload_wait_seconds();
@@ -2126,7 +2693,16 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 			g_ct_reload_queued.reset();
 #endif
 			out->applied = 0;
-			out->reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+			// GDH-M5's RESIDUAL, and GDH-M8 does not hide it. A reload queued
+			// in the window between this timeout and the safe point's own
+			// clear can still be DROPPED (`g_ct_reload_queued.reset()` here
+			// and at the safe point's exit). It has always failed BY NAME and
+			// it still does; what GDH-M8 changed is only that the name is now
+			// its OWN — `no-safe-point` rather than the `writer-refused` it
+			// used to share with five unrelated conditions. The detail
+			// sentence is unchanged, so a harness matching on it still
+			// matches.
+			out->reason = REPRO_HCR_RELOAD_REASON_NO_SAFE_POINT;
 			static CharString s_timeout;
 			s_timeout = (String("no engine safe point was reached within ") +
 					itos(bound_s) + " s").utf8();
@@ -2171,6 +2747,15 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 		out->applied = 0;
 		out->reason = req.reason != nullptr ? req.reason
 										   : REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+		// GDH-M8: a refusal gets its own stderr line, in the same shape as the
+		// apply line below. A harness that could see an apply but not a refusal
+		// would have to infer the refusal from the absence of the other line,
+		// which is indistinguishable from a notification that never arrived —
+		// the conflation this milestone's anti-vacuity clause forbids.
+		fprintf(stderr, "[ct-gdh8] reload REFUSED: %s gen=%u reason=%s detail=%s\n",
+				req.res_path.utf8().get_data(), req.generation, out->reason,
+				out->detail != nullptr ? out->detail : "");
+		fflush(stderr);
 		return -1;
 	}
 	out->applied = 1;
@@ -2192,7 +2777,9 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 			(unsigned long long)req.old_path_id,
 			(unsigned long long)req.path_id,
 			(unsigned long long)req.in_flight_frames,
-			(unsigned long long)trace_writer_source_reload_count(g_ct_writer));
+			(unsigned long long)(g_ct_writer != nullptr
+					? trace_writer_source_reload_count(g_ct_writer)
+					: 0));
 	for (int i = 0; i < reported; i++) {
 		fprintf(stderr, "[ct-gdh5]   unpreserved: %s\n", out->unpreserved[i]);
 	}
@@ -2242,8 +2829,9 @@ void gdscript_ct_hcr_safe_point() {
 					ct_apply_reload_locked(*req);
 				} else {
 					req->applied = false;
-					req->reason = REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
-					req->detail = "the emit lock was not available at the safe point";
+					req->reason = REPRO_HCR_RELOAD_REASON_HOST_BUSY;
+					req->detail = "host-busy/emit-lock: the emit lock was not "
+								  "available at the safe point";
 				}
 			}
 			{

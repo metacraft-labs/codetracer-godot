@@ -39,6 +39,27 @@ if _ct_gdh6_falsify:
               % _arm)
         env_gdscript.Append(CPPDEFINES=[_arm])
 
+# --- GDH-M8 falsifier arms, and the injection-hook OPT-OUT ---------------
+# Same mechanism and same scope. Two kinds of define arrive through it and the
+# difference is worth stating, because one of them is not a falsifier:
+#
+#   CT_GDH8_FALSIFY_*         a mutation, exactly like the GDH-M5/M6 arms.
+#   CT_GDH8_NO_INJECTION_HOOK compiles the fault-injection hook OUT.
+#
+# The second exists because `gdh8_a_failure_after_registration_closes_the_
+# trace_rather_than_continuing` injects its failure through a hook in SHIPPED
+# code, and the milestone accepts that only if the hook's inertness is
+# MEASURED. The measurement is "an unarmed build with the hook produces a
+# container byte-identical to a build without it", and the second build is what
+# this define produces. A comment asserting the hook is off would not be a
+# measurement.
+_ct_gdh8_falsify = os.environ.get("CT_GDH8_FALSIFY", "")
+if _ct_gdh8_falsify:
+    for _arm in [a.strip() for a in _ct_gdh8_falsify.split(",") if a.strip()]:
+        print("CodeTracer GDH-M8 FALSIFIER ARM: -D%s (this is NOT a plain build)"
+              % _arm)
+        env_gdscript.Append(CPPDEFINES=[_arm])
+
 # --- GDH-M6 AddressSanitizer, scoped to this module ---------------------
 # `gdh6_a_timed_out_deferral_does_not_outlive_its_request` is killed by the
 # SANITIZER'S REPORT, never by a crash: the defect it guards is a

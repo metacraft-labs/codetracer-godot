@@ -3,6 +3,8 @@ from misc.utility.scons_hints import *
 
 Import("env")
 
+import os
+
 import platform_linuxbsd_builders
 
 common_linuxbsd = [
@@ -45,8 +47,29 @@ if env["dbus"]:
 # always links the same agent the coordinator on the other end of the socket was
 # built against. The explicit `target=` keeps its object inside `bin/obj`
 # instead of next to the source in the other repo.
+#
+# GDH-M8: `CT_GDH8_AGENT_FALSIFY` names a mutation to compile into the AGENT's
+# translation unit — `gdh8_digest_mismatch_is_refused_before_anything_is_
+# touched`'s falsifier is "skip the digest check", and the digest check lives in
+# repro_hcr_agent.c rather than in the engine. It is scoped to THIS ONE OBJECT
+# through a cloned environment, for the reason modules/gdscript/SCsub states at
+# length: a define added to the engine-wide CCFLAGS invalidates every object in
+# the tree and turns a ~20 s relink into a full rebuild.
+#
+# The arm is compiled into a copy of the production agent's source, in place, so
+# the mutation is a real mutation of the shipped file's behaviour and not of a
+# fork of it.
 if env["library_type"] == "executable" and env["hcr_agent_source"]:
-    common_linuxbsd += env.Object(
+    env_hcr_agent = env.Clone()
+    _ct_gdh8_agent_falsify = os.environ.get("CT_GDH8_AGENT_FALSIFY", "")
+    if _ct_gdh8_agent_falsify:
+        for _arm in [a.strip() for a in _ct_gdh8_agent_falsify.split(",") if a.strip()]:
+            print(
+                "CodeTracer GDH-M8 FALSIFIER ARM: -D%s on the HCR agent "
+                "(this is NOT a plain build)" % _arm
+            )
+            env_hcr_agent.Append(CPPDEFINES=[_arm])
+    common_linuxbsd += env_hcr_agent.Object(
         target="#bin/obj/hcr/repro_hcr_agent" + env["OBJSUFFIX"],
         source=env["hcr_agent_source"],
     )
