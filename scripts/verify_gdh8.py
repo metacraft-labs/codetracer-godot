@@ -9,7 +9,9 @@ Design:    codetracer-specs/Planned-Features/
            GDScript-Hot-Reload-Multi-Version-Sources.md §5.5, §8.1-§8.3.
 Milestone: the `GDH-M8` block of the campaign's `.milestones.org`.
 
-Three gates live here, each with its own control arm.
+Five gates live here, each with its own control arm.  The last two were added
+by GDH-M8b, which closed the `GDScriptCompiler` door GDH-M8 left named as a
+residual and gave §5.5's `line-table-mismatch` the user it never had.
 
 `gdh8_refused_reload_leaves_a_coherent_trace`                      (GDH-G6)
     A v2 that does NOT compile.  The engine keeps running v1 and keeps
@@ -29,11 +31,34 @@ Three gates live here, each with its own control arm.
     stream must succeed, and no step may be attributed to a path id with no
     source view.
 
-`allowed_mocks: none` for the first two.  The third injects its failure through
-a real fault-injection hook in the SHIPPED code path rather than through a
-double — a double would prove this harness's ordering rather than the product's
-— and the hook's inertness is a gate of its own, run by the driver
-(`record-and-verify-gdh8.sh`) because it needs a second BUILD.
+`gdh8_a_reload_that_fails_the_compiler_is_refused_by_name`             (M8b)
+    THE SECOND DOOR INTO THE SAME DEFECT.  A v2 that PARSES and ANALYZES and
+    then fails `GDScriptCompiler` cannot be refused before the swap — the
+    compiler compiles INTO the live script — so the host detects it after, by
+    `GDScript::is_valid()`.  It must answer `failed` / `compile-error` with the
+    compiler's own message, close the trace with the reason recorded in it, and
+    PUT THE ENGINE BACK on the source it was running.  Measured on the
+    pre-GDH-M8b build, this same notification came back `applied` with a fresh
+    path version in the container and left the process hung on a script whose
+    members `_prepare_compilation` had cleared and never refilled.
+
+`gdh8_a_stale_line_table_digest_is_refused_by_name`                    (M8b)
+    §5.5's `line-table-mismatch` was DEFINED WITH NO USER — the constant existed
+    in `repro_hcr_agent.h` and `protocol.nim`, `lineTableDigest` was a mandatory
+    wire field, and nothing anywhere compared it.  The agent now does.  The
+    notification this gate sends is correct in every other respect — right
+    content, right `snapshotDigest`, right `lineCount`, a line table with the
+    right NUMBER of offsets and one wrong offset — so nothing but the line-table
+    check can refuse it.
+
+`allowed_mocks: none` for four of the five.  The THIRD injects its failure
+through a real fault-injection hook in the SHIPPED code path rather than through
+a double — a double would prove this harness's ordering rather than the
+product's — and the hook's inertness is a gate of its own, run by the driver
+(`record-and-verify-gdh8.sh`) because it needs a second BUILD.  In particular
+the compile gate uses NO hook at all: its fixture is a real GDScript file that
+the STOCK engine calls a compile error, and the failure it grades is the
+engine's own.
 
 WHAT THIS FILE DOES NOT REIMPLEMENT.  The CTFS reader, the `paths.dat`
 line-count-table layout and the agent wire are already written, reviewed and
@@ -67,6 +92,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -179,8 +205,34 @@ def read_fixture(path: str) -> dict:
                 probe_lines=sorted(probes), probe_text=probes)
 
 
+def cold_load(engine: str, fixtures_dir: str, work: str, tag: str,
+              content: bytes) -> str:
+    """Ask the ENGINE to load `content` cold, and return everything it said.
+
+    The fixtures' defects are measured against Godot rather than asserted by
+    this harness, and the two defects are measured the SAME way so the
+    distinction between them is the engine's own words and not a difference in
+    method.
+    """
+    proj = os.path.join(work, tag)
+    if os.path.isdir(proj):
+        shutil.rmtree(proj)
+    os.makedirs(proj)
+    shutil.copyfile(os.path.join(fixtures_dir, "project.godot"),
+                    os.path.join(proj, "project.godot"))
+    with open(os.path.join(proj, "probe.gd"), "wb") as handle:
+        handle.write(content)
+    try:
+        proc = subprocess.run(
+            [engine, "--headless", "--path", proj, "--script", "res://probe.gd"],
+            capture_output=True, text=True, timeout=180)
+        return proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired:
+        return ""
+
+
 def fixture_preconditions(ck: Checker, v1: dict, v2ok: dict, v2bad: dict,
-                          engine: str, work: str) -> None:
+                          v2unc: dict, engine: str, work: str) -> None:
     """The preconditions on the FIXTURES themselves, before anything is run.
 
     Without them every gate below degrades into something weaker and still
@@ -214,21 +266,10 @@ def fixture_preconditions(ck: Checker, v1: dict, v2ok: dict, v2bad: dict,
     ck.ck(v2bad["bytes"].startswith(v1["bytes"]),
           "probe_v2_bad.gd also starts with probe_v1.gd byte for byte, so it "
           "differs from probe_v2_ok.gd only in the defect")
-    proj = os.path.join(work, "fixture-precheck")
-    if os.path.isdir(proj):
-        shutil.rmtree(proj)
-    os.makedirs(proj)
-    shutil.copyfile(os.path.join(os.path.dirname(v1["path"]), "project.godot"),
-                    os.path.join(proj, "project.godot"))
-    with open(os.path.join(proj, "probe.gd"), "wb") as handle:
-        handle.write(v2bad["bytes"])
-    try:
-        proc = subprocess.run(
-            [engine, "--headless", "--path", proj, "--script", "res://probe.gd"],
-            capture_output=True, text=True, timeout=180)
-        blob = proc.stdout + proc.stderr
-    except subprocess.TimeoutExpired:
-        blob = ""
+    fixtures_dir = os.path.dirname(v1["path"])
+    blob = cold_load(engine, fixtures_dir, work, "fixture-precheck",
+                     v2bad["bytes"])
+    if not blob:
         ck.check_fail("the parse-error precheck run timed out")
     ck.ck("Parse Error" in blob,
           "GODOT ITSELF calls probe_v2_bad.gd a parse error when asked to load "
@@ -237,6 +278,40 @@ def fixture_preconditions(ck: Checker, v1: dict, v2ok: dict, v2bad: dict,
     ck.ck("GDH8_BEGIN" not in blob,
           "and the broken fixture never reaches `_initialize`, so it is "
           "unrunnable rather than merely warned about")
+
+    # (iv) GDH-M8b: THE COMPILE-ERROR FIXTURE PASSES THE TWO STAGES THE
+    # PRE-CHECK RUNS AND FAILS THE ONE IT CANNOT.  This is the whole premise of
+    # `gdh8_a_reload_that_fails_the_compiler_is_refused_by_name`, and it is the
+    # claim most at risk of being wrong without anybody noticing: a fixture that
+    # in fact failed to PARSE would be refused at §8.1 step 2 by the GDH-M8
+    # pre-check, the wire would answer `parse-error`, the gate below would be
+    # measuring the door that is already shut, and everything would still look
+    # green if the gate were written to accept either name.  So the distinction
+    # is taken from the ENGINE'S OWN WORDS: `GDScript::reload` prints
+    # "Parse Error: …" when `GDScriptParser::parse` (gdscript.cpp:822-830) or
+    # `GDScriptAnalyzer::analyze` (:835-847) fails, and "Compile Error: …" ONLY
+    # at :856, which is the `ERR_COMPILATION_FAILED` branch at :862.  Both are
+    # asserted: the presence of one and the ABSENCE of the other.
+    ck.ck(v2unc["bytes"].startswith(v2ok["bytes"]),
+          "probe_v2_uncompilable.gd starts with probe_v2_ok.gd BYTE FOR BYTE, "
+          "so it carries v2's own probe lines and differs from a WORKING v2 "
+          "only in the compiler-only defect")
+    blob = cold_load(engine, fixtures_dir, work, "fixture-precheck-compile",
+                     v2unc["bytes"])
+    if not blob:
+        ck.check_fail("the compile-error precheck run timed out")
+    ck.ck("Compile Error" in blob,
+          "GODOT ITSELF calls probe_v2_uncompilable.gd a COMPILE error when "
+          "asked to load it cold (gdscript.cpp:856, the ERR_COMPILATION_FAILED "
+          "branch at :862)")
+    ck.ck("Parse Error" not in blob,
+          "and it says NOTHING about a parse error — the file gets through "
+          "`GDScriptParser::parse` AND `GDScriptAnalyzer::analyze`, which are "
+          "exactly the two stages design §8.1's step-2 pre-check runs, so this "
+          "fixture is not refusable before the swap")
+    ck.ck("GDH8_BEGIN" not in blob,
+          "and it never reaches `_initialize` either, so the compiler's refusal "
+          "is fatal to the script and not a warning")
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +326,16 @@ class Run:
         self.failure: str | None = None
         self.container_path: str | None = None
         self.reload_tick: int | None = None
+        # GDH-M8b.  A v2 the compiler refused does not merely degrade the
+        # session: `_prepare_compilation` has already cleared the script's
+        # members and functions, so a MainLoop in that state stops being called
+        # and the PROCESS NEVER ENDS.  `record` therefore bounds the wait for
+        # the engine to exit and kills it, and says so here — a harness that
+        # blocked forever on that would report a hang where the product has a
+        # nameable defect, and a harness that did not distinguish the two would
+        # let `gdh8_a_reload_that_fails_the_compiler_is_refused_by_name`'s
+        # no-restore arm look like an instrument failure.
+        self.timed_out = False
         # The project's own `probe.gd`, so the ON-DISK state is gradeable.
         # `assert_disk_holds` is the only user; see the note there for why a
         # gate that never looks at the disk misses half of design §8.1's
@@ -279,25 +364,68 @@ class Run:
 
 
 def source_changed(reload_id: str, path: str, generation: int, content: bytes,
-                   digest_override: str | None = None) -> dict:
-    """`agentwire.source_changed`, with the snapshot digest overridable.
+                   digest_override: str | None = None,
+                   line_table_override: str | None = None) -> dict:
+    """`agentwire.source_changed`, with the two digests overridable.
 
     The override is the ONLY difference, and it is what
     `gdh8_digest_mismatch_is_refused_before_anything_is_touched` needs: a
     notification whose `content` does not hash to its `snapshotDigest` while
     every other field — `lineCount` included — is correct, so the refusal
     cannot come from a different check.
+
+    `line_table_override` is the same idea for GDH-M8b's
+    `gdh8_a_stale_line_table_digest_is_refused_by_name`.
     """
     msg = agentwire.source_changed(reload_id, path, generation, content)
     if digest_override is not None:
         msg["sourceChanged"]["changedFiles"][0]["snapshotDigest"] = digest_override
+    if line_table_override is not None:
+        msg["sourceChanged"]["changedFiles"][0]["lineTableDigest"] = \
+            line_table_override
     return msg
 
 
+def stale_line_table_digest(content: bytes) -> str:
+    """A well-formed sha256 of a line table that is NOT this content's.
+
+    Built by taking the content's own line-start offsets and moving ONE of them
+    by a byte.  That keeps the number of offsets — and therefore `lineCount` —
+    exactly right, so `line-count-mismatch` cannot fire; `snapshotDigest` stays
+    the true digest of the real content, so `digest-mismatch` cannot fire
+    either.  The ONLY field that disagrees with the bytes is the line table,
+    which is the case §4.3 gave it its own digest for: "it detects a content
+    change that does not change the line count".
+    """
+    table = ",".join(str(o) for o in stale_line_table_offsets(content))
+    return "sha256:" + hashlib.sha256(table.encode("utf-8")).hexdigest()
+
+
+def stale_line_table_offsets(content: bytes) -> list:
+    """The perturbed offsets `stale_line_table_digest` hashes.
+
+    Split out by the GDH-M8b review, 2026-09-12.  The gate asserted that "the
+    perturbed table still has the content's own NUMBER of offsets" while
+    measuring `agentwire.line_start_offsets(...)` — the TRUE, unperturbed table.
+    The property held, because the perturbation moves an offset rather than
+    adding one, but the assertion was not measuring the object it named, and an
+    assertion that names one thing and reads another is how a gate stops
+    tracking the code it guards.  It now reads this.
+    """
+    offsets = agentwire.line_start_offsets(content)
+    if len(offsets) < 2:
+        die("the content has %d line-start offsets; this gate needs at least "
+            "two to perturb one of them" % len(offsets))
+    perturbed = list(offsets)
+    perturbed[1] += 1
+    return perturbed
+
+
 def record(engine: str, fixtures_dir: str, work: str, schedule: list,
-           bound: float, sock_dir: str, env_extra: dict | None = None) -> Run:
+           bound: float, sock_dir: str, env_extra: dict | None = None,
+           exit_bound: float = 45.0) -> Run:
     """Record one run, delivering `schedule` = [(tick, bytes, generation,
-    digest_override)]."""
+    digest_override, line_table_override)]."""
     result = Run()
     project = os.path.join(work, "project")
     if os.path.isdir(project):
@@ -334,9 +462,28 @@ def record(engine: str, fixtures_dir: str, work: str, schedule: list,
 
     def finish(failure: str | None) -> Run:
         result.failure = failure
+        # THE WATCHDOG, GDH-M8b.  `proc.stdout.read()` blocks until EOF and
+        # `wait()` until exit, and an engine left on a script the compiler
+        # refused does NEITHER — it sits in a MainLoop whose `_process` is never
+        # called again.  Killing it here is what turns that into a measurement
+        # (`run.timed_out`, and a non-zero `rc` the gates assert on) instead of a
+        # verifier hang, which the driver would score as rc 124 and correctly
+        # refuse to count as a kill.  For every well-behaved run the timer is
+        # cancelled before it ever fires and nothing about the recording changes.
+        def _kill() -> None:
+            result.timed_out = True
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+        watchdog = threading.Timer(exit_bound, _kill)
+        watchdog.daemon = True
+        watchdog.start()
         rest = proc.stdout.read() if proc.stdout else ""
         result.stdout = "".join(lines) + rest
         result.rc = proc.wait()
+        watchdog.cancel()
         result.container_path = os.path.join(trace_dir, "gdscript_trace.ct")
         if not os.path.isfile(result.container_path):
             result.container_path = None
@@ -367,7 +514,7 @@ def record(engine: str, fixtures_dir: str, work: str, schedule: list,
                       "advertised %r" % (caps,))
     peer.send(agentwire.hello_ack(obj["hello"]["supportProfile"]))
 
-    for tick, content, generation, digest_override in schedule:
+    for tick, content, generation, digest_override, table_override in schedule:
         marker = "GDH8_TICK=%d " % tick
         deadline = time.monotonic() + bound
         reached = False
@@ -384,7 +531,8 @@ def record(engine: str, fixtures_dir: str, work: str, schedule: list,
             return finish("the fixture never printed %r; the reload window for "
                           "generation %d was never entered" % (marker, generation))
         peer.send(source_changed("gdh8-r-%04d" % generation, FIXTURE_PATH,
-                                 generation, content, digest_override))
+                                 generation, content, digest_override,
+                                 table_override))
         result.reload_tick = tick
         kind, obj = peer.read(bound)
         if kind != "sourceReloadResult":
@@ -762,10 +910,161 @@ def gate_close(ck: Checker, injected: Run, i_view: View, control: Run,
 
 
 # ---------------------------------------------------------------------------
+# Gate 4 — GDH-M8b: a v2 that fails the COMPILER.
+# ---------------------------------------------------------------------------
+
+COMPILE_CLAIMS = 34  # written FROM A RUN (trap 4c)
+
+
+def gate_compile(ck: Checker, run: Run, view: View | None, control: Run,
+                 c_view: View, v1: dict, v2ok: dict, v2unc: dict) -> None:
+    # --- THE HEADLINE, and it is asserted before anything else.  Measured on
+    # the pre-GDH-M8b build, this exact notification came back
+    # `outcome: "applied"`, `reason: ""`, `pathIndex: 1`,
+    # `appliedDigest: sha256:5b8737e1…` — the digest of content the engine could
+    # not run.
+    assert_refusal(ck, run, "compile-error", "compile-error",
+                   want_outcome="failed")
+    first = run.reload_results[0] if run.reload_results else {}
+    detail = ((first.get("refusedFiles") or [{}])[0].get("detail") or "")
+    ck.ck("§8.1 step" in detail and "6 (swap" in detail,
+          "the refusal NAMES THE STAGE — §8.1 step 6, the swap — because that "
+          "is the earliest point a compile failure is detectable at all (%r)"
+          % detail[:200])
+    # THE COMPILER'S OWN MESSAGE.  `reload_scripts` returns void and drops
+    # `GDScript::reload`'s Error (gdscript.cpp:2511), so a host that only asked
+    # `is_valid()` would have nothing but "it did not compile" to say.  The
+    # substring is Godot's, not this harness's wording.
+    ck.ck("Compile Error" in detail and "in getter" in detail,
+          "and it carries THE COMPILER'S OWN MESSAGE, so the refusal is "
+          "actionable by the person who wrote the source rather than being a "
+          "code with nothing behind it (%r)" % detail[-180:])
+    ck.ck("put back on the source it was running" in detail,
+          "and it states WHAT HAPPENED TO THE ENGINE.  A compile failure is "
+          "only detectable after the swap, so 'the engine continues unreloaded' "
+          "is not free — it has to be done and then measured.  The reply says "
+          "which of the two it managed, and never implies more than happened")
+    ck.ck(not run.timed_out,
+          "the process ENDED BY ITSELF.  This is the claim the restore exists "
+          "for: after a failed compile `_prepare_compilation` has already "
+          "cleared the script's members and functions, so a MainLoop in that "
+          "state stops being called and the program never finishes.  Measured "
+          "on the pre-GDH-M8b build: alive and silent, indefinitely")
+    ck.ck("[ct-gdh8b] COMPILE FAILURE at §8.1 step 6" in run.stdout
+          and "restored=yes" in run.stdout,
+          "and the RECORDER says so on its own channel, with the restore "
+          "reported as a measurement (`restored=`) rather than as a claim")
+    ck.ck("[ct-gdh8] CLOSING THE TRACE at §8.1 stage 6" in run.stdout,
+          "the trace was CLOSED, which is §8.1's answer for a failure at steps "
+          "4-6: the container had already minted v2 and recorded the boundary, "
+          "and the engine is going back to v1, so continuing would attribute "
+          "every later step to a version nothing ever executed")
+
+    # --- THE ENGINE, in memory and on disk.
+    assert_no_v2_tokens(ck, run, v1, v2ok, "compile-error")
+    assert_disk_holds(ck, run, v1, "probe_v1.gd's bytes again — step 6 DID "
+                      "write the refused content (that is the only way to find "
+                      "out the compiler refuses it) and the restore put v1 "
+                      "back", "compile-error")
+
+    # --- THE CONTAINER.  Unlike the parse-error gate this one is NOT
+    # single-version: steps 3-5 completed, so v2 is minted, carries its source
+    # view and has a boundary marker.  What must hold is COHERENCE — every step
+    # resolves to a version whose text the container carries — and that the
+    # reason the recording stopped is in the container rather than only on
+    # stderr.
+    if view is None:
+        ck.check_fail("the container could not be read, so none of the "
+                      "coherence claims below were made")
+        return
+    ck.ck(view.dump["complete"],
+          "the closed trace's FULL step stream decodes: %d dump lines == the "
+          "%d its own header declares"
+          % (view.dump["lines"], view.dump["expected_lines"]))
+    ck.ck(len(view.steps) > 0,
+          "and it carries steps (%d) — an empty container decodes for free"
+          % len(view.steps))
+    ck.eq(len(view.ids), 2,
+          "the container carries TWO paths.dat entries for %s: §8.1 steps 3-5 "
+          "ran and committed to v2 before step 6 could find out the compiler "
+          "would not take it" % FIXTURE_PATH)
+    ck.eq([c for (p, c) in view.sized if p == FIXTURE_PATH],
+          [v1["addressable_lines"], v2unc["addressable_lines"]],
+          "each entry states ITS OWN line count, the second one the refused "
+          "content's")
+    ck.eq(len(view.markers), 1,
+          "and exactly ONE TagSourceReload marker — the boundary was recorded "
+          "at step 5, before the failure")
+    have_views = {v["path_id"] for v in view.raw_views}
+    orphans = sorted({s["path_id"] for s in view.steps} - have_views)
+    ck.eq(orphans, [],
+          "NO step is attributed to a path id with no raw source view "
+          "(orphaned ids: %r)" % orphans)
+    after_ids = {s["path_id"] for s in view.steps} & set(view.ids[1:])
+    ck.eq(sorted(after_ids), [],
+          "and NOT ONE step is attributed to the version the compiler refused "
+          "— the trace closed at the same safe point the swap failed in, so "
+          "there is no execution to misattribute")
+    reason_events = [e for e in view.dump["events"]
+                     if e["kind"] not in ("step", "source_reload")
+                     and "§8.1" in json.dumps(e, ensure_ascii=False)]
+    ck.ck(len(reason_events) >= 1,
+          "the reason the recording stopped is RECORDED IN THE CONTAINER "
+          "(%d event(s) naming §8.1)" % len(reason_events))
+    ck.ck(any("compiler refused" in json.dumps(e, ensure_ascii=False)
+              for e in reason_events),
+          "and the recorded reason names THE COMPILER, so a reader of the "
+          "container alone can tell this apart from the other four §8.1 "
+          "steps-4-6 failures")
+
+    # --- THE CONTROL: `probe_v2_ok.gd` is this file minus the defect, and it
+    # applies.  Without it, "the compiler refused it" would be indistinguishable
+    # from an engine that refuses every reload.
+    assert_applied_control(ck, control, c_view, v1, v2ok, "compile-error")
+
+
+# ---------------------------------------------------------------------------
+# Gate 5 — GDH-M8b: `line-table-mismatch` gets its user.
+# ---------------------------------------------------------------------------
+
+LINE_TABLE_CLAIMS = 35  # written FROM A RUN (trap 4c)
+
+
+def gate_line_table(ck: Checker, refused: Run, r_view: View, control: Run,
+                    c_view: View, v1: dict, v2ok: dict,
+                    supplied_table: str) -> None:
+    # --- anti-vacuity on the NOTIFICATION.  Every OTHER field has to be right,
+    # or this gate passes on a refusal that has nothing to do with the line
+    # table.  Three ways that could happen and all three are excluded here.
+    ck.ck(bool(supplied_table) and supplied_table.startswith("sha256:")
+          and len(supplied_table) == len("sha256:") + 64
+          and all(c in "0123456789abcdef" for c in supplied_table[7:]),
+          "the supplied lineTableDigest %r is WELL FORMED, so the refusal "
+          "cannot be `digest-algorithm-unsupported`" % supplied_table)
+    true_table = "sha256:" + hashlib.sha256(
+        ",".join(str(o) for o in agentwire.line_start_offsets(v2ok["bytes"]))
+        .encode("utf-8")).hexdigest()
+    ck.ck(supplied_table != true_table,
+          "and it DIFFERS from the true line-table digest of the content, "
+          "computed here by this harness (%s)" % true_table)
+    perturbed = stale_line_table_offsets(v2ok["bytes"])
+    ck.eq(len(perturbed), v2ok["addressable_lines"],
+          "and the perturbed table still has the content's own NUMBER of "
+          "offsets, so `line-count-mismatch` cannot fire either")
+    assert_refusal(ck, refused, "line-table-mismatch", "line-table")
+    assert_disk_holds(ck, refused, v1, "still probe_v1.gd's bytes — the agent "
+                      "refused before the host handler ran at all", "line-table")
+    assert_no_v2_tokens(ck, refused, v1, v2ok, "line-table")
+    assert_single_version_container(ck, r_view, v1, "line-table")
+    assert_step_token_bijection(ck, refused, r_view, v1, "line-table")
+    assert_applied_control(ck, control, c_view, v1, v2ok, "line-table")
+
+
+# ---------------------------------------------------------------------------
 # Main.
 # ---------------------------------------------------------------------------
 
-GATES = ["refused", "digest", "close"]
+GATES = ["refused", "digest", "close", "compile", "line-table"]
 RELOAD_TICK = 8
 
 
@@ -794,7 +1093,8 @@ def main() -> int:
         HERE, "..", "..", "codetracer-trace-format-nim", "ct-print"))
     if not os.access(ct_print, os.X_OK):
         die("ct-print is not executable: %s" % ct_print)
-    names = ["project.godot", "probe_v1.gd", "probe_v2_ok.gd", "probe_v2_bad.gd"]
+    names = ["project.godot", "probe_v1.gd", "probe_v2_ok.gd", "probe_v2_bad.gd",
+             "probe_v2_uncompilable.gd"]
     for name in names:
         if not os.path.isfile(os.path.join(args.fixtures, name)):
             die("missing fixture %s in %s" % (name, args.fixtures))
@@ -810,11 +1110,12 @@ def main() -> int:
     v1 = read_fixture(os.path.join(args.fixtures, "probe_v1.gd"))
     v2ok = read_fixture(os.path.join(args.fixtures, "probe_v2_ok.gd"))
     v2bad = read_fixture(os.path.join(args.fixtures, "probe_v2_bad.gd"))
+    v2unc = read_fixture(os.path.join(args.fixtures, "probe_v2_uncompilable.gd"))
 
     if args.record_only:
         run = record(args.engine, args.fixtures,
                      os.path.join(args.work, "record-only"),
-                     [(RELOAD_TICK, v2ok["bytes"], 2, None)],
+                     [(RELOAD_TICK, v2ok["bytes"], 2, None, None)],
                      args.bound, sock_dir)
         if run.failure:
             die("the record-only run did not happen: %s" % run.failure)
@@ -836,8 +1137,8 @@ def main() -> int:
     checkers: list[Checker] = []
     pre = Checker("gdh8_fixture_preconditions")
     print("== %s ==" % pre.gate)
-    fixture_preconditions(pre, v1, v2ok, v2bad, args.engine, args.work)
-    pre.expect_count(7)
+    fixture_preconditions(pre, v1, v2ok, v2bad, v2unc, args.engine, args.work)
+    pre.expect_count(11)
     checkers.append(pre)
     pre.report()
     if pre.red:
@@ -855,18 +1156,62 @@ def main() -> int:
             die("the %s run produced no container" % tag)
         return View(run, ct_print, args.work, tag)
 
-    def go(tag: str, content: bytes, digest_override=None, env=None) -> Run:
+    def load_tolerant(run: Run, tag: str, ck: Checker) -> View | None:
+        """`load`, for the ONE gate whose own falsifiers kill the engine.
+
+        `load` calls `die()` — rc 2, a DRIVER-FAIL — on a run whose engine did
+        not exit 0, which is exactly right everywhere else: a dead engine is an
+        instrument failure and never a kill.  It is wrong for
+        `gdh8_a_reload_that_fails_the_compiler_is_refused_by_name`, because
+        "the process did not end by itself" is that gate's OWN subject matter
+        and one of its two arms produces it deliberately.  Routing it through
+        `die()` would turn a kill into a DRIVER-FAIL, which the driver refuses
+        to count — an arm that cannot be scored is an unarmed claim.
+
+        So the engine's fate is asserted BY NAME inside the gate, and this only
+        has to keep the container claims from raising.  A container that cannot
+        be read is a CHECK-FAIL, which reddens the gate without pretending to be
+        one of its assertions.
+        """
+        if run.failure:
+            ck.check_fail("the %s run did not happen: %s" % (tag, run.failure))
+            return None
+        if not run.container_path:
+            ck.check_fail("the %s run produced no container" % tag)
+            return None
+        try:
+            return View(run, ct_print, args.work, tag)
+        except (Exception, SystemExit) as exc:  # reported, never swallowed
+            # `SystemExit` IS caught, and deliberately.  GDH-M8b review,
+            # 2026-09-12: `View.__init__` reaches `verify_gdh6.ct_print_events`,
+            # which on a `ct-print` failure calls `die()` — i.e. `sys.exit(2)`,
+            # a `SystemExit`, which does NOT derive from `Exception` and so
+            # escaped the original `except Exception`.  It would have left the
+            # verifier exiting 2, which the driver scores as a DRIVER-FAIL and
+            # refuses to count — turning this gate's own arms back into the
+            # unscoreable state this helper exists to prevent.  Catching only
+            # `Exception` closed the KeyError path (an unfinalized container,
+            # which is what arm 7 actually produces) and left the ct-print path
+            # open; both are now CHECK-FAILs that redden the gate by name.
+            ck.check_fail("the %s container could not be decoded: %r"
+                          % (tag, exc))
+            return None
+
+    def go(tag: str, content: bytes, digest_override=None, env=None,
+           line_table_override=None) -> Run:
         return record(args.engine, args.fixtures,
                       os.path.join(args.work, tag),
-                      [(RELOAD_TICK, content, 2, digest_override)],
+                      [(RELOAD_TICK, content, 2, digest_override,
+                        line_table_override)],
                       args.bound, sock_dir, env)
 
-    # The APPLIED control recording is shared by the first two gates: it is the
-    # same notification, correctly delivered, and it is what shows a one-entry
+    # The APPLIED control recording is shared by every gate: it is the same
+    # notification, correctly delivered, and it is what shows a one-entry
     # container is caused by the refusal rather than by the fixture.
     control = None
     c_view = None
-    if args.gate in ("all", "refused", "digest", "close"):
+    if args.gate in ("all", "refused", "digest", "close", "compile",
+                     "line-table"):
         control = go("control", v2ok["bytes"])
         c_view = load(control, "control")
 
@@ -903,6 +1248,27 @@ def main() -> int:
         view = load(run, "close")
         gate_close(ck, run, view, control, c_view, v1, v2ok, args.inject_stage)
         ck.expect_count(CLOSE_CLAIMS)
+        checkers.append(ck)
+        ck.report()
+
+    if args.gate in ("all", "compile"):
+        ck = Checker("gdh8_a_reload_that_fails_the_compiler_is_refused_by_name")
+        print("== %s ==" % ck.gate)
+        run = go("compile", v2unc["bytes"])
+        view = load_tolerant(run, "compile", ck)
+        gate_compile(ck, run, view, control, c_view, v1, v2ok, v2unc)
+        ck.expect_count(COMPILE_CLAIMS)
+        checkers.append(ck)
+        ck.report()
+
+    if args.gate in ("all", "line-table"):
+        ck = Checker("gdh8_a_stale_line_table_digest_is_refused_by_name")
+        print("== %s ==" % ck.gate)
+        stale = stale_line_table_digest(v2ok["bytes"])
+        run = go("line-table", v2ok["bytes"], line_table_override=stale)
+        view = load(run, "line-table")
+        gate_line_table(ck, run, view, control, c_view, v1, v2ok, stale)
+        ck.expect_count(LINE_TABLE_CLAIMS)
         checkers.append(ck)
         ck.report()
 

@@ -10,11 +10,13 @@
 #
 # What runs here:
 #
-#   1. The three gates, unmutated, against the plain engine — each with its own
+#   1. The five gates, unmutated, against the plain engine — each with its own
 #      control arm inside the verifier:
 #        gdh8_refused_reload_leaves_a_coherent_trace                 (GDH-G6)
 #        gdh8_digest_mismatch_is_refused_before_anything_is_touched
 #        gdh8_a_failure_after_registration_closes_the_trace_rather_than_continuing
+#        gdh8_a_reload_that_fails_the_compiler_is_refused_by_name      (M8b)
+#        gdh8_a_stale_line_table_digest_is_refused_by_name             (M8b)
 #
 #   2. THE INERTNESS GATE, which is not a falsifier and is the price of the
 #      fault-injection hook.  The third gate injects its failure through a hook
@@ -25,8 +27,14 @@
 #      in — and requires the two containers to be BYTE-IDENTICAL.  A comment
 #      claiming the hook is off would not be a measurement.
 #
-#   3. Every named falsifier arm.  SIX of them: the milestone names four and the
-#      2026-09-12 review added two, each for a claim that had none —
+#   3. Every named falsifier arm.  TEN of them: the milestone names four, the
+#      2026-09-12 review added two, GDH-M8b added three — two for the compile
+#      gate (one for the acknowledgement, one for the restore, because an arm
+#      that killed both would not have shown the restore could go red on its
+#      own) and one agent-side for the line-table check — and the GDH-M8b review
+#      added a tenth, `CT_GDH8_FALSIFY_RESTORE_SELF_REPORT`, for the one shape
+#      the other two do not model: a host that CLAIMS the restore it never
+#      performed.  The review's two were each for a claim that had none —
 #      `CT_GDH8_FALSIFY_CLOSE_WITHOUT_REASON` for "the reason is recorded IN THE
 #      CONTAINER" (§8.1's contract has two halves and only "closes the trace"
 #      was armed) and `CT_GDH8_FALSIFY_WRITE_BEFORE_COMPILE` for deviation (a)'s
@@ -49,13 +57,21 @@
 #   * An arm must go red IN THE GATE IT IS AIMED AT — the verifier prefixes
 #     every failure with `GDH8-FAIL[<gate>]` and this driver requires the right
 #     one.
-#   * An arm must PASS the gates it is not aimed at, or it has not been shown to
-#     discriminate.  Nine falsifiers in this campaign have already been measured
-#     non-discriminating for exactly that reason.
+#   * An arm SHOULD pass the gates it is not aimed at.  This one is REPORTED,
+#     not enforced, and the GDH-M8b review corrected this line because it used
+#     to read like an enforced rule: an arm that reddens another gate is printed
+#     as `NOT FULLY DISCRIMINATING` and still counted, because some properties
+#     are legitimately asserted in two gates (arms 4, 5 and 6 are each such a
+#     case and each is named at its own `run_arm` below).  What IS enforced is
+#     the named kill.  Nine falsifiers in this campaign have already been
+#     measured non-discriminating, so the note is never silent.
 #   * Any harness that mutates a shared artifact restores it AND VERIFIES the
 #     restore.  `bin/…hcr` is overwritten in place by every armed build, so the
 #     plain engine is copied aside first and the restore is checked by the
-#     ABSENCE of the arm in the rebuild log.
+#     ABSENCE of the arm in the rebuild log.  An EXIT trap added by the GDH-M8b
+#     review makes that hold for the abnormal exits too — a failed armed build,
+#     a failed restore, or a Ctrl-C used to leave an ARMED engine in the
+#     developer's tree, which is a mutated shared artifact left behind.
 #
 # Usage:  scripts/record-and-verify-gdh8.sh [<output-dir>]
 # Exit:   0 iff every gate is green and every arm is red in its own gate.
@@ -94,7 +110,8 @@ mkdir -p "$OUT" || die "cannot create $OUT"
 [[ -x "$CT_PRINT" ]] || die "ct-print not executable: $CT_PRINT (build it in codetracer-trace-format-nim)"
 [[ -f "$VERIFY" ]]   || die "verifier missing: $VERIFY"
 command -v python3 >/dev/null || die "python3 is not on PATH"
-for f in project.godot probe_v1.gd probe_v2_ok.gd probe_v2_bad.gd; do
+for f in project.godot probe_v1.gd probe_v2_ok.gd probe_v2_bad.gd \
+         probe_v2_uncompilable.gd; do
   [[ -f "$FIXTURES/$f" ]] || die "missing fixture $FIXTURES/$f"
 done
 
@@ -105,6 +122,29 @@ SOCK_DIR="${GDH8_SOCKET_DIR:-${XDG_RUNTIME_DIR:-/tmp}}"
 
 PLAIN="$OUT/godot-plain.hcr"
 cp -f "$BIN" "$PLAIN" || die "could not copy the plain engine aside"
+
+# THE SHARED ARTIFACT IS PUT BACK ON EVERY EXIT PATH — GDH-M8b review,
+# 2026-09-12.  `$BIN` lives in the DEVELOPER'S TREE and every armed build
+# overwrites it in place.  `restore_plain` runs after each arm, but it was only
+# on the normal paths: a build failure, a failed restore, a `die`, or a Ctrl-C
+# all returned with an ARMED engine sitting at `$BIN`, where the next thing to
+# run it — another gate, another campaign, a person — would silently get a
+# mutated engine.  That is a shared artifact mutated and not restored, which
+# this campaign's own rules forbid.  The trap copies the byte-exact saved engine
+# back (no rebuild, so it cannot itself fail slowly) and SAYS whether it worked.
+ct_gdh8_restore_bin_on_exit() {
+  local rc=$?
+  if [[ -f "$PLAIN" ]] && ! cmp -s "$BIN" "$PLAIN"; then
+    if cp -f "$PLAIN" "$BIN"; then
+      echo "[gdh8] restored the plain engine to $BIN on exit (it was armed)" >&2
+    else
+      echo "[gdh8] WARNING: could NOT restore the plain engine to $BIN — an" \
+           "ARMED engine is left in the tree.  Copy $PLAIN back by hand." >&2
+    fi
+  fi
+  exit $rc
+}
+trap ct_gdh8_restore_bin_on_exit EXIT INT TERM
 
 failures=0
 green=0
@@ -131,7 +171,7 @@ echo
 # ---------------------------------------------------------------------------
 # 1. The unmutated run.
 # ---------------------------------------------------------------------------
-echo "== the three gates, unmutated =="
+echo "== the five gates, unmutated =="
 rc=$(run_verifier plain "$PLAIN" all)
 cat "$OUT/plain.out"
 if [[ "$rc" == "124" ]]; then
@@ -326,7 +366,7 @@ run_arm() {
   # inside each gate; here the requirement is that the OTHER gates stay green
   # under the same armed engine.
   local other rc2 clean=1
-  for other in refused digest close; do
+  for other in refused digest close compile line-table; do
     [[ "$other" == "$selector" ]] && continue
     rc2=$(run_verifier "arm-$defines-$other" "$armed" "$other")
     if [[ "$rc2" == "2" ]]; then
@@ -340,7 +380,7 @@ run_arm() {
     fi
   done
   if [[ $clean -eq 1 ]]; then
-    echo "   and the other two gates stay GREEN under the same armed engine"
+    echo "   and the other four gates stay GREEN under the same armed engine"
   else
     echo "   NOT FULLY DISCRIMINATING — see the notes above.  Recorded, not" \
          "hidden: an arm that reddens more than its own gate is reported here" \
@@ -415,10 +455,83 @@ if [[ "$REBUILD_ARMS" == "1" ]]; then
   #   ran).  The driver prints the note; the `digest` gate, whose refusal
   #   happens inside the agent before this code path is reached, stays green and
   #   is the discrimination evidence.
+  #
+  #   THE KILL SUBSTRING IS PREFIXED — GDH-M8b review, 2026-09-12.  It used to
+  #   be the bare "the file ON DISK", and `assert_disk_holds` is called TWICE in
+  #   this gate: once for the arm's own refusal and once inside
+  #   `assert_applied_control`.  The bare substring could therefore have been
+  #   satisfied by the CONTROL going red, which is a different claim.  The
+  #   `parse-error:` tag pins it to the arm's own assertion.
   run_arm CT_GDH8_FALSIFY CT_GDH8_FALSIFY_WRITE_BEFORE_COMPILE refused \
     gdh8_refused_reload_leaves_a_coherent_trace \
-    "the file ON DISK" \
+    "parse-error: the file ON DISK" \
     "restore the pre-GDH-M8 disk write, before the compile check"
+  # ARM 7 (gdh8_a_reload_that_fails_the_compiler_is_refused_by_name) — GDH-M8b.
+  #   RESTORE THE PRE-GDH-M8b BEHAVIOUR: never ask whether the compiler took the
+  #   new content.  This is the shipped defect verbatim and it was MEASURED on
+  #   the unarmed pre-M8b build — `outcome: "applied"`, `reason: ""`,
+  #   `pathIndex: 1`, `appliedDigest` over content the engine could not run, and
+  #   the process left alive and silent forever.
+  #
+  #   The named kill is the ACKNOWLEDGEMENT and not the hang.  An arm scored on
+  #   "the process stopped" would also be satisfied by an engine that crashed
+  #   for an unrelated reason, and the milestone's claim is specifically that a
+  #   v2 the compiler refused must not come back `applied`.
+  run_arm CT_GDH8_FALSIFY CT_GDH8_FALSIFY_IGNORE_COMPILE_FAILURE compile \
+    gdh8_a_reload_that_fails_the_compiler_is_refused_by_name \
+    "the reload's OUTCOME is 'failed'" \
+    "never ask whether the compiler took the new content"
+  # ARM 8 (same gate, second arm) — GDH-M8b.  Detect the compile failure, name
+  #   it on the wire, close the trace correctly — and DO NOT PUT THE ENGINE
+  #   BACK.  The ACKNOWLEDGEMENT claims stay green, so what kills it is the
+  #   claim that the session survives.  Without this arm "the engine ends up
+  #   back on v1" would be a sentence with no measurement behind it, which is
+  #   the exact state deviation (a)'s disk half was found in.
+  #
+  #   WHAT 7 AND 8 TOGETHER DO AND DO NOT SHOW — corrected by the GDH-M8b
+  #   review, 2026-09-12.  The earlier wording claimed they were independently
+  #   discriminating.  They are not, in the set sense: arm 7 skips the check and
+  #   therefore the restore too, so its red set strictly CONTAINS arm 8's.  The
+  #   true, one-directional statement is that arm 8 reddens the restore/session
+  #   claims while leaving arm 7's named kill GREEN — the restore claim can fail
+  #   on its own.  Nothing shows the converse, and nothing can while one flag
+  #   gates both.  Two further wire assertions also redden under arm 8 (the
+  #   `detail` and `restored=NO`), which is the host reporting honestly; "every
+  #   wire claim stays green under it" was false and has been removed.
+  run_arm CT_GDH8_FALSIFY CT_GDH8_FALSIFY_NO_RESTORE_AFTER_COMPILE_FAILURE compile \
+    gdh8_a_reload_that_fails_the_compiler_is_refused_by_name \
+    "the process ENDED BY ITSELF" \
+    "refuse by name and leave the engine on the script the compiler refused"
+  # ARM 10 (same gate, THIRD arm) — ADDED BY THE GDH-M8b REVIEW, 2026-09-12.
+  #   THE SILENT SELF-PASS.  Arms 7 and 8 both leave the host HONEST: 7 never
+  #   looks, 8 looks and reports `restored=NO`.  Neither models the failure this
+  #   campaign has found twenty times — code that reports a success it never
+  #   observed.  This arm skips the write and the reload and still answers
+  #   `restored=yes`, with the matching detail sentence and the matching
+  #   recorder line, all false.
+  #
+  #   It is aimed at the GATE, not the host.  Every assertion that reads the
+  #   host's own account of the restore stays GREEN under it, so the gate can
+  #   only go red on evidence it gathered ITSELF — hence the named kill is the
+  #   file ON DISK, which the harness hashes.  If the gate's verdict rested on
+  #   the host's `restored=yes`, this arm would pass and "the engine ends up
+  #   back on v1" would have only the host's word behind it.
+  run_arm CT_GDH8_FALSIFY CT_GDH8_FALSIFY_RESTORE_SELF_REPORT compile \
+    gdh8_a_reload_that_fails_the_compiler_is_refused_by_name \
+    "probe_v1.gd's bytes again" \
+    "claim the restore without performing it"
+  # ARM 9 (gdh8_a_stale_line_table_digest_is_refused_by_name) — GDH-M8b,
+  #   AGENT-SIDE.  Compute the line-table digest and DO NOT COMPARE IT, which is
+  #   the state `line-table-mismatch` was in for the whole campaign: a constant
+  #   in two headers, a mandatory wire field, and no comparison anywhere.  The
+  #   gate must go red by observing the reload APPLY — v2's own tokens in
+  #   stdout — and not merely by a missing error string, for the same reason the
+  #   digest arm must.
+  run_arm CT_GDH8_AGENT_FALSIFY REPRO_HCR_GDH8B_FALSIFY_SKIP_LINE_TABLE_CHECK \
+    line-table \
+    gdh8_a_stale_line_table_digest_is_refused_by_name \
+    "NOT ONE of v2's own probe lines" \
+    "the agent does not compare the line table it computed"
 else
   echo "-- every arm and the inertness gate SKIPPED (REBUILD_ARMS=0).  They" \
        "are NOT counted as passed; this run proves the unmutated gates only." >&2
@@ -444,3 +557,10 @@ echo "GDH-M8: a v2 that does not compile is REFUSED by name, the engine keeps"
 echo "        running v1, and the container is indistinguishable from one that"
 echo "        was never asked — and a failure after the trace has committed"
 echo "        closes the recording rather than continuing into incoherence."
+echo "GDH-M8b: that now holds through BOTH doors.  A v2 that parses and analyzes"
+echo "        and fails the COMPILER cannot be refused before the swap, so it is"
+echo "        refused after it — by name (compile-error), with the compiler's own"
+echo "        message, with the trace closed and the reason in the container, and"
+echo "        with the engine put back on the source it was running.  And"
+echo "        line-table-mismatch, which was defined with no user anywhere, has"
+echo "        one."
