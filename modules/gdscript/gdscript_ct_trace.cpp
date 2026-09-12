@@ -49,6 +49,9 @@
 // virtual path resolves at replay, and mirror the writer's path interning.
 #include "core/io/file_access.h"
 #include "core/templates/hash_map.h"
+// GDH-M8b: `add_error_handler` / `ErrorHandlerList`, used to capture the
+// compiler's own message for the `compile-error` refusal's `detail`.
+#include "core/error/error_macros.h"
 
 // GF4: math / struct / handle Variant types. Most are pulled in transitively by
 // variant.h (it holds a union of every math type), but we include them
@@ -1892,6 +1895,55 @@ bool ct_gdscript_content_compiles(const String &p_res_path,
 	return true;
 }
 
+// GDH-M8b — CAPTURING THE COMPILER'S OWN MESSAGE.
+//
+// `GDScriptLanguage::reload_scripts` returns void and `GDScript::reload()`'s
+// `ERR_COMPILATION_FAILED` is dropped on the floor by it (gdscript.cpp:2511),
+// so the only in-process statement that the compiler refused the new source is
+// `GDScript::is_valid()` going false. That answers WHETHER but not WHY, and a
+// refusal whose `detail` says only "it did not compile" is a code with no
+// diagnostic attached — the shape §5.5 exists to keep off this wire.
+//
+// Godot does print the reason: `_err_print_error("GDScript::reload", path,
+// compiler.get_error_line(), "Compile Error: " + compiler.get_error(), false,
+// ERR_HANDLER_SCRIPT)` at gdscript.cpp:856. Every error handler on the engine's
+// own list sees it, so one is installed for the duration of the swap and taken
+// off again immediately. Nothing is intercepted or suppressed: the handler
+// COPIES the first script-level error it sees and the normal printer still runs.
+//
+// It is deliberately not a general error sink. It is armed for exactly one call,
+// it keeps only the FIRST message (the compiler stops at its first error), and
+// it is disarmed in the same block, so it cannot accumulate state across reloads
+// or attribute an unrelated error to this one.
+struct CtGdh8CompileErrorSink {
+	String message;
+	int line = -1;
+	bool captured = false;
+	ErrorHandlerList entry;
+
+	static void handle(void *p_self, const char *, const char *, int p_line,
+			const char *p_error, const char *p_explanation, bool,
+			ErrorHandlerType p_type) {
+		CtGdh8CompileErrorSink *self = (CtGdh8CompileErrorSink *)p_self;
+		if (self == nullptr || self->captured || p_type != ERR_HANDLER_SCRIPT) {
+			return;
+		}
+		self->captured = true;
+		self->line = p_line;
+		self->message = String::utf8(p_error != nullptr ? p_error : "");
+		if (p_explanation != nullptr && p_explanation[0] != '\0') {
+			self->message += " (" + String::utf8(p_explanation) + ")";
+		}
+	}
+
+	CtGdh8CompileErrorSink() {
+		entry.errfunc = &CtGdh8CompileErrorSink::handle;
+		entry.userdata = this;
+		add_error_handler(&entry);
+	}
+	~CtGdh8CompileErrorSink() { remove_error_handler(&entry); }
+};
+
 #if !defined(CT_GDH8_NO_INJECTION_HOOK)
 // The fault-injection hook of `gdh8_a_failure_after_registration_closes_the_
 // trace_rather_than_continuing`.
@@ -2022,8 +2074,19 @@ const bool ct_gdh8_close_on_late_failure = true;
 // Returns TRUE when the caller must abort — which is what it always does in a
 // shipping build. It returns false only under the falsifier arm, which is what
 // "continue instead of closing" means.
+//
+// GDH-M8b added `p_reason`. It defaults to `trace-closed`, which is what every
+// pre-GDH-M8b site passes and what §5.5 says a steps-4-6 failure answers when
+// the CONSEQUENCE is the only thing a coordinator can act on. The compile
+// failure is the one case where it is not: the cause is the user's own new
+// source, the coordinator's next move is to show them the compiler's message,
+// and collapsing that into `trace-closed` would repeat the `writer-refused`
+// mistake this milestone spent its whole review splitting apart. The trace
+// consequence does not disappear — it is stated in `detail` and recorded in the
+// container exactly as for every other site.
 bool ct_reload_fail_after_registration(CtReloadRequest &req, const String &p_stage,
-		const String &p_detail) {
+		const String &p_detail,
+		const char *p_reason = REPRO_HCR_RELOAD_REASON_TRACE_CLOSED) {
 	if (!ct_gdh8_close_on_late_failure) {
 		// THE FALSIFIER ARM. Keep going, and keep recording. The version is
 		// minted and every step after this point is attributed to it, so the
@@ -2039,7 +2102,7 @@ bool ct_reload_fail_after_registration(CtReloadRequest &req, const String &p_sta
 		return false;
 	}
 	req.applied = false;
-	req.reason = REPRO_HCR_RELOAD_REASON_TRACE_CLOSED;
+	req.reason = p_reason;
 	req.detail = "design §8.1 step " + p_stage +
 			" failed after the trace had committed to the new version, so the "
 			"recording was closed rather than continued: " +
@@ -2503,6 +2566,26 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 					"injected failure at §8.1 step 6")) {
 		return;
 	}
+	// GDH-M8b. THE TEXT THE ENGINE IS ACTUALLY RUNNING, taken before anything is
+	// written, so a compile failure below has something to put back.
+	//
+	// It is read from the SCRIPT and not from disk on purpose. Disk is not a
+	// reliable statement of what the engine is running — `CT_GDH8_FALSIFY_WRITE_
+	// BEFORE_COMPILE` is a build in which it demonstrably is not — and the thing
+	// that has to be restored is the source the live `GDScript` object was
+	// compiled from. `GDScript::reload()` re-parses `source` (gdscript.cpp:820)
+	// and `reload_scripts` refills it from disk first (gdscript.cpp:2509), so
+	// writing this text back and re-running the same wrapper puts the engine
+	// where it was rather than somewhere merely similar.
+	String ct_gdh8_pre_swap_source;
+	bool ct_gdh8_have_pre_swap_source = false;
+	{
+		Ref<GDScript> gd_before = scr;
+		if (gd_before.is_valid()) {
+			ct_gdh8_pre_swap_source = gd_before->get_source_code();
+			ct_gdh8_have_pre_swap_source = true;
+		}
+	}
 	{
 		Error err = OK;
 		Ref<FileAccess> fa = FileAccess::open(req.res_path, FileAccess::WRITE, &err);
@@ -2539,10 +2622,217 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 		}
 	}
 #else
-	Array scripts;
-	scripts.push_back(scr);
-	GDScriptLanguage::get_singleton()->reload_scripts(scripts, /*p_soft_reload=*/true);
+	CtGdh8CompileErrorSink ct_gdh8_sink;
+	{
+		Array scripts;
+		scripts.push_back(scr);
+		GDScriptLanguage::get_singleton()->reload_scripts(scripts, /*p_soft_reload=*/true);
+	}
 #endif
+
+	// ---------------------------------------------------------------------
+	// §8.1 STEP 6, SECOND HALF — GDH-M8b: DID THE COMPILER TAKE IT?
+	//
+	// THE DOOR THE PRE-CHECK CANNOT STAND IN FRONT OF. Step 2 runs
+	// `GDScriptParser::parse` and `GDScriptAnalyzer::analyze` on a stack-local
+	// parser and installs nothing, which is why it can refuse `parse-error`
+	// cleanly. `GDScriptCompiler` cannot be run that way: `compile()` takes a
+	// `GDScript *` and writes into it — it clears the target's members, deletes
+	// its `GDScriptFunction`s, re-runs `_prepare_compilation` on its BASE script
+	// objects (gdscript_compiler.cpp:2794), pulls orphan subclasses out of
+	// `GDScriptLanguage`'s global map (:3159) and can register the target in
+	// `GDScriptCache`'s static-script list (:3332). A "throwaway" GDScript is
+	// therefore not throwaway; giving it the real path collides in
+	// `ResourceCache`, and not giving it the real path still lets it mutate the
+	// live base scripts of any file with a GDScript `extends`. The pre-check
+	// deliberately stops before it, and this is the price: a v2 that parses and
+	// analyzes and fails the compiler is only detectable once the engine has
+	// already taken it.
+	//
+	// So it is detected HERE, after the swap, and the state that produces is
+	// named rather than dressed up. `GDScript::reload()` sets `valid = false`
+	// before it parses (gdscript.cpp:814) and only sets it back on a clean
+	// compile, and `reload_scripts` drops the Error (gdscript.cpp:2511), so
+	// `is_valid()` is the whole in-process signal.
+	//
+	// WHAT "RECOVERY" MEANS, PRECISELY. After a failed compile the engine is NOT
+	// on v1 and it is NOT on v2 — it is on a GDScript whose members, functions
+	// and signals `_prepare_compilation` cleared and never refilled. A MainLoop
+	// script in that state stops being called at all, which is a HUNG PROCESS and
+	// not a degraded one. There is nothing to "keep running", so the engine is
+	// put back by re-running the SAME supported wrapper over the text it was
+	// running before the swap. That either works — and is then asserted, by
+	// asking `is_valid()` a second time — or it does not, and the wire says which
+	// of the two happened. The reply never implies more than happened.
+	//
+	// THE TRACE IS A SEPARATE QUESTION AND GETS §8.1's ANSWER. Steps 3-5 already
+	// minted v2's path version, bundled its source view and recorded the
+	// boundary; the engine is going back to v1. Continuing would attribute every
+	// later step to a version nothing ever executed, which is exactly the
+	// misattribution this campaign exists to prevent, so the recording is CLOSED
+	// with the reason written into the container. A restored engine and a closed
+	// trace is a degraded session with a coherent recording — §8.1's contract,
+	// verbatim.
+	// ---------------------------------------------------------------------
+#if defined(CT_GDH8_FALSIFY_IGNORE_COMPILE_FAILURE)
+	// FALSIFIER ARM (gdh8_a_reload_that_fails_the_compiler_is_refused_by_name):
+	// RESTORE THE PRE-GDH-M8b BEHAVIOUR. Never ask whether the compiler took it;
+	// report `applied`, keep the marker, keep the recording, and leave the engine
+	// on the half-cleared script. This is the defect verbatim, and the gate must
+	// go red on the ACKNOWLEDGEMENT — a v2 the compiler refused must not come
+	// back `applied` — rather than merely on the process having stopped.
+	const bool ct_gdh8b_check_compiled = false;
+#else
+	const bool ct_gdh8b_check_compiled = true;
+#endif
+#if defined(CT_GDH8_FALSIFY_NO_RESTORE_AFTER_COMPILE_FAILURE)
+	// FALSIFIER ARM (same gate, second arm): detect the compile failure, name it
+	// on the wire and close the trace correctly — and DO NOT PUT THE ENGINE BACK.
+	// The ACKNOWLEDGEMENT claims stay green — `outcome: failed`, `reason:
+	// compile-error`, the stage, the compiler's own message, the closed trace —
+	// so what kills this arm is the claim that the SESSION SURVIVES: the process
+	// is left on a script the compiler refused and never reaches its own end.
+	// Without it "the engine ends up back on v1" would be a sentence with
+	// nothing behind it, which is the state deviation (a)'s disk half was
+	// measured to be in.
+	//
+	// WHAT THIS ARM DOES AND DOES NOT SHOW — corrected by the GDH-M8b review,
+	// 2026-09-12, because the earlier wording here claimed more than the arms
+	// measure. It is NOT true that arms 7 and 8 are independent in the set
+	// sense: arm 7 skips the check, so it skips the restore too, and its red set
+	// strictly CONTAINS arm 8's. The honest statement is the one-directional
+	// one — arm 8 reddens the restore/session claims while leaving arm 7's named
+	// kill (`the reload's OUTCOME is 'failed'`) GREEN, so it shows the restore
+	// claim can fail on its own. The converse is not shown by any arm, and no
+	// arm can show it while `ct_gdh8b_check_compiled` gates both: an
+	// acknowledgement-only mutation would have to keep the check and corrupt
+	// only the reporting. Recorded as a residual rather than asserted away.
+	//
+	// Two further wire assertions also go red under this arm, correctly and by
+	// design: the `detail` says "could NOT be put back" and the recorder channel
+	// prints `restored=NO`. That is the host reporting honestly, not a leak —
+	// but "every wire claim stays green under it" was false and is gone.
+	const bool ct_gdh8b_restore_v1 = false;
+#else
+	const bool ct_gdh8b_restore_v1 = true;
+#endif
+#if defined(CT_GDH8_FALSIFY_RESTORE_SELF_REPORT)
+	// FALSIFIER ARM (same gate, THIRD arm) — ADDED BY THE GDH-M8b REVIEW,
+	// 2026-09-12. THE SILENT SELF-PASS, IN THE ONE PLACE THIS MILESTONE SAYS IT
+	// MUST NOT BE.
+	//
+	// Arms 7 and 8 both make the host tell the truth: 7 never looks, 8 looks and
+	// says `restored=NO`. NEITHER of them models the failure this campaign has
+	// now found twenty times — code that REPORTS SUCCESS IT DID NOT OBSERVE. So
+	// this arm skips the write and the reload and still answers `restored=yes`,
+	// with the detail sentence "put back on the source it was running" and the
+	// recorder line `restored=yes`, all of them false.
+	//
+	// What it proves is about the GATE, not the host: every assertion that reads
+	// the host's own account of the restore stays GREEN under it, and the gate
+	// must still go red — on the file ON DISK still being the refused content,
+	// on `GDH8_END` never being printed, and on the process not ending by
+	// itself. If the gate's verdict rested on `restored=yes` it would pass this
+	// arm, and "the engine ends up back on v1" would again be a sentence with
+	// only the host's word behind it. `restored` is therefore set here WITHOUT
+	// being measured, which is precisely what the shipping path must never do.
+	const bool ct_gdh8b_restore_self_report = true;
+#else
+	const bool ct_gdh8b_restore_self_report = false;
+#endif
+	if (ct_gdh8b_check_compiled) {
+		Ref<GDScript> gd_after = scr;
+		if (gd_after.is_valid() && !gd_after->is_valid()) {
+			String why = "the engine's GDScript compiler refused the new content";
+#if !defined(CT_GDH5_FALSIFY_SCRIPT_RELOAD_ONLY)
+			if (ct_gdh8_sink.captured) {
+				why += ": line " + itos(ct_gdh8_sink.line) + ": " +
+						ct_gdh8_sink.message;
+			} else {
+				why += " (GDScript::reload left the script invalid; the compiler's "
+					   "own message was not captured)";
+			}
+#endif
+			// --- PUT THE ENGINE BACK, and MEASURE whether it went back.
+			//
+			// The bytes written are `String::utf8()` of what `get_source_code()`
+			// returned, so the round trip is byte-exact for well-formed UTF-8
+			// and is not guaranteed to be for a file that is not. The gate does
+			// not take that on trust: it hashes the file on disk after the
+			// refusal and requires it to equal `probe_v1.gd`, so a round trip
+			// that changed a byte would be RED rather than quietly accepted.
+			bool restored = false;
+			if (ct_gdh8b_restore_self_report) {
+				// FALSIFIER ARM ONLY (CT_GDH8_FALSIFY_RESTORE_SELF_REPORT):
+				// claim the restore without performing or measuring it. On the
+				// shipping path `restored` is only ever assigned from
+				// `is_valid()` below.
+				restored = true;
+			} else if (ct_gdh8b_restore_v1 && ct_gdh8_have_pre_swap_source) {
+				Error rerr = OK;
+				Ref<FileAccess> fa = FileAccess::open(req.res_path,
+						FileAccess::WRITE, &rerr);
+				if (fa.is_valid() && rerr == OK) {
+					CharString old_cs = ct_gdh8_pre_swap_source.utf8();
+					if (old_cs.length() > 0) {
+						fa->store_buffer((const uint8_t *)old_cs.get_data(),
+								(uint64_t)old_cs.length());
+					}
+					fa->flush();
+					fa = Ref<FileAccess>();
+					Array back;
+					back.push_back(scr);
+					GDScriptLanguage::get_singleton()->reload_scripts(back,
+							/*p_soft_reload=*/true);
+					restored = gd_after->is_valid();
+				}
+			}
+			req.unpreserved.push_back(restored
+							? "source-version-rolled-back:the compiler refused the "
+							  "new content and the engine was put back on the "
+							  "source it was running"
+							: "engine-left-uncompiled:the compiler refused the new "
+							  "content and the engine could NOT be put back");
+			why += restored
+					? "; the engine was put back on the source it was running "
+					  "before the swap and that source compiles"
+					: "; the engine could NOT be put back and is left on a script "
+					  "the compiler refused";
+			fprintf(stderr, "[ct-gdh8b] COMPILE FAILURE at §8.1 step 6: %s "
+							"gen=%u restored=%s: %s\n",
+					req.res_path.utf8().get_data(), req.generation,
+					restored ? "yes" : "NO", why.utf8().get_data());
+			fflush(stderr);
+			// THE REASON IS SET HERE AND NOT ONLY BY THE HELPER, and that is the
+			// GDH-M8 review's own warning taken up rather than repeated. It
+			// found the agent's `reason == NULL ? WRITER_REFUSED` fallback
+			// "defensive rather than load-bearing today… a silent-collapse
+			// hazard for whoever adds the seventh [refusal site]". This IS the
+			// seventh. `ct_reload_fail_after_registration` sets the reason on
+			// the path that closes the trace — but under
+			// `CT_GDH8_FALSIFY_CONTINUE_AFTER_FAILURE` it returns without
+			// setting anything, and the fallback then turned a compile failure
+			// into `writer-refused` on the wire: the exact name-collapse this
+			// milestone's review spent its length undoing, reintroduced by a
+			// build that was only supposed to change what the TRACE does.
+			//
+			// What the compiler did and what the recorder did are two different
+			// facts, so they are set in two places. The helper still overwrites
+			// `detail` with the fuller §8.1 sentence on the shipping path.
+			req.applied = false;
+			req.reason = REPRO_HCR_RELOAD_REASON_COMPILE_ERROR;
+			req.detail = why;
+			(void)ct_reload_fail_after_registration(req,
+					"6 (swap the engine's script)", why,
+					REPRO_HCR_RELOAD_REASON_COMPILE_ERROR);
+			// Unconditional: under `CT_GDH8_FALSIFY_CONTINUE_AFTER_FAILURE` the
+			// call above answers "do not abort", and CONTINUING here would
+			// report `applied` for content the engine does not run. That arm
+			// models a recorder that keeps recording, not a host that lies about
+			// the outcome, and the two must not be confused.
+			return;
+		}
+	}
 
 	// What did not survive, measured rather than asserted.
 	List<StringName> names_after;
@@ -2745,15 +3035,39 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 
 	if (!req.applied) {
 		out->applied = 0;
-		out->reason = req.reason != nullptr ? req.reason
-										   : REPRO_HCR_RELOAD_REASON_WRITER_REFUSED;
+		// THE FALLBACK IS DELIBERATELY NOT A REAL REASON — GDH-M8b REVIEW,
+		// 2026-09-12.
+		//
+		// This used to read `req.reason != nullptr ? req.reason :
+		// REPRO_HCR_RELOAD_REASON_WRITER_REFUSED`, and GDH-M8's review called
+		// that "a silent-collapse hazard for whoever adds the seventh
+		// [refusal site]". GDH-M8b WAS the seventh and the hazard fired
+		// exactly as predicted: under `CT_GDH8_FALSIFY_CONTINUE_AFTER_FAILURE`
+		// a compile failure reached the wire as `writer-refused`. The fix
+		// applied there — set the reason at the site as well as in the helper
+		// — repairs the seventh site and leaves the EIGHTH exposed, because
+		// the only thing standing between a forgotten assignment and a
+		// plausible-looking wrong name was discipline.
+		//
+		// So the collapse is removed instead of being out-run. A null reason
+		// is passed THROUGH, and `repro_hcr_agent.c:2222` substitutes
+		// `unspecified-refusal` — a name deliberately outside §5.5's closed
+		// vocabulary, so a site that forgets produces something no gate, no
+		// coordinator and no reader can mistake for a real refusal. That
+		// sentinel already existed; this fallback was masking it. Every real
+		// refusal site sets `req.reason` explicitly (the two `writer-refused`
+		// ones at :2260 and :2298 included), so nothing depended on the
+		// collapse and nothing on the wire changes for any reachable path.
+		out->reason = req.reason;
 		// GDH-M8: a refusal gets its own stderr line, in the same shape as the
 		// apply line below. A harness that could see an apply but not a refusal
 		// would have to infer the refusal from the absence of the other line,
 		// which is indistinguishable from a notification that never arrived —
 		// the conflation this milestone's anti-vacuity clause forbids.
 		fprintf(stderr, "[ct-gdh8] reload REFUSED: %s gen=%u reason=%s detail=%s\n",
-				req.res_path.utf8().get_data(), req.generation, out->reason,
+				req.res_path.utf8().get_data(), req.generation,
+				out->reason != nullptr ? out->reason : "(unset — the agent will "
+													   "answer unspecified-refusal)",
 				out->detail != nullptr ? out->detail : "");
 		fflush(stderr);
 		return -1;
