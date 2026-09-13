@@ -97,20 +97,20 @@ Design §5.1's measurement, re-confirmed here by running it:
 
 * `GDScriptLanguage::reload_scripts` is `#ifdef DEBUG_ENABLED`
   (`modules/gdscript/gdscript.cpp`), and `template_debug` defines
-  `DEBUG_ENABLED` without `TOOLS_ENABLED` (`SConstruct:534-536` sets
-  `editor_build` / `debug_features`; `:549-555` turns them into the two
+  `DEBUG_ENABLED` without `TOOLS_ENABLED` (`SConstruct:542-544` sets
+  `editor_build` / `debug_features`; `:557-563` turns them into the two
   `CPPDEFINES`).
 * The remote-debugger command exists with **zero preprocessor conditionals** in
   the file: `_core_capture` stores the request at
-  `core/debugger/remote_debugger.cpp:719-722` (its in-break twin inside
-  `debug()` is at `:527-528`), and `poll_events` applies it **during idle poll
-  only** at `:685-716`, re-reading each script from disk.
+  `core/debugger/remote_debugger.cpp:722-725` (its in-break twin inside
+  `debug()` is at `:530-531`), and `poll_events` applies it **during idle poll
+  only** at `:688-719`, re-reading each script from disk.
 * The engine **connects out** to `--remote-debug tcp://host:port`, so the
   driver must be listening first.
 
 ### The wire format, measured
 
-`remote_debugger_peer.cpp:98-155`: `u32 LE length` followed by
+`remote_debugger_peer.cpp:101-170`: `u32 LE length` followed by
 `encode_variant(Array)`.
 
 A host→engine command is a **three**-element array:
@@ -119,10 +119,10 @@ A host→engine command is a **three**-element array:
 ["core:reload_scripts", <thread_id>, ["res://probe.gd"]]
 ```
 
-`remote_debugger.cpp:350-371` — `_poll_messages` does
+`remote_debugger.cpp:353-374` — `_poll_messages` does
 `ERR_CONTINUE(cmd.size() != 3)`, `cmd[0]` STRING, `cmd[1]` INT, `cmd[2]` ARRAY.
 `cmd[1]` must name a thread the engine has registered; the main thread is
-registered unconditionally at `:798` and `Thread::MAIN_ID` is **1**
+registered unconditionally at `:801` and `Thread::MAIN_ID` is **1**
 (`core/os/thread.h:72`).
 
 > **A two-element array is refused, and this was measured before it was read.**
@@ -130,16 +130,16 @@ registered unconditionally at `:798` and `Thread::MAIN_ID` is **1**
 > thing to send. The first run of this driver sent `[cmd, data]` and the engine
 > answered, on its own stdout:
 > `ERROR: Condition "cmd.size() != 3" is true. Continuing. at: _poll_messages
-> (core/debugger/remote_debugger.cpp:356)`.
+> (core/debugger/remote_debugger.cpp:359)`.
 > The three-element form is the one `_poll_messages` accepts.
 
 ## `--path <real dir>` — deliverable 4
 
-`--path` is gated on `OVERRIDE_PATH_ENABLED`, which `SConstruct:1146-1147` sets
+`--path` is gated on `OVERRIDE_PATH_ENABLED`, which `SConstruct:1171-1172` sets
 from `disable_path_overrides` — and that option **defaults to `True`**
-(`SConstruct:273-279`). A stock export template therefore aborts on `--path`
+(`SConstruct:281-287`). A stock export template therefore aborts on `--path`
 with a *different* message than an enabled build does
-(`main/main.cpp:1707-1725`):
+(`main/main.cpp:1768-1786`):
 
 | build | message on a bad `--path` |
 |---|---|
@@ -326,9 +326,9 @@ which is why the arm is worth running rather than reasoning about:
 
 ```
 ERROR: Attempt to open script 'res://gdh0_never_loaded.gd' resulted in error 'File not found'.
-   at: load_source_code (modules/gdscript/gdscript.cpp:1128)
+   at: load_source_code (modules/gdscript/gdscript.cpp:1140)
 ERROR: Could not reload script 'res://gdh0_never_loaded.gd': File not found
-   at: poll_events (core/debugger/remote_debugger.cpp:707)
+   at: poll_events (core/debugger/remote_debugger.cpp:710)
 ```
 
 ### GDH-G0b — what the container carries
@@ -469,7 +469,7 @@ survived all five.
 
 **1 is the sharpest.** `_poll_messages` accepts the three-element array, reads
 `cmd[1]` as a thread id, and then does `if (!messages.has(thread)) continue;`
-(`remote_debugger.cpp:363-365`) — an unregistered thread id is dropped **with
+(`remote_debugger.cpp:366-368`) — an unregistered thread id is dropped **with
 no diagnostic at all**, unlike mutation 2, which the engine complains about.
 The reload silently does not happen and GDH-G0a catches it anyway.
 

@@ -288,7 +288,7 @@ def fixture_preconditions(ck: Checker, v1: dict, v2ok: dict, v2bad: dict,
     # measuring the door that is already shut, and everything would still look
     # green if the gate were written to accept either name.  So the distinction
     # is taken from the ENGINE'S OWN WORDS: `GDScript::reload` prints
-    # "Parse Error: …" when `GDScriptParser::parse` (gdscript.cpp:822-830) or
+    # "Parse Error: …" when `GDScriptParser::parse` (gdscript.cpp:820-828) or
     # `GDScriptAnalyzer::analyze` (:835-847) fails, and "Compile Error: …" ONLY
     # at :856, which is the `ERR_COMPILATION_FAILED` branch at :862.  Both are
     # asserted: the presence of one and the ABSENCE of the other.
@@ -302,7 +302,7 @@ def fixture_preconditions(ck: Checker, v1: dict, v2ok: dict, v2bad: dict,
         ck.check_fail("the compile-error precheck run timed out")
     ck.ck("Compile Error" in blob,
           "GODOT ITSELF calls probe_v2_uncompilable.gd a COMPILE error when "
-          "asked to load it cold (gdscript.cpp:856, the ERR_COMPILATION_FAILED "
+          "asked to load it cold (gdscript.cpp:854, the ERR_COMPILATION_FAILED "
           "branch at :862)")
     ck.ck("Parse Error" not in blob,
           "and it says NOTHING about a parse error — the file gets through "
@@ -932,7 +932,7 @@ def gate_compile(ck: Checker, run: Run, view: View | None, control: Run,
           "is the earliest point a compile failure is detectable at all (%r)"
           % detail[:200])
     # THE COMPILER'S OWN MESSAGE.  `reload_scripts` returns void and drops
-    # `GDScript::reload`'s Error (gdscript.cpp:2511), so a host that only asked
+    # `GDScript::reload`'s Error (gdscript.cpp:2560), so a host that only asked
     # `is_valid()` would have nothing but "it did not compile" to say.  The
     # substring is Godot's, not this harness's wording.
     ck.ck("Compile Error" in detail and "in getter" in detail,

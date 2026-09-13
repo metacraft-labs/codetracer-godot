@@ -30,7 +30,7 @@ Reading `modules/gdscript/gdscript_compiler.cpp` +
   address `src_address`, then emits
   `gen->write_assign[_with_conversion](local, src_address)`.
 - `write_assign` / `write_assign_with_conversion`
-  (gdscript_byte_codegen.cpp:908/968) ALWAYS emit an `OPCODE_ASSIGN` or an
+  (gdscript_byte_codegen.cpp:911/968) ALWAYS emit an `OPCODE_ASSIGN` or an
   `OPCODE_ASSIGN_TYPED_*` into the named local `local`.
 - Every operator / cast / type-test / ternary / logical sub-result is computed
   into a FRESH COMPILER TEMPORARY (`codegen.add_temporary()`), e.g.

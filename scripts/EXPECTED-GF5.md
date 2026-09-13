@@ -48,7 +48,7 @@ So `do_void() -> void` records `return_value = None`, and `_init` (no return) an
 GDScript compiles optional parameters into a **default-argument bytecode block**
 emitted at the top of the function (`start_parameters` /
 `write_assign_default_parameter`, `gdscript_compiler.cpp:2438` +
-`gdscript_byte_codegen.cpp:1017`). `write_assign_default_parameter` emits a plain
+`gdscript_byte_codegen.cpp:1020`). `write_assign_default_parameter` emits a plain
 `write_assign` — i.e. an `OPCODE_ASSIGN` (already hooked by G4's
 `CT_TRACE_ASSIGN`) into the **parameter's own stack slot**.
 

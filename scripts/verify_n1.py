@@ -9,7 +9,7 @@ against a native trace per the correlation record's resolution rule
 (codetracer-trace-format-spec/nested-trace-correlation.md §3).
 
   ── What is REAL ──────────────────────────────────────────────────────────
-  The patched godotengine/godot@4.6.2-stable fork records a real n1_nested.gd
+  The patched godotengine/godot@4.7.2-stable fork records a real n1_nested.gd
   headless and the real join events are read back from the real .ct via the
   real ct-print. There is NO mock of the engine, VM, writer, reader, or trace.
 

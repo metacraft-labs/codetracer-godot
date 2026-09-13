@@ -24,7 +24,7 @@ The load-bearing findings (see EXPECTED-GF6.md for the full derivation):
     slot. Their values are observed at lambda execution by the body reading them
     into fresh named locals (`seen_x` <- param x; `seen_base` <- capture base).
   - CAPTURE-BY-VALUE: OPCODE_CREATE_LAMBDA snapshots captures by value
-    (gdscript_vm.cpp:2700 `captures.write[i] = *arg`). So after the outer `base`
+    (gdscript_vm.cpp:2744 `captures.write[i] = *arg`). So after the outer `base`
     is mutated 10 -> 999, the lambda STILL returns 15 and `seen_base` STILL reads
     10 on the second call, while the outer local `base` is captured as [10, 999].
   - A lambda stored in a var is value-captured as a Callable (GF4 shallow

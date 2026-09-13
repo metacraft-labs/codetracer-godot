@@ -75,9 +75,27 @@ if _ct_gdh8_falsify:
 #
 # `detect_leaks=0` is NOT set here. The gate sets ASAN_OPTIONS itself, so the
 # choice is visible in the harness rather than baked into the binary.
+#
+# `ASAN_ENABLED` IS REQUIRED FROM GODOT 4.7 ONWARDS, and it is not optional
+# bookkeeping. 4.7 added a guard to `core/typedefs.h` (:65-67):
+#
+#     #if (GD_HAS_FEATURE(address_sanitizer) || defined(__SANITIZE_ADDRESS__)) \
+#             && !defined(ASAN_ENABLED)
+#     #error Address sanitizer was enabled without defining `ASAN_ENABLED`
+#
+# so at 4.6.2 this block worked with the flag alone and at 4.7.2 it stops the
+# build dead — every `modules/gdscript` translation unit fails at the `#error`.
+# Upstream pairs the two itself wherever it turns the sanitizer on (see
+# `platform/linuxbsd/detect.py`'s `use_asan` branch, which does
+# `CPPDEFINES=["ASAN_ENABLED"]` immediately before the `-fsanitize=address`
+# CCFLAGS), and this mirrors that pairing at the scope we use. It is defined on
+# `env_gdscript` only, matching where the flag is applied: the rest of the tree
+# is not sanitized and must not claim to be, since `ASAN_ENABLED` also gates
+# real behaviour in the engine (allocator hooks, poisoning helpers).
 if os.environ.get("CT_GDH6_ASAN", "") not in ("", "0"):
     print("CodeTracer GDH-M6: -fsanitize=address on modules/gdscript "
           "(this is NOT a plain build)")
+    env_gdscript.Append(CPPDEFINES=["ASAN_ENABLED"])
     env_gdscript.Append(CCFLAGS=["-fsanitize=address", "-fno-omit-frame-pointer"])
     env.Append(LINKFLAGS=["-fsanitize=address"])
 
@@ -145,5 +163,6 @@ if env.editor_build:
 
 
 if env["tests"]:
+    # TODO: Handle test creation magic without needing to pass macro.
     env_gdscript.Append(CPPDEFINES=["TESTS_ENABLED"])
     env_gdscript.add_source_files(env.modules_sources, "./tests/*.cpp")

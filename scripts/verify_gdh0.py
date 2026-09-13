@@ -402,11 +402,11 @@ def _varint(buf: bytes, pos: int) -> tuple[int, int]:
 # Godot remote-debugger wire protocol (the host half).
 #
 # The engine CONNECTS OUT to `--remote-debug tcp://host:port` and speaks
-# `u32 LE length` + `encode_variant(Array)` (`remote_debugger_peer.cpp:98-155`).
+# `u32 LE length` + `encode_variant(Array)` (`remote_debugger_peer.cpp:101-170`).
 # A host->engine command is a THREE-element array
-# `[String cmd, int thread_id, Array data]` — `remote_debugger.cpp:350-371`
+# `[String cmd, int thread_id, Array data]` — `remote_debugger.cpp:353-374`
 # `ERR_CONTINUE(cmd.size() != 3)`.  `thread_id` must name a thread the engine
-# has registered; the main thread is registered unconditionally at `:798` and
+# has registered; the main thread is registered unconditionally at `:801` and
 # `Thread::MAIN_ID` is 1 (`core/os/thread.h:72`).  A two-element array — the
 # shape `poll_events` itself parses at `:663` — is REFUSED here with
 # `Condition "cmd.size() != 3" is true`, measured on 2026-09-10 before the

@@ -27,7 +27,7 @@ ELF HCR provider (HLX-M0/M1) and the change is observed on the engine's stdout.
 > `.localalias` STB_LOCAL symbol at the same address, which is the ambiguity
 > HLX-M1's disambiguation rule exists to refuse.
 
-Defined at `core/core_bind.cpp:623` (namespace `CoreBind`):
+Defined at `core/core_bind.cpp:632` (namespace `CoreBind`):
 
 ```cpp
 int OS::get_processor_count() const {
@@ -35,7 +35,7 @@ int OS::get_processor_count() const {
 }
 ```
 
-Bound to GDScript at `core/core_bind.cpp:765`:
+Bound to GDScript at `core/core_bind.cpp:774`:
 
 ```cpp
 ClassDB::bind_method(D_METHOD("get_processor_count"), &OS::get_processor_count);

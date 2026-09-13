@@ -207,9 +207,9 @@ def source_changed(reload_id: str, path: str, generation: int,
 # Godot remote-debugger wire, host half.
 #
 # The engine CONNECTS OUT to `--remote-debug tcp://host:port` and speaks
-# `u32 LE length` + `encode_variant(Array)` (`remote_debugger_peer.cpp:98-155`).
+# `u32 LE length` + `encode_variant(Array)` (`remote_debugger_peer.cpp:101-170`).
 # A host->engine command is a THREE-element array `[String cmd, int thread_id,
-# Array data]` — `remote_debugger.cpp:350-371`, `ERR_CONTINUE(cmd.size() != 3)`.
+# Array data]` — `remote_debugger.cpp:353-374`, `ERR_CONTINUE(cmd.size() != 3)`.
 # A two-element array is dropped, and an UNREGISTERED thread_id is dropped with
 # no diagnostic at all; `Thread::MAIN_ID` is 1 and is registered
 # unconditionally.
@@ -451,7 +451,7 @@ def run_remote_arm(engine: str, fixtures: str, work: str, v1: str, v2: str,
         return result
 
     # The external overwrite the remote-debugger path requires: it re-reads the
-    # `.gd` from disk (`gdscript.cpp:2509`) and has no way to be handed bytes.
+    # `.gd` from disk (`gdscript.cpp:2558`) and has no way to be handed bytes.
     incoming = os.path.join(project, "probe.gd.incoming")
     shutil.copyfile(os.path.join(fixtures, v2), incoming)
     os.replace(incoming, os.path.join(project, "probe.gd"))

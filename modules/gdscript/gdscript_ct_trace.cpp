@@ -1599,7 +1599,7 @@ public:
 //
 // No new reload machinery. §5.1 measured that Godot's own path is already in a
 // headless `template_debug` build: `GDScriptLanguage::reload_scripts` is
-// `#ifdef DEBUG_ENABLED` (gdscript.cpp:2421/:2555), not TOOLS_ENABLED, and it
+// `#ifdef DEBUG_ENABLED` (gdscript.cpp:2472/:2604), not TOOLS_ENABLED, and it
 // re-reads the `.gd` from disk at :2509 before recompiling. What this file adds
 // is the TIMING — a reload applied where the recorder can bracket it — and the
 // REPORTING of what that reload does not preserve.
@@ -1608,7 +1608,7 @@ public:
 // alternative is wrong:
 //
 //  1. `reload_scripts`, not `GDScript::reload()`. `reload()` alone parses the
-//     in-memory `source` member (gdscript.cpp:820) and never re-reads disk, so
+//     in-memory `source` member (gdscript.cpp:818) and never re-reads disk, so
 //     it would recompile v1 and report success. `reload_scripts` is the wrapper
 //     that calls `load_source_code` first.
 //  2. The apply happens at a SAFE POINT the engine chooses, never where the
@@ -1796,7 +1796,7 @@ bool g_ct_in_safe_point = false;
 
 // `static_variables_indices` is private to GDScript and we are not a friend, so
 // the values are read through the public property surface —
-// `GDScript::_get_property_list` (gdscript.cpp:1048-1072) enumerates exactly
+// `GDScript::_get_property_list` (gdscript.cpp:1052-1076) enumerates exactly
 // the static variables of the script and its bases, and `GDScript::_get`
 // (:954-:1000) resolves them. That is the same surface `MyClass.my_static`
 // uses, so what is measured here is what the program itself would see.
@@ -1812,7 +1812,7 @@ void ct_collect_statics(const Ref<Script> &p_script, List<StringName> &r_names,
 		// Object/Resource/Script — `source_code`, `resource_path`, `script`,
 		// `script/source` — with `GDScript::_get_property_list`'s statics.
 		// Only the latter carry `PROPERTY_USAGE_SCRIPT_VARIABLE`
-		// (gdscript_compiler.cpp:2877, set on every script-declared variable
+		// (gdscript_compiler.cpp:2897, set on every script-declared variable
 		// before it is filed into `static_variables_indices`).
 		//
 		// This filter is here because its absence was CAUGHT, not anticipated:
@@ -1847,15 +1847,15 @@ void ct_collect_statics(const Ref<Script> &p_script, List<StringName> &r_names,
 // `source` member and then compiles into `this`, so it is unusable here.
 //
 // What IS used is the same pair `GDScript::reload()` itself uses, in the same
-// order, on a stack-local parser: `GDScriptParser::parse` (gdscript.cpp:816-820,
-// whose failure is the ERR_PARSE_ERROR at :822-830) then `GDScriptAnalyzer::
-// analyze` (:832-846, a second ERR_PARSE_ERROR). Both are run, because a file
+// order, on a stack-local parser: `GDScriptParser::parse` (gdscript.cpp:813-818,
+// whose failure is the ERR_PARSE_ERROR at :820-827) then `GDScriptAnalyzer::
+// analyze` (:830-844, a second ERR_PARSE_ERROR). Both are run, because a file
 // that tokenizes but does not resolve is just as unrunnable as one that does
 // not tokenize, and Godot names both the same way.
 //
 // GDScriptCompiler is deliberately NOT run. It compiles INTO a GDScript object,
 // which is precisely the installation this check exists to avoid; its own
-// failure mode is `ERR_COMPILATION_FAILED` (:862) and it is reached, on the
+// failure mode is `ERR_COMPILATION_FAILED` (:860) and it is reached, on the
 // real script, by `reload_scripts` at step 6. A compile error that the analyzer
 // does not catch therefore still reaches the engine — that residue is recorded
 // in the milestone rather than papered over here, because closing it means
@@ -1864,6 +1864,17 @@ void ct_collect_statics(const Ref<Script> &p_script, List<StringName> &r_names,
 //
 // Returns true when the content is a program. On false, `r_detail` names the
 // first error with its line, so the refusal is diagnosable from the wire.
+//
+// THE LINE FIELD IS `start_line`, NOT `line`, AND THE CHOICE IS THE ENGINE'S.
+// Godot 4.7 replaced `ParserError`'s `int line, column` with a SPAN —
+// `start_line`/`start_column`/`end_line`/`end_column` (gdscript_parser.h:263-278)
+// — so `.line` stopped compiling at the 4.7.2 rebase. `start_line` is not merely
+// the surviving spelling: it is the one `GDScript::reload()` itself passes to
+// `_err_print_error` in BOTH error branches (gdscript.cpp:825 and :840) and to
+// `debug_break_parse` (:822, :835). Reporting `end_line` here instead would put
+// a different line in this refusal's `detail` than in the engine's own "Parse
+// Error: … at res://<path>:NN" on the same failure, and GDH-M8b's gate reads
+// both — so the two must name one line, and it must be the engine's.
 bool ct_gdscript_content_compiles(const String &p_res_path,
 		const Vector<uint8_t> &p_content, String &r_detail) {
 	String source;
@@ -1877,7 +1888,7 @@ bool ct_gdscript_content_compiles(const String &p_res_path,
 		const List<GDScriptParser::ParserError>::Element *e = parser.get_errors().front();
 		r_detail = "the new content does not parse as GDScript";
 		if (e != nullptr) {
-			r_detail += ": line " + itos(e->get().line) + ": " + e->get().message;
+			r_detail += ": line " + itos(e->get().start_line) + ": " + e->get().message;
 		}
 		return false;
 	}
@@ -1888,7 +1899,7 @@ bool ct_gdscript_content_compiles(const String &p_res_path,
 		const List<GDScriptParser::ParserError>::Element *e = parser.get_errors().front();
 		r_detail = "the new content parses but does not analyze";
 		if (e != nullptr) {
-			r_detail += ": line " + itos(e->get().line) + ": " + e->get().message;
+			r_detail += ": line " + itos(e->get().start_line) + ": " + e->get().message;
 		}
 		return false;
 	}
@@ -1898,7 +1909,7 @@ bool ct_gdscript_content_compiles(const String &p_res_path,
 // GDH-M8b — CAPTURING THE COMPILER'S OWN MESSAGE.
 //
 // `GDScriptLanguage::reload_scripts` returns void and `GDScript::reload()`'s
-// `ERR_COMPILATION_FAILED` is dropped on the floor by it (gdscript.cpp:2511),
+// `ERR_COMPILATION_FAILED` is dropped on the floor by it (gdscript.cpp:2560),
 // so the only in-process statement that the compiler refused the new source is
 // `GDScript::is_valid()` going false. That answers WHETHER but not WHY, and a
 // refusal whose `detail` says only "it did not compile" is a code with no
@@ -1906,7 +1917,7 @@ bool ct_gdscript_content_compiles(const String &p_res_path,
 //
 // Godot does print the reason: `_err_print_error("GDScript::reload", path,
 // compiler.get_error_line(), "Compile Error: " + compiler.get_error(), false,
-// ERR_HANDLER_SCRIPT)` at gdscript.cpp:856. Every error handler on the engine's
+// ERR_HANDLER_SCRIPT)` at gdscript.cpp:854. Every error handler on the engine's
 // own list sees it, so one is installed for the duration of the swap and taken
 // off again immediately. Nothing is intercepted or suppressed: the handler
 // COPIES the first script-level error it sees and the normal printer still runs.
@@ -2471,8 +2482,8 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	// the engine went on running it from memory. The write is now step 6.
 	//
 	// Before GDH-M8 there was no compile step AT ALL. `reload_scripts` returns
-	// void (gdscript.h:633) and drops `GDScript::reload()`'s Error on the floor
-	// (gdscript.cpp:2511), so an unparseable v2 was written to disk, handed to
+	// void (gdscript.h:631) and drops `GDScript::reload()`'s Error on the floor
+	// (gdscript.cpp:2560), so an unparseable v2 was written to disk, handed to
 	// the engine, and acknowledged `applied` with a boundary marker and a fresh
 	// path version already in the container. `REPRO_HCR_RELOAD_REASON_PARSE_
 	// ERROR` had existed in the agent's vocabulary the whole time with zero
@@ -2557,7 +2568,7 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	// §8.1 STEP 6 — SWAP THE ENGINE'S SCRIPT RESOURCE.
 	//
 	// The bytes the notification carried become the bytes on disk, because
-	// `reload_scripts` re-reads from disk (gdscript.cpp:2509). Writing them
+	// `reload_scripts` re-reads from disk (gdscript.cpp:2558). Writing them
 	// here rather than trusting a path handle is §4.3's "content travels with
 	// the notification": a handle races the next edit.
 	// ---------------------------------------------------------------------
@@ -2573,8 +2584,8 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	// reliable statement of what the engine is running — `CT_GDH8_FALSIFY_WRITE_
 	// BEFORE_COMPILE` is a build in which it demonstrably is not — and the thing
 	// that has to be restored is the source the live `GDScript` object was
-	// compiled from. `GDScript::reload()` re-parses `source` (gdscript.cpp:820)
-	// and `reload_scripts` refills it from disk first (gdscript.cpp:2509), so
+	// compiled from. `GDScript::reload()` re-parses `source` (gdscript.cpp:818)
+	// and `reload_scripts` refills it from disk first (gdscript.cpp:2558), so
 	// writing this text back and re-running the same wrapper puts the engine
 	// where it was rather than somewhere merely similar.
 	String ct_gdh8_pre_swap_source;
@@ -2610,7 +2621,7 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 #if defined(CT_GDH5_FALSIFY_SCRIPT_RELOAD_ONLY)
 	// FALSIFIER ARM (gdh5_in_process_reload_matches_the_remote_debugger_path):
 	// call `GDScript::reload()` directly. It parses the IN-MEMORY `source`
-	// member (gdscript.cpp:820) and never re-reads disk, so the program keeps
+	// member (gdscript.cpp:818) and never re-reads disk, so the program keeps
 	// running v1 while every call reports success. This arm exists because
 	// `reload()` is the obvious-looking call and is the wrong one — the gate
 	// must go red by finding v1's tokens after the reload, measured against
@@ -2639,7 +2650,7 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	// cleanly. `GDScriptCompiler` cannot be run that way: `compile()` takes a
 	// `GDScript *` and writes into it — it clears the target's members, deletes
 	// its `GDScriptFunction`s, re-runs `_prepare_compilation` on its BASE script
-	// objects (gdscript_compiler.cpp:2794), pulls orphan subclasses out of
+	// objects (gdscript_compiler.cpp:2787), pulls orphan subclasses out of
 	// `GDScriptLanguage`'s global map (:3159) and can register the target in
 	// `GDScriptCache`'s static-script list (:3332). A "throwaway" GDScript is
 	// therefore not throwaway; giving it the real path collides in
@@ -2651,8 +2662,8 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	//
 	// So it is detected HERE, after the swap, and the state that produces is
 	// named rather than dressed up. `GDScript::reload()` sets `valid = false`
-	// before it parses (gdscript.cpp:814) and only sets it back on a clean
-	// compile, and `reload_scripts` drops the Error (gdscript.cpp:2511), so
+	// before it parses (gdscript.cpp:812) and only sets it back on a clean
+	// compile, and `reload_scripts` drops the Error (gdscript.cpp:2560), so
 	// `is_valid()` is the whole in-process signal.
 	//
 	// WHAT "RECOVERY" MEANS, PRECISELY. After a failed compile the engine is NOT
@@ -2857,7 +2868,7 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 				req.unpreserved.push_back("static-variable-removed:" + String(ne->get()));
 			} else if (now != be->get()) {
 				// §5.3: `_save_old_static_data` / `_restore_old_static_data` are
-				// TOOLS_ENABLED-only (gdscript.cpp:808-812, :892-901), so a
+				// TOOLS_ENABLED-only (gdscript.cpp:806-810, :890-899), so a
 				// `template_debug` build re-defaults every static through
 				// `_static_init()`. That is a real behavioural divergence from
 				// the editor and it is reported, never silently absorbed.

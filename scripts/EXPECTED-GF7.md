@@ -99,7 +99,7 @@ _process                       depth 0  parent -1 source gf_zoo.gd     -> true
 
 ## @abstract / _static_init availability (honest)
 
-Both ARE available in this Godot `4.6.2-stable` build (`@abstract` is a
+Both ARE available in this Godot `4.7.2-stable` build (`@abstract` is a
 registered SCRIPT|CLASS|FUNCTION annotation in `gdscript_parser.cpp`;
 `_static_init` / `static_initializer` exists in `gdscript.cpp`). So this
 milestone EXERCISES both — `Animal` is `@abstract` (never instantiated directly;

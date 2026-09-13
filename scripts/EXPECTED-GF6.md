@@ -23,11 +23,11 @@ coverage milestone:
    `function->call(nullptr, args, total_argcount, ...)` (line 120, or line 149
    for the no-capture branch), where `function` is the lambda's
    `GDScriptFunction*`. So the existing hooks all fire for a lambda frame:
-   - the G2 per-line step hook (`gdscript_vm.cpp:3928`),
-   - the G3 call-entry hook (`gdscript_vm.cpp:666`,
+   - the G2 per-line step hook (`gdscript_vm.cpp:3975`),
+   - the G3 call-entry hook (`gdscript_vm.cpp:676`,
      `gdscript_ct_trace_call(name, source, _initial_line)` — `name` is the
      function's `name` field = `<anonymous lambda>`),
-   - the G3+GF5 return hook on both exit paths (`:4025` / `:4049`,
+   - the G3+GF5 return hook on both exit paths (`:4089` / `:4089`,
      `gdscript_ct_trace_return(retvalue)`).
    So a lambda `.call(...)` records as a **nested call/return FRAME** named
    `<anonymous lambda>` with its **return value** captured — no new hook.
@@ -53,7 +53,7 @@ coverage milestone:
    hook captures by name.
 
 4. **Capture is BY VALUE.** `OPCODE_CREATE_LAMBDA` snapshots each capture with
-   `captures.write[i] = *arg` (`gdscript_vm.cpp:2700`) into the
+   `captures.write[i] = *arg` (`gdscript_vm.cpp:2744`) into the
    `GDScriptLambdaCallable`'s `Vector<Variant> captures`
    (`gdscript_lambda_callable.cpp:153`). Mutating the outer local afterwards does
    NOT change the snapshot. The fixture proves this: after `base = 999`, the

@@ -75,7 +75,7 @@ func extra(n: int) -> void:
 # THE DEFECT THIS FIXTURE EXISTS FOR — GDH-M8b.  It PARSES.  It ANALYZES.  The
 # COMPILER refuses it.
 #
-# `probe_v2_bad.gd`'s defect dies in `GDScriptParser::parse` (gdscript.cpp:816),
+# `probe_v2_bad.gd`'s defect dies in `GDScriptParser::parse` (gdscript.cpp:818),
 # which is why GDH-M8's pre-check can refuse it without installing anything: the
 # parser and the analyzer both run on a stack-local `GDScriptParser`.
 # `GDScriptCompiler` cannot be run that way — `compile()` writes into a
@@ -90,8 +90,8 @@ func extra(n: int) -> void:
 #             at: GDScript::reload (res://probe.gd:112)
 #
 # "Compile Error", not "Parse Error" — Godot prints the first at
-# gdscript.cpp:856 (after `ERR_COMPILATION_FAILED` at :862) and the second at
-# :827 and :842.  `verify_gdh8.py` re-measures exactly that distinction before
+# gdscript.cpp:854 (after `ERR_COMPILATION_FAILED` at :860) and the second at
+# :825 and :840.  `verify_gdh8.py` re-measures exactly that distinction before
 # it records anything, so this claim is the engine's and not this comment's.
 #
 # The construct: inside the getter of `gdh8_compiler_only_defect`, read the

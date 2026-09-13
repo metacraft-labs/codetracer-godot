@@ -84,6 +84,62 @@ SOCK_DIR="${GDH6_SOCKET_DIR:-${XDG_RUNTIME_DIR:-/tmp}}"
 
 failures=0
 
+# The plain engine is copied aside BEFORE any armed build, because an armed
+# build overwrites `bin/…hcr` in place. This byte-exact copy is what the exit
+# trap below restores from, and it doubles as the oracle for "is the engine in
+# the tree the plain one" — a question this campaign has repeatedly needed a
+# checkable answer to.
+# NOTE THE FILENAME, it is the whole point. `$OUT/godot-plain.hcr` is ALREADY
+# TAKEN in this driver: its first ASan build is LABELLED `plain` (meaning "ASan
+# but unmutated"), and `build_asan` copies that SANITIZED engine to
+# `$OUT/godot-$label.hcr`. A snapshot written there is overwritten by the first
+# build and the exit trap then "restores" a sanitized engine over the driver's
+# own correct un-sanitized rebuild — measured on 2026-09-13, which is how this
+# comment came to exist. The name below cannot collide with any `$label`.
+PLAIN="$OUT/godot-unsanitized-original.hcr"
+cp -f "$BIN" "$PLAIN" || die "could not copy the un-sanitized engine aside"
+
+# THE SHARED ARTIFACT IS PUT BACK ON EVERY EXIT PATH.
+#
+# `$BIN` lives in the DEVELOPER'S TREE and every armed build overwrites it in
+# place. Calling `restore_plain` on the normal path is not enough: a build
+# failure, a `die`, a Ctrl-C, or an outer timeout all returned with an ARMED
+# engine sitting at `$BIN`, where the next thing to run it — another gate,
+# another campaign, a person — silently gets a mutated engine and grades
+# against it. Mutating a shared artifact without restoring it AND verifying the
+# restore is precisely what this campaign's rules forbid; the same defect has
+# already been found once here, in the ASan driver.
+#
+# The restore is a COPY of the byte-exact saved engine rather than a rebuild,
+# so it cannot itself fail slowly, and it SAYS whether it worked.
+#
+# KNOWN RESIDUAL GAP, MEASURED 2026-09-13 — a trap alone does not close the
+# mid-rebuild case, and `record-and-verify-gdh8.sh`'s trap has it too. This
+# driver was killed by an outer 10-minute timeout during an armed build. `$BIN`
+# was still PLAIN at the moment of the kill and became ARMED one minute LATER,
+# because the orphaned `scons` outlived the shell and finished linking after
+# the handler had already run. Closing that needs the armed build started in
+# its own process group (`setsid`) and stopped by the handler before it copies;
+# that is a restructuring of the build invocations in three drivers and is left
+# as owed work rather than done blind. Until then the two oracles below are the
+# defence, and both are cheap: `$PLAIN` is a byte-exact comparison target, and
+# the patchable build is bit-reproducible (measured: two independent builds of
+# the same tree both sha256 3a97806f…), so `sha256sum` against a fresh build
+# also answers it.
+ct_gdh6_asan_restore_bin_on_exit() {
+  local rc=$?
+  if [[ -f "$PLAIN" ]] && ! cmp -s "$BIN" "$PLAIN"; then
+    if cp -f "$PLAIN" "$BIN"; then
+      echo "[gdh6-asan] restored the plain engine to $BIN on exit (it was armed)" >&2
+    else
+      echo "[gdh6-asan] WARNING: could NOT restore the plain engine to $BIN — an" \
+           "ARMED engine is left in the tree. Copy $PLAIN back by hand." >&2
+    fi
+  fi
+  exit $rc
+}
+trap ct_gdh6_asan_restore_bin_on_exit EXIT INT TERM
+
 build_asan() {  # build_asan <label> [falsify-define]
   local label="$1" falsify="${2:-}"
   CT_GDH6_ASAN=1 CT_GDH6_FALSIFY="$falsify" JOBS="$JOBS" \

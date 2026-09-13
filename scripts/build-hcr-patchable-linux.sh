@@ -14,6 +14,22 @@
 #   * no `.note.gnu.build-id` -> HLX-M1's mandatory verification refuses the
 #     object with `elf-build-id-absent`.
 #
+# RE-MEASURED at the 4.7.2 base (2026-09-13, 4.7.2.stable.custom_build, GCC
+# 15.3.0, 82 MB / 86,544,552 bytes): ALL THREE still hold, verbatim.
+# `scripts/verify_hcr_patchable.py` on the stock engine reports the same three
+# CHECK-FAILs (plus "cannot look for the agent: no .symtab"), `.dynsym` still
+# carries exactly **342** defined FUNC symbols, and `main` is still not one of
+# them. So the 4.7 series did not quietly start shipping any of what the
+# provider needs, and this profile is still doing real work.
+#
+# The patchable 4.7.2 engine that comes out of this script: 110,957,064 bytes,
+# `.symtab` with 206,879 symbols / 155,172 defined FUNC, 133,667
+# `__patchable_function_entries`, build-id present, no CET. Built twice from
+# the same tree and byte-identical both times
+# (sha256:3a97806fbdba60c3d299a9647c05a0d3710d591d9a380c5b56129be9cd13d63c) —
+# which is also how you tell a plain engine from one a falsifier arm left
+# behind. See `scripts/EXPECTED-GODOT-4.7.2-BASE.md`.
+#
 # This script builds the same engine with the three properties fixed. It is the
 # reproducible form of that recipe; see `hcr_patchable=yes` in the SConstruct.
 #

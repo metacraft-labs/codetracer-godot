@@ -74,7 +74,7 @@ func extra(n: int) -> void:
 
 # THE DEFECT THIS FIXTURE EXISTS FOR.  An unterminated parameter list: the
 # tokenizer reaches end-of-file inside `(`, so GDScriptParser::parse returns
-# ERR_PARSE_ERROR (gdscript.cpp:816-830) and no amount of analysis or
+# ERR_PARSE_ERROR (gdscript.cpp:820-827) and no amount of analysis or
 # compilation can rescue it.  Before GDH-M8 this file was written to disk,
 # handed to `reload_scripts`, and acknowledged `applied`.
 func gdh8_this_does_not_parse(
