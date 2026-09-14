@@ -118,18 +118,25 @@ if os.environ.get("CT_GDH6_ASAN", "") not in ("", "0"):
 #  --nimMainPrefix:codetracerTraceWriter --passC:-fPIC -p:src`), run inside
 # that repo's `nix develop` shell so libzstd's headers resolve.
 #
-# KNOWN GAP, GDH-M3 (2026-09-10): `ct_writer/libcodetracer_trace_writer.a`,
-# the macOS-arm64 fallback, is STALE. GDH-M3 added entry points that
-# gdscript_ct_trace.cpp now calls unconditionally — `trace_writer_current_path_id`
-# and `trace_writer_register_path_version` among them — and only the
-# `linuxbsd-x86_64/` archive was refreshed, because the milestone ran on a
-# Linux host and a macOS archive can only be produced on macOS. A macOS build
-# of this fork therefore FAILS TO LINK with undefined symbols for those names.
-# The fix is not a code change: regenerate the archive from
-# codetracer-trace-format-nim (`just build`) on a macOS arm64 host and replace
-# this file. `scripts/verify-gdh3-fork.sh` re-checks the exported symbols of
-# BOTH archives on every run and reports this by name rather than skipping it,
-# so the gap stays visible until it is closed.
+# RESOLVED, HX-D-0 (2026-09-14): `ct_writer/libcodetracer_trace_writer.a`,
+# the macOS-arm64 fallback archive, was regenerated on a macOS arm64 host
+# from codetracer-trace-format-nim using:
+#   nix develop --command just build-static-lib
+# (which executes: `nim c --app:staticlib --mm:arc --noMain -d:release
+#   --nimMainPrefix:codetracerTraceWriter --passC:"-fPIC" -p:src
+#   -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim`).
+# The regenerated archive exports all required entry points (including
+# `trace_writer_current_path_id`, `trace_writer_register_path_version`,
+# `trace_writer_set_recording_id`, `trace_writer_enable_line_count_table`,
+# `trace_writer_register_path_with_line_count`, `trace_writer_clear_last_error`),
+# matching the exported symbol set of the Linux archive.
+# Provenance and rebuild procedure:
+# If this archive ever becomes stale relative to codetracer-trace-format-nim,
+# run on a macOS arm64 host:
+#   cd ../codetracer-trace-format-nim && nix develop --command just build-static-lib
+#   cp libcodetracer_trace_writer.a ../codetracer-engine-godot/modules/gdscript/ct_writer/
+# `scripts/verify-gdh3-fork.sh` actively guards this archive with an
+# anti-vacuity floor check and fails if any required entry point is missing.
 env_gdscript.Prepend(CPPPATH=[Dir("ct_writer/include").srcnode()])
 _ct_writer_dir = Dir("ct_writer").srcnode()
 _ct_writer_arch_dir = Dir("ct_writer/%s-%s" % (env["platform"], env["arch"])).srcnode()

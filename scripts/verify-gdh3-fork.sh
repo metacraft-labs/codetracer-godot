@@ -35,12 +35,14 @@ HDR=modules/gdscript/ct_writer/include/codetracer_trace_writer.h
 ARCH_DIR=modules/gdscript/ct_writer/linuxbsd-x86_64
 LIB="$ARCH_DIR/libcodetracer_trace_writer.a"
 
+FALLBACK=modules/gdscript/ct_writer/libcodetracer_trace_writer.a
+
 fails=0
 checks=0
 ck_fail() { echo "GDH3-FORK-FAIL: $*" >&2; fails=$((fails + 1)); }
 ck() { checks=$((checks + 1)); }
 
-for f in "$SRC" "$HDR" "$LIB"; do
+for f in "$SRC" "$HDR" "$LIB" "$FALLBACK"; do
   [[ -e "$f" ]] || { echo "GDH3-FORK-FAIL: $f is missing" >&2; exit 1; }
 done
 
@@ -134,7 +136,8 @@ echo "== 5. the vendored archive EXPORTS them =="
 # depending on whether nm had finished writing. That is a harness that
 # reports a state it did not reach, and it bit this very script once.
 NMOUT="$(mktemp)"
-trap 'rm -f "$NMOUT"' EXIT
+FBOUT="$(mktemp)"
+trap 'rm -f "$NMOUT" "$FBOUT"' EXIT
 nm "$LIB" >"$NMOUT" 2>/dev/null
 ck
 if [[ ! -s "$NMOUT" ]]; then
@@ -161,26 +164,75 @@ to the vendored header: refresh both from codetracer-trace-format-nim with
 done
 echo "   archive exports 5 entry points"
 
-echo "== 6. the OTHER vendored archive, which this host cannot refresh =="
+echo "== 6. the OTHER vendored archive (macOS-arm64 fallback) =="
 # `modules/gdscript/SCsub` prefers `ct_writer/<platform>-<arch>/` when it
 # exists and falls back to `ct_writer/` — which holds the macOS-arm64 build.
-# This host can only rebuild the Linux one, so the macOS archive is now STALE
-# against the header both platforms share. Reported, not skipped: a check that
-# quietly ignores the platform it cannot test is how a rollout misses one.
-FALLBACK=modules/gdscript/ct_writer/libcodetracer_trace_writer.a
-if [[ -f "$FALLBACK" ]]; then
-  FBOUT="$(mktemp)"
-  nm "$FALLBACK" >"$FBOUT" 2>/dev/null
-  if grep -qE " (T|D) _?trace_writer_current_path_id\$" "$FBOUT"; then
+# On macOS arm64, this archive IS what the build links against, so missing
+# entry points cause a link failure. On a host that cannot refresh it (Linux),
+# it continues to report and pass. Anti-vacuity refuses to draw any conclusion
+# from an empty or unparsed symbol dump.
+
+HOST_OS="$(uname -s)"
+HOST_ARCH="$(uname -m)"
+IS_MACOS_ARM64=false
+if [[ "$HOST_OS" == "Darwin" && "$HOST_ARCH" == "arm64" ]]; then
+  IS_MACOS_ARM64=true
+fi
+
+NM_FALLBACK="nm"
+if [[ "$HOST_OS" == "Darwin" ]] && [[ -x /usr/bin/nm ]]; then
+  NM_FALLBACK="/usr/bin/nm"
+elif command -v llvm-nm >/dev/null 2>&1; then
+  NM_FALLBACK="llvm-nm"
+fi
+
+$NM_FALLBACK "$FALLBACK" >"$FBOUT"
+n_fb_tw=$(grep -cE ' (T|D) _?trace_writer_' "$FBOUT" 2>/dev/null || true)
+
+if [[ "$IS_MACOS_ARM64" == "true" ]]; then
+  # On macOS arm64, anti-vacuity guard and required entry points check:
+  ck
+  if [[ ! -s "$FBOUT" ]]; then
+    ck_fail "$NM_FALLBACK produced NO output for $FALLBACK; every symbol check below would
+report 'absent' over an empty haystack"
+  fi
+  ck
+  if [[ "$n_fb_tw" -lt 40 ]]; then
+    ck_fail "only $n_fb_tw trace_writer_* symbols found in $FALLBACK (expected >= 40); archive reader is blind or format not parsed"
+  fi
+
+  for sym in trace_writer_enable_line_count_table \
+             trace_writer_register_path_with_line_count \
+             trace_writer_register_path_version \
+             trace_writer_current_path_id \
+             trace_writer_clear_last_error \
+             trace_writer_set_recording_id ; do
+    ck
+    if ! grep -qE " (T|D) _?$sym\$" "$FBOUT"; then
+      ck_fail "$FALLBACK does not export $sym. The vendored macOS-arm64 archive is stale
+relative to the vendored header: refresh from codetracer-trace-format-nim with
+\`nix develop --command just build-static-lib\`"
+    fi
+  done
+  if [[ $fails -eq 0 ]]; then
+    echo "   macOS-arm64 archive exports all required entry points ($n_fb_tw trace_writer_* symbols verified)"
+  fi
+else
+  # On non-macOS hosts (e.g. Linux), report without failing since host cannot rebuild:
+  if [[ ! -s "$FBOUT" || "$n_fb_tw" -lt 40 ]]; then
+    echo "   NOTE (not a failure on this host): $NM_FALLBACK produced no usable symbol dump for $FALLBACK."
+    echo "   Mach-O archive inspection is unsupported on $HOST_OS $HOST_ARCH without a cross-target reader."
+  elif grep -qE " (T|D) _?trace_writer_current_path_id\$" "$FBOUT" && \
+       grep -qE " (T|D) _?trace_writer_register_path_version\$" "$FBOUT" && \
+       grep -qE " (T|D) _?trace_writer_set_recording_id\$" "$FBOUT"; then
     echo "   fallback archive also exports the new entry points"
   else
     echo "   NOTE (not a failure on this host): $FALLBACK does NOT export"
-    echo "   trace_writer_current_path_id. It is the macOS-arm64 build and can"
+    echo "   the required entry points. It is the macOS-arm64 build and can"
     echo "   only be refreshed on a macOS host. A macOS build of the fork will"
     echo "   FAIL TO LINK until it is regenerated from"
-    echo "   codetracer-trace-format-nim with \`just build\`."
+    echo "   codetracer-trace-format-nim with \`nix develop --command just build-static-lib\`."
   fi
-  rm -f "$FBOUT"
 fi
 
 echo
@@ -192,10 +244,19 @@ if [[ $fails -ne 0 ]]; then
 fi
 # The count is written from a run, not read off the source (trap 4c): a check
 # that skipped a loop iteration cannot reach the end with the right number.
-if [[ $checks -ne 22 ]]; then
-  echo "GDH3-FORK-FAIL: ran $checks checks, expected 22. A count that moved" >&2
+expected_checks=22
+if [[ "$IS_MACOS_ARM64" == "true" ]]; then
+  expected_checks=30
+fi
+if [[ $checks -ne $expected_checks ]]; then
+  echo "GDH3-FORK-FAIL: ran $checks checks, expected $expected_checks. A count that moved" >&2
   echo "means a check was skipped or added; reconcile it deliberately." >&2
   exit 1
 fi
-echo "GDH-M3 (fork side): the mirror is gone, the bundler asks the writer,"
-echo "                    and the vendored header + Linux archive can answer."
+if [[ "$IS_MACOS_ARM64" == "true" ]]; then
+  echo "GDH-M3 (fork side): the mirror is gone, the bundler asks the writer,"
+  echo "                    and the vendored header + macOS archive can answer."
+else
+  echo "GDH-M3 (fork side): the mirror is gone, the bundler asks the writer,"
+  echo "                    and the vendored header + Linux archive can answer."
+fi
