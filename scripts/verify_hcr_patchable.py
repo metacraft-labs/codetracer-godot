@@ -4,10 +4,14 @@
 Reprobuild's Linux ELF HCR provider (HLX-M0/M1) accepts a target only if three
 independent properties hold, and each one fails differently:
 
-  1. ``__patchable_function_entries`` exists, is SHF_ALLOC (the provider finds
-     it at runtime through the linker-synthesised ``__start_``/``__stop_``
-     symbols, which only exist for an allocated section), and its entries point
-     at real NOP sleds -> otherwise every request is refused ``absent-sled``.
+  1. ``__patchable_function_entries`` exists, is SHF_ALLOC (so the dynamic
+     loader maps AND relocates it, which is what makes its entries hold runtime
+     addresses), and its entries point at real NOP sleds -> otherwise every
+     request is refused ``absent-sled``. Since HLX-M2 the provider locates that
+     section PER LOADED OBJECT through ``dl_iterate_phdr`` plus the object's own
+     section headers; it no longer reads the linker-synthesised
+     ``__start_``/``__stop_`` symbols, and their absence is now the expected
+     shape rather than a failure. See ``check_sleds``.
   2. ``.symtab`` exists and covers the binary's functions -> otherwise the
      resolver falls back to ``.dynsym`` and refuses ``elf-symbol-not-found``
      for everything that is not exported.
@@ -270,7 +274,31 @@ def check_sleds(elf: Elf64, sample: int, expect_nops: int) -> None:
     )
     NOTES.append(f"sled_entries={count}")
 
-    # The provider needs the __start_/__stop_ pair to exist as real symbols.
+    # The `__start_`/`__stop_` pair: RECORDED, no longer REQUIRED (HLX-M2).
+    #
+    # HLX-M0 read the sled table through the linker-synthesised
+    # `__start___patchable_function_entries` / `__stop___patchable_function_entries`
+    # symbols, so this check demanded them. Those symbols name exactly ONE
+    # object's section — whichever image the agent's own translation unit was
+    # linked into — which is why a function inside a `dlopen`'d shared library
+    # resolved and then refused `absent-sled`. HLX-M2 closed that by discovering
+    # the section PER LOADED OBJECT (`dl_iterate_phdr` for the load bias, the
+    # object's own file for `sh_addr`/`sh_size`, the build-id to tie the two
+    # together) and DELETED the externs. The linker only synthesises
+    # `__start_X`/`__stop_X` when something references them, so they now vanish
+    # from correctly-built engines.
+    #
+    # Requiring them here therefore reported `NOT PATCHABLE-SHAPED` for every
+    # current engine, with a fully present sled table and a linked agent sitting
+    # right above the failure — a permanently-red check that reads as a broken
+    # engine. Worse, their PRESENCE would now be the suspicious result: it means
+    # something still references the retired mechanism.
+    #
+    # This is `codetracer-specs/Testing/Verification-Harness-Traps.md` trap 10 on
+    # the check side — an assertion that was correct when written and stopped
+    # describing its subject when the subject grew a different path to the same
+    # observable. The measurement is kept, because "which mechanism located the
+    # sleds" is worth knowing; the verdict is not, because it no longer follows.
     symtab = elf.by_name.get(".symtab")
     if symtab is not None:
         wanted = {
@@ -278,11 +306,29 @@ def check_sleds(elf: Elf64, sample: int, expect_nops: int) -> None:
             "__stop___patchable_function_entries",
         }
         found = {n for n, _t, _b, sh, _v, _s in elf.symbols(symtab) if n in wanted and sh != 0}
-        missing = wanted - found
-        if missing:
-            fail(f"linker did not synthesise: {sorted(missing)}")
+        if found == wanted:
+            ok(
+                "__start___patchable_function_entries / __stop___ both defined "
+                "(pre-HLX-M2 shape; not required — the provider no longer reads them)"
+            )
+            NOTES.append("start_stop_symbols=present")
+        elif not found:
+            ok(
+                "__start___patchable_function_entries / __stop___ absent, as "
+                "expected since HLX-M2: the provider discovers the section per "
+                "loaded object via dl_iterate_phdr, so nothing references them "
+                "and the linker does not synthesise them"
+            )
+            NOTES.append("start_stop_symbols=absent-post-m2")
         else:
-            ok("__start___patchable_function_entries / __stop___ both defined")
+            # Neither shape. One half present is not a state either mechanism
+            # produces, so it is reported as the anomaly it is rather than
+            # folded into one of the two expected answers.
+            fail(
+                f"exactly one of the __start_/__stop_ pair is defined "
+                f"({sorted(found)}); neither the pre-HLX-M2 shape (both) nor "
+                f"the post-HLX-M2 shape (neither)"
+            )
 
     # Now the part that actually matters: the BYTES the entries point at.
     entries = struct.unpack_from(f"<{count}Q", elf.data, section.offset)
