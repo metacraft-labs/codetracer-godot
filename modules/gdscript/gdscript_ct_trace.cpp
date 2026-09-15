@@ -2047,8 +2047,13 @@ void ct_close_trace_with_reason(const String &p_stage, const String &p_detail) {
 #else
 	if (g_ct_writer != nullptr) {
 		CharString meta_cs = p_stage.utf8();
-		CharString content_cs = ("codetracer: the recording was closed at design "
-								 "§8.1 stage " + p_stage +
+		// Milestone HX-S-9: Godot's String(const char *) and operator+(const char *, String)
+		// call append_latin1 (ustring.h:677, :711), widening each byte to a codepoint.
+		// UTF-8 '§' (0xC2 0xA7) becomes U+00C2 U+00A7 and .utf8() re-encodes it as 'Â§'.
+		// We explicitly wrap non-ASCII literals in String::utf8(...) to ensure cleanly
+		// encoded UTF-8 in the container's FFI_EVENT_ERROR record without 'Â'.
+		CharString content_cs = (String::utf8("codetracer: the recording was closed at design "
+								 "§8.1 stage ") + p_stage +
 				" because the reload could not be completed coherently: " +
 				p_detail).utf8();
 		trace_writer_register_special_event(g_ct_writer, FFI_EVENT_ERROR,
@@ -2114,7 +2119,10 @@ bool ct_reload_fail_after_registration(CtReloadRequest &req, const String &p_sta
 	}
 	req.applied = false;
 	req.reason = p_reason;
-	req.detail = "design §8.1 step " + p_stage +
+	// Milestone HX-S-9: String(const char *) is Latin-1, not UTF-8 (ustring.h:677, :688-691).
+	// Wrap non-ASCII literals in String::utf8(...) so req.detail carries
+	// clean UTF-8 '§' (0xC2 0xA7) rather than double-encoded 'Â§' on the wire.
+	req.detail = String::utf8("design §8.1 step ") + p_stage +
 			" failed after the trace had committed to the new version, so the "
 			"recording was closed rather than continued: " +
 			p_detail;
@@ -2175,7 +2183,7 @@ bool ct_reload_emit_marker_locked(CtReloadRequest &req, uint64_t p_old_id,
 #else
 	if (ct_gdh8_inject_at("marker")) {
 		if (ct_reload_fail_after_registration(req, "5 (emit the boundary marker)",
-					"injected failure at §8.1 step 5")) {
+					String::utf8("injected failure at §8.1 step 5"))) {
 			return false;
 		}
 		return true; // falsifier arm only: no marker, and the reload proceeds
@@ -2574,7 +2582,7 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	// ---------------------------------------------------------------------
 	if (ct_gdh8_inject_at("swap") &&
 			ct_reload_fail_after_registration(req, "6 (swap the engine's script)",
-					"injected failure at §8.1 step 6")) {
+					String::utf8("injected failure at §8.1 step 6"))) {
 		return;
 	}
 	// GDH-M8b. THE TEXT THE ENGINE IS ACTUALLY RUNNING, taken before anything is
