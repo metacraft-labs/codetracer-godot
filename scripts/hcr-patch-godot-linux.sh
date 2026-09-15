@@ -156,7 +156,26 @@ log "building the coordinator driver"
 [[ -x "$DRIVER" ]] || die "driver missing after build: $DRIVER"
 
 # --- run --------------------------------------------------------------------
-SOCK="$OUT/hcr1.sock"
+# AF_UNIX caps a socket path at 108 bytes including the NUL, in the kernel. A
+# caller that puts its output under a deep directory gets "socket path too
+# long" out of the driver and "the driver never created the socket" out of this
+# script -- neither of which names the cause or the remedy. Measured on an
+# output directory 92 characters deep.
+#
+# THE FALLBACK IS LENGTH-CHECKED TOO. The first version reached for $TMPDIR
+# without measuring it, and inside `nix develop` TMPDIR is itself a nested
+# per-shell directory -- so on a host whose TMPDIR is already deep the
+# replacement came to 115 bytes, over the same limit, and produced the exact
+# "driver never created the socket" failure this block exists to prevent.
+SOCK=""
+for cand in "$OUT/hcr1.sock" "${TMPDIR:-/tmp}/hcr1-$$.sock" "/tmp/hcr1-$$.sock"; do
+	if [[ "${#cand}" -lt 100 ]]; then SOCK="$cand"; break; fi
+done
+[[ -n "$SOCK" ]] \
+	|| die "every candidate socket path is past the AF_UNIX 108-byte kernel limit (tried \$OUT, \$TMPDIR and /tmp); use a shorter output directory"
+if [[ "$SOCK" != "$OUT/hcr1.sock" ]]; then
+	log "the socket path under \$OUT is past the AF_UNIX 108-byte limit; using $SOCK instead"
+fi
 RUN_LOG="$OUT/engine.log"
 # The driver polls this file for the marker, so it must exist before the driver
 # starts; otherwise the first few polls read a missing file rather than an empty

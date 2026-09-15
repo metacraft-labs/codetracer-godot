@@ -56,11 +56,22 @@
 #   REPROBUILD_DIR  path to the reprobuild checkout (default: ../reprobuild)
 #   JOBS            parallelism (default: nproc-4, floor 1)
 #   BUILD_LOG       log file (default: <mktemp>)
+#   EXTRA_SUFFIX    scons `extra_suffix` (default `hcr`). scons keys its object
+#                   files by this, so two suffixes share NO objects and building
+#                   one cannot touch the other's binary — which is the only
+#                   reason a second patchable engine can be built beside a
+#                   recorded one without invalidating its sha256.
+#   VULKAN          `yes` to build a RENDERING patchable engine (default `no`).
+#                   The default engine is headless-only and refuses
+#                   `--rendering-driver vulkan`; the rendered HCR arms need
+#                   `VULKAN=yes EXTRA_SUFFIX=hcrgpu`.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPROBUILD_DIR="${REPROBUILD_DIR:-$(cd "$REPO/.." && pwd)/reprobuild}"
 JOBS="${JOBS:-$(( $(nproc) > 5 ? $(nproc) - 4 : 1 ))}"
+EXTRA_SUFFIX="${EXTRA_SUFFIX:-hcr}"
+VULKAN="${VULKAN:-no}"
 
 log() { printf '[hcr-build] %s\n' "$*"; }
 die() { printf '[hcr-build] FATAL: %s\n' "$*" >&2; exit 1; }
@@ -127,20 +138,20 @@ START="$(date +%s)"
 		exec scons -j"$1" \
 			platform=linuxbsd target=template_debug arch=x86_64 \
 			module_gdscript_enabled=yes \
-			vulkan=no opengl3=no \
+			vulkan="$2" opengl3=no \
 			disable_path_overrides=no \
 			hcr_patchable=yes \
-			extra_suffix=hcr \
+			extra_suffix="$3" \
 			import_env_vars="$vars" \
-			"${@:2}"
-	' -- "$JOBS" "$@"
+			"${@:4}"
+	' -- "$JOBS" "$VULKAN" "$EXTRA_SUFFIX" "$@"
 )
 RC=$?
 END="$(date +%s)"
 log "scons exit: $RC; wall time: $(( END - START ))s"
 [[ "$RC" -eq 0 ]] || exit "$RC"
 
-BIN="$REPO/bin/godot.linuxbsd.template_debug.x86_64.hcr"
+BIN="$REPO/bin/godot.linuxbsd.template_debug.x86_64.$EXTRA_SUFFIX"
 [[ -x "$BIN" ]] || die "scons succeeded but $BIN is missing"
 log "built $BIN ($(stat -c%s "$BIN") bytes)"
 
