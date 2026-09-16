@@ -181,7 +181,7 @@ opts.Add(
     BoolVariable(
         "hcr_patchable",
         "Build an engine the CodeTracer HCR provider can hot-patch "
-        "(NOP sleds, aligned functions, build-id note, unstripped .symtab). "
+        "(platform entry geometry plus matching symbols/debug identity). "
         "Requires HCR_PATCHABLE_CCFLAGS/HCR_PATCHABLE_LINKFLAGS in the environment.",
         False,
     )
@@ -679,8 +679,24 @@ if env["hcr_patchable"]:
         )
         Exit(255)
     print(f"HCR patchable profile: CCFLAGS={hcr_ccflags} LINKFLAGS={hcr_linkflags}")
+    if env["platform"] == "windows" and not env["debug_symbols"]:
+        print(
+            "ERROR: the Windows HCR profile requires debug_symbols=yes so the "
+            "linked PE keeps the full PDB whose CodeView identity the provider "
+            "validates. Refusing a /DEBUG:NONE override."
+        )
+        Exit(255)
     env.Append(CCFLAGS=hcr_ccflags)
     env.Append(LINKFLAGS=hcr_linkflags)
+
+    # Windows' canonical provider is a DLL because the same artifact must also
+    # support external attach. A recorded stage0 process cannot safely run a
+    # raw CreateRemoteThread(LoadLibraryW): that thread bypasses the recorder's
+    # in-process thread wrapper and therefore has no recorder TLS. Let the
+    # patchable engine load the exact same DLL from its registered main thread
+    # when REPRO_HCR_AGENT_DLL is configured. Ordinary runs remain inert.
+    if env["platform"] == "windows":
+        env.Append(CPPDEFINES=["CT_HCR_WINDOWS_AGENT_LOADER"])
 
     # The HCR agent is a LIBRARY LINKED INTO THE TARGET, not a debugger that
     # attaches from outside: `repro_hcr_agent_start_from_env` reads

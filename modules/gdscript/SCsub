@@ -140,16 +140,34 @@ if os.environ.get("CT_GDH6_ASAN", "") not in ("", "0"):
 env_gdscript.Prepend(CPPPATH=[Dir("ct_writer/include").srcnode()])
 _ct_writer_dir = Dir("ct_writer").srcnode()
 _ct_writer_arch_dir = Dir("ct_writer/%s-%s" % (env["platform"], env["arch"])).srcnode()
-if os.path.exists(os.path.join(str(_ct_writer_arch_dir), "libcodetracer_trace_writer.a")):
+_ct_writer_archive = (
+    "codetracer_trace_writer.lib"
+    if env["platform"] == "windows"
+    else "libcodetracer_trace_writer.a"
+)
+if os.path.exists(os.path.join(str(_ct_writer_arch_dir), _ct_writer_archive)):
     _ct_writer_dir = _ct_writer_arch_dir
-env.Append(LIBPATH=[_ct_writer_dir])
-env.Append(LIBS=["codetracer_trace_writer"])
+_ct_writer_archive_path = os.path.join(str(_ct_writer_dir), _ct_writer_archive)
+if not os.path.exists(_ct_writer_archive_path):
+    raise RuntimeError(
+        "missing CodeTracer trace writer archive for %s-%s: %s"
+        % (env["platform"], env["arch"], _ct_writer_archive_path)
+    )
+# Pass an exact file node. A bare library name inherits Godot's extra suffix
+# and would incorrectly rename this prebuilt dependency in custom variants.
+env.Append(LIBS=[File(_ct_writer_archive_path)])
 # Runtime deps the Nim/arc static lib pulls in:
 if env["platform"] in ["linuxbsd", "android"]:
     env.Append(LIBS=["zstd", "m", "pthread"])
 elif env["platform"] == "macos":
     env.Append(LIBS=["zstd"])
     env.Append(LINKFLAGS=["-framework", "Security", "-framework", "CoreFoundation"])
+elif env["platform"] == "windows":
+    # The vendored writer is compiled with Nim's MSVC backend. Its zstd
+    # bindings use this matching MSVC archive rather than the incompatible
+    # MinGW archive used by GCC-hosted Windows builds.
+    env.Append(LIBS=[File("C:/zstd/lib/zstd.lib")])
+    env.Append(LINKFLAGS=["bcrypt.lib"])
 
 env_gdscript.add_source_files(env.modules_sources, "*.cpp")
 

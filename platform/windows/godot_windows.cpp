@@ -34,6 +34,41 @@
 #include "main/main.h"
 
 #include <clocale>
+#include <cstdio>
+
+#if defined(CT_HCR_WINDOWS_AGENT_LOADER)
+typedef DWORD(WINAPI *ReproHcrWindowsBootstrapProc)(void *);
+
+static bool start_repro_hcr_windows_agent_from_env() {
+	wchar_t agent_path[32768];
+	const DWORD capacity = DWORD(sizeof(agent_path) / sizeof(agent_path[0]));
+	const DWORD length = GetEnvironmentVariableW(L"REPRO_HCR_AGENT_DLL", agent_path, capacity);
+	if (length == 0) {
+		return true;
+	}
+	if (length >= capacity) {
+		fprintf(stderr, "[ct-hcr] REPRO_HCR_AGENT_DLL exceeds the Windows path buffer\n");
+		return false;
+	}
+	HMODULE agent = LoadLibraryW(agent_path);
+	if (agent == nullptr) {
+		fprintf(stderr, "[ct-hcr] LoadLibraryW(REPRO_HCR_AGENT_DLL) failed: %lu\n", (unsigned long)GetLastError());
+		return false;
+	}
+	auto bootstrap = reinterpret_cast<ReproHcrWindowsBootstrapProc>(
+			GetProcAddress(agent, "ReproHcrWindowsBootstrap"));
+	if (bootstrap == nullptr) {
+		fprintf(stderr, "[ct-hcr] agent lacks ReproHcrWindowsBootstrap\n");
+		return false;
+	}
+	const DWORD result = bootstrap(nullptr);
+	fprintf(stderr,
+			"[ct-hcr] Windows agent start rc=%lu module=%p main_thread=%lu\n",
+			(unsigned long)result, static_cast<void *>(agent),
+			(unsigned long)GetCurrentThreadId());
+	return result == 0;
+}
+#endif
 
 // For export templates, add a section; the exporter will patch it to enclose
 // the data appended to the executable (bundled PCK).
@@ -100,6 +135,21 @@ int widechar_main(int argc, wchar_t **argv) {
 		}
 		return EXIT_FAILURE;
 	}
+
+#if defined(CT_HCR_WINDOWS_AGENT_LOADER)
+	// Main::setup has initialized the platform and the recorder has registered
+	// this thread, while Main::start has not launched the project yet. Loading
+	// here keeps the agent outside loader lock and makes its pipe worker pass
+	// through the recorder's normal in-process thread-registration path.
+	if (!start_repro_hcr_windows_agent_from_env()) {
+		for (int i = 0; i < argc; ++i) {
+			delete[] argv_utf8[i];
+		}
+		delete[] argv_utf8;
+		Main::cleanup();
+		return EXIT_FAILURE;
+	}
+#endif
 
 	if (Main::start() == EXIT_SUCCESS) {
 		os.run();
