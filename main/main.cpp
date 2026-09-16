@@ -2826,6 +2826,14 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 		audio_driver_idx = 0;
 	}
 
+#ifdef CT_HCR_WINDOWS_RECORDING_PROFILE
+	// The HCR recording workload has no audible observation. Keep the real
+	// AudioServer available, but do not let the dummy driver's background mixer
+	// dominate the production atomic trace before the scene reaches frame 1.
+	audio_driver_idx = AudioDriverManager::get_driver_count() - 1;
+	AudioDriverDummy::get_dummy_singleton()->set_use_threads(false);
+#endif
+
 	if (Engine::get_singleton()->get_write_movie_path() != String()) {
 		// Always use dummy driver for audio driver (which is last), also in no threaded mode.
 		audio_driver_idx = AudioDriverManager::get_driver_count() - 1;

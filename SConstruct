@@ -186,6 +186,14 @@ opts.Add(
         False,
     )
 )
+opts.Add(
+    BoolVariable(
+        "hcr_recording_profile",
+        "Build the Windows HCR recording runtime without the unobserved "
+        "dummy-audio mixer thread. Requires hcr_patchable=yes on Windows.",
+        False,
+    )
+)
 opts.Add(BoolVariable("debug_paths_relative", "Make file paths in debug symbols relative (if supported)", False))
 opts.Add(
     EnumVariable(
@@ -719,6 +727,15 @@ if env["hcr_patchable"]:
         env.Append(CPPPATH=[os.path.dirname(env["hcr_agent_source"])])
 else:
     env["hcr_agent_source"] = ""
+
+if env["hcr_recording_profile"]:
+    if not env["hcr_patchable"] or env["platform"] != "windows":
+        print(
+            "ERROR: hcr_recording_profile=yes is specific to the patchable "
+            "Windows recording runtime. Set platform=windows and hcr_patchable=yes."
+        )
+        Exit(255)
+    env.Append(CPPDEFINES=["CT_HCR_WINDOWS_RECORDING_PROFILE"])
 
 # Feature build profile
 env.disabled_classes = []

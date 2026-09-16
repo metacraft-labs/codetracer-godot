@@ -64,7 +64,7 @@ def main() -> int:
         action="store_true",
         help=(
             "build the HWG-M5 runtime: no Vulkan/glslang or unused GUI, "
-            "physics, navigation, and XR subsystems"
+            "physics, navigation, XR, or background audio mixing"
         ),
     )
     parser.add_argument("scons_args", nargs="*")
@@ -167,6 +167,7 @@ def main() -> int:
                 "disable_navigation_2d=yes",
                 "disable_navigation_3d=yes",
                 "disable_xr=yes",
+                "hcr_recording_profile=yes",
             ]
         )
     if vulkan == "yes":
@@ -203,6 +204,7 @@ def main() -> int:
                 "runtimeProfile": (
                     "recording-headless" if args.recording_headless else "rendering"
                 ),
+                "audioThreaded": not args.recording_headless,
                 "target": args.target,
             }
         )
