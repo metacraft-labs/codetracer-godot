@@ -49,7 +49,24 @@ def main() -> int:
     )
     parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     parser.add_argument("--suffix", default="hcrwin")
+    parser.add_argument(
+        "--target",
+        choices=("template_debug", "template_release"),
+        default="template_debug",
+        help=(
+            "Godot runtime profile. Both variants retain the full PDB and "
+            "consume the same Windows HCR patchability profile."
+        ),
+    )
     parser.add_argument("--vulkan", choices=("yes", "no"), default="yes")
+    parser.add_argument(
+        "--recording-headless",
+        action="store_true",
+        help=(
+            "build the HWG-M5 runtime: no Vulkan/glslang or unused GUI, "
+            "physics, navigation, and XR subsystems"
+        ),
+    )
     parser.add_argument("scons_args", nargs="*")
     args = parser.parse_args()
     if sys.platform != "win32":
@@ -115,16 +132,17 @@ def main() -> int:
             "SCons is unavailable. Install the Godot build dependency with "
             f"'{sys.executable} -m pip install scons'."
         )
+    vulkan = "no" if args.recording_headless else args.vulkan
     command.extend(
         [
             f"-j{args.jobs}",
             "platform=windows",
-            "target=template_debug",
+            f"target={args.target}",
             "arch=x86_64",
             "debug_symbols=yes",
             "hcr_patchable=yes",
             f"extra_suffix={args.suffix}",
-            f"vulkan={args.vulkan}",
+            f"vulkan={vulkan}",
             "opengl3=no",
             "d3d12=no",
             "winrt=no",
@@ -138,14 +156,33 @@ def main() -> int:
             "modules_enabled_by_default=no",
             "module_gdscript_enabled=yes",
             "disable_path_overrides=no",
-            *args.scons_args,
         ]
     )
+    if args.recording_headless:
+        command.extend(
+            [
+                "disable_advanced_gui=yes",
+                "disable_physics_2d=yes",
+                "disable_physics_3d=yes",
+                "disable_navigation_2d=yes",
+                "disable_navigation_3d=yes",
+                "disable_xr=yes",
+            ]
+        )
+    if vulkan == "yes":
+        # Vulkan's runtime shader compiler is a module rather than an
+        # engine/driver facility. A pruned rendering build without it links
+        # and starts, but every RD shader compilation is refused. The headless
+        # MCR variant deliberately omits both Vulkan and this module so its
+        # startup does not execute renderer work that the recorded scene never
+        # observes.
+        command.append("module_glslang_enabled=yes")
+    command.extend(args.scons_args)
     output = checked(command, REPO, env)
     build_log = REPO / "build" / f"hcr-windows-{args.suffix}.log"
     build_log.write_text(output, encoding="utf-8")
 
-    stem = f"godot.windows.template_debug.x86_64.{args.suffix}"
+    stem = f"godot.windows.{args.target}.x86_64.{args.suffix}"
     image = REPO / "bin" / f"{stem}.exe"
     pdb = REPO / "bin" / f"{stem}.pdb"
     if not image.is_file() or image.stat().st_size == 0:
@@ -162,7 +199,11 @@ def main() -> int:
                 "image": str(image),
                 "pdb": str(pdb),
                 "buildLog": str(build_log),
-                "vulkan": args.vulkan == "yes",
+                "vulkan": vulkan == "yes",
+                "runtimeProfile": (
+                    "recording-headless" if args.recording_headless else "rendering"
+                ),
+                "target": args.target,
             }
         )
     )
