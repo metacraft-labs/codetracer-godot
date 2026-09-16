@@ -2531,6 +2531,21 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 		return;
 	}
 
+#if !defined(CT_GDH8_FALSIFY_FAILED_DOWNCAST_FALLTHROUGH)
+	Ref<GDScript> gd = scr;
+	if (gd.is_null()) {
+		req.applied = false;
+		req.reason = REPRO_HCR_RELOAD_REASON_SCRIPT_NOT_GDSCRIPT;
+		req.detail = "loaded resource at " + req.res_path +
+				" is not a GDScript; GDScript reload requires a GDScript instance";
+		fprintf(stderr, "[ct-gdh8] REFUSED (script-not-gdscript) %s gen=%u: %s\n",
+				req.res_path.utf8().get_data(), req.generation,
+				req.detail.utf8().get_data());
+		fflush(stderr);
+		return;
+	}
+#endif
+
 	List<StringName> names;
 	List<Variant> before;
 	ct_collect_statics(scr, names, before);
@@ -2600,6 +2615,19 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	bool ct_gdh8_have_pre_swap_source = false;
 	{
 		Ref<GDScript> gd_before = scr;
+#if !defined(CT_GDH8_FALSIFY_FAILED_DOWNCAST_FALLTHROUGH)
+		if (gd_before.is_null()) {
+			req.applied = false;
+			req.reason = REPRO_HCR_RELOAD_REASON_SCRIPT_NOT_GDSCRIPT;
+			req.detail = "loaded resource at " + req.res_path +
+					" is not a GDScript; GDScript reload requires a GDScript instance";
+			fprintf(stderr, "[ct-gdh8] REFUSED (script-not-gdscript) %s gen=%u: %s\n",
+					req.res_path.utf8().get_data(), req.generation,
+					req.detail.utf8().get_data());
+			fflush(stderr);
+			return;
+		}
+#endif
 		if (gd_before.is_valid()) {
 			ct_gdh8_pre_swap_source = gd_before->get_source_code();
 			ct_gdh8_have_pre_swap_source = true;
@@ -2761,6 +2789,19 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 #endif
 	if (ct_gdh8b_check_compiled) {
 		Ref<GDScript> gd_after = scr;
+#if !defined(CT_GDH8_FALSIFY_FAILED_DOWNCAST_FALLTHROUGH)
+		if (gd_after.is_null()) {
+			req.applied = false;
+			req.reason = REPRO_HCR_RELOAD_REASON_SCRIPT_NOT_GDSCRIPT;
+			req.detail = "loaded resource at " + req.res_path +
+					" is not a GDScript; GDScript reload requires a GDScript instance";
+			fprintf(stderr, "[ct-gdh8] REFUSED (script-not-gdscript) %s gen=%u: %s\n",
+					req.res_path.utf8().get_data(), req.generation,
+					req.detail.utf8().get_data());
+			fflush(stderr);
+			return;
+		}
+#endif
 		if (gd_after.is_valid() && !gd_after->is_valid()) {
 			String why = "the engine's GDScript compiler refused the new content";
 #if !defined(CT_GDH5_FALSIFY_SCRIPT_RELOAD_ONLY)
