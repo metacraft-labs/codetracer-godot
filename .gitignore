@@ -419,3 +419,6 @@ $RECYCLE.BIN/
 # shadows nothing. The upstream line above is left in place so this file stays
 # mergeable with upstream.
 node_modules
+
+# Repro development environment cache
+.repro/
