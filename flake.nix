@@ -26,10 +26,23 @@
     # network fetch — plain `github:NixOS/nixpkgs` hit GitHub 429s here. The
     # concrete revision is pinned in flake.lock.
     nixpkgs.url = "https://flakehub.com/f/DeterminateSystems/nixpkgs-weekly/0.1";
+
+    # The CodeTracer trace writer the GDScript recorder links, PINNED: the
+    # revision is the one flake.lock records, and it is the only declaration of
+    # it. `modules/gdscript/SCsub` links the archive built from exactly this
+    # source (`ct-trace-writer` below, exported to the dev shell), and refuses a
+    # vendored archive stamped with any other revision. Bump it with
+    #   nix flake update codetracer-trace-format-nim
+    # and re-vendor with scripts/vendor-trace-writer.sh.
+    codetracer-trace-format-nim.url = "github:metacraft-labs/codetracer-trace-format-nim/dev";
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      codetracer-trace-format-nim,
+    }:
     let
       systems = [
         "aarch64-darwin"
@@ -38,12 +51,67 @@
         "aarch64-linux"
       ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f system);
+
+      writerRev = codetracer-trace-format-nim.rev;
+
+      # The static C-ABI writer archive, from the pinned source, with the
+      # writer's own pinned Nim toolchain and Nim dependencies (its flake's
+      # inputs), so this is the same compiler and the same `requires` the
+      # writer's repository builds and tests with. The command is the writer's
+      # `buildStaticLib` plus `-d:useMalloc`: the engine calls the writer from
+      # its own worker threads, and with Nim's per-thread heaps the main
+      # thread's close frees memory owned by a worker that has already exited
+      # (a crash at exit, measured with gf_threads.gd).
+      ctTraceWriterFor =
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          w = codetracer-trace-format-nim.inputs;
+          nim = w.codetracer-toolchains.packages.${system}.nim-2_2;
+        in
+        pkgs.stdenv.mkDerivation {
+          pname = "codetracer-trace-writer-static";
+          version = builtins.substring 0 12 writerRev;
+          src = codetracer-trace-format-nim;
+          nativeBuildInputs = [ nim ];
+          buildInputs = [ pkgs.zstd ];
+          buildPhase = ''
+            runHook preBuild
+            export HOME=$TMPDIR
+            nim c --app:staticlib --mm:arc --noMain -d:release -d:useMalloc \
+              --nimMainPrefix:codetracerTraceWriter --passC:-fPIC \
+              --hints:off --nimcache:$TMPDIR/nimcache \
+              -p:src --path:${w.nim-stew} --path:${w.nim-results} \
+              -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            install -Dm644 libcodetracer_trace_writer.a $out/lib/libcodetracer_trace_writer.a
+            install -Dm644 include/codetracer_trace_writer.h $out/include/codetracer_trace_writer.h
+            echo ${writerRev} > $out/rev
+            runHook postInstall
+          '';
+        };
     in
     {
+      packages = forAll (system: {
+        ct-trace-writer = ctTraceWriterFor system;
+        # The reader at the SAME revision, for the verification scripts.
+        ct-print = codetracer-trace-format-nim.packages.${system}.default;
+      });
+
       devShells = forAll (
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          ctTraceWriter = ctTraceWriterFor system;
+          ctPrint = codetracer-trace-format-nim.packages.${system}.default;
+          writerEnv = ''
+            export CT_TRACE_WRITER_DIR="${ctTraceWriter}"
+            export CT_TRACE_WRITER_REV="${writerRev}"
+            export CT_PRINT="${ctPrint}/bin/ct-print"
+          '';
           isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
 
           # Common Godot-from-source build tooling. Godot vendors almost all
@@ -75,7 +143,7 @@
               pkgs.mkShell {
                 nativeBuildInputs = buildTools;
                 buildInputs = linkLibs;
-                shellHook = ''
+                shellHook = writerEnv + ''
                   export PKG_CONFIG_PATH="${pkgs.zstd.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
                   echo "codetracer-engine-godot dev shell (darwin): scons $(scons --version 2>/dev/null | sed -n 's/.*v\([0-9.]*\).*/\1/p' | head -n1); clang $(clang --version 2>/dev/null | sed -n '1s/.*version \([0-9.]*\).*/\1/p')"
                 '';
@@ -94,7 +162,7 @@
                   pkgs.alsa-lib
                   pkgs.libpulseaudio
                 ];
-                shellHook = ''
+                shellHook = writerEnv + ''
                   export PKG_CONFIG_PATH="${pkgs.zstd.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
                 '';
               };

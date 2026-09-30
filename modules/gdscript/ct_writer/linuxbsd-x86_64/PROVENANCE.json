@@ -1,0 +1,7 @@
+{
+  "rev": "4b0dcadaab3c9b4179ba8e7fda90269d2fa1be65",
+  "source": "github:metacraft-labs/codetracer-trace-format-nim",
+  "built_by": "nix build .#ct-trace-writer (flake.nix)",
+  "archive_sha256": "347d0165a76bf3a0916eeb8c8ac1a1a16278932ed90ca1dfddf0d29c8b7efbb5",
+  "header_sha256": "786f6f92974eb695fd6fa1ec85c5749b12f5d2e14aa46be185df0c328d57a2d3"
+}
