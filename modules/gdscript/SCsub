@@ -96,67 +96,102 @@ if os.environ.get("CT_GDH6_ASAN", "") not in ("", "0"):
     env.Append(LINKFLAGS=["-fsanitize=address"])
 
 # --- CodeTracer G2: link the CTFS writer static lib ---------------------
-# The C-ABI header (compile-time) and libcodetracer_trace_writer.a
-# (link-time) come from codetracer-trace-format-nim, vendored under
-# modules/gdscript/ct_writer/ (header in ct_writer/include/). The glue TU
+# The recorder links codetracer-trace-format-nim's C-ABI trace writer: a header
+# (compile time) and a static archive (link time). The glue TU
 # gdscript_ct_trace.cpp is picked up by the "*.cpp" glob below.
-# The static lib is a *native* object archive, so it is vendored per host
-# platform+arch: `ct_writer/` holds the macOS arm64 build (the platform the
-# recorder was first brought up on) and `ct_writer/<platform>-<arch>/` (scons'
-# own platform/arch spelling, e.g. `linuxbsd-x86_64`) holds any other build.
-# Note the two archives are not interchangeable in a subtler way than being
-# different ISAs: the macOS one carries a `__.SYMDEF` index, which GNU ld
-# rejects outright ("archive has no index"), so a Linux link that silently
-# picked it up fails at the very last step of a full engine build.
-# The Linux x86_64 archive was produced from
-# codetracer-trace-format-nim with the repo's own `buildStaticLib` command
-# (`nim c --app:staticlib --mm:arc --noMain -d:release
-#  --nimMainPrefix:codetracerTraceWriter --passC:-fPIC -p:src`), run inside
-# that repo's `nix develop` shell so libzstd's headers resolve.
-# Current Linux x86_64 archive and ct_writer/include/codetracer_trace_writer.h:
-# codetracer-trace-format-nim ded420b (dev, 2026-09-30), built with the
-# `buildStaticLib` command above plus `-d:useMalloc`:
-#   nim c --app:staticlib --mm:arc --noMain -d:release -d:useMalloc
-#     --nimMainPrefix:codetracerTraceWriter --passC:-fPIC -p:src
-#     -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
-# `-d:useMalloc` is required here. The engine calls the writer from its own
-# worker threads (GF12), and Nim's default allocator gives each thread its own
-# heap; memory a worker allocated is freed by the main thread at close, after
-# the worker has exited, and `trace_writer_close` then crashes in rawDealloc
-# (measured with gf_threads.gd: SIGSEGV on every run without it, a complete
-# and verified recording on every run with it).
 #
-# RESOLVED, HX-D-0 (2026-09-14): `ct_writer/libcodetracer_trace_writer.a`,
-# the macOS-arm64 fallback archive, was regenerated on a macOS arm64 host
-# from codetracer-trace-format-nim using:
-#   nix develop --command just build-static-lib
-# (which executes: `nim c --app:staticlib --mm:arc --noMain -d:release
-#   --nimMainPrefix:codetracerTraceWriter --passC:"-fPIC" -p:src
-#   -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim`).
-# The regenerated archive exports all required entry points (including
-# `trace_writer_current_path_id`, `trace_writer_register_path_version`,
-# `trace_writer_set_recording_id`, `trace_writer_enable_line_count_table`,
-# `trace_writer_register_path_with_line_count`, `trace_writer_clear_last_error`),
-# matching the exported symbol set of the Linux archive.
-# Provenance and rebuild procedure:
-# If this archive ever becomes stale relative to codetracer-trace-format-nim,
-# run on a macOS arm64 host:
-#   cd ../codetracer-trace-format-nim && nix develop --command just build-static-lib
-#   cp libcodetracer_trace_writer.a ../codetracer-engine-godot/modules/gdscript/ct_writer/
-# `scripts/verify-gdh3-fork.sh` actively guards this archive with an
-# anti-vacuity floor check and fails if any required entry point is missing.
-env_gdscript.Prepend(CPPPATH=[Dir("ct_writer/include").srcnode()])
-_ct_writer_dir = Dir("ct_writer").srcnode()
-_ct_writer_arch_dir = Dir("ct_writer/%s-%s" % (env["platform"], env["arch"])).srcnode()
+# ONE REVISION, AND A STALE WRITER FAILS THE BUILD. The writer revision is
+# declared once, by the `codetracer-trace-format-nim` input in the repository's
+# flake.lock. A writer built from any other revision writes containers the
+# current readers may refuse, or decode differently, so it is never linked:
+#
+#   1. Inside `nix develop`, the dev shell exports CT_TRACE_WRITER_DIR: the
+#      archive and header the flake builds FROM THE PINNED SOURCE (package
+#      `ct-trace-writer`). That is what gets linked. Its recorded revision must
+#      equal the lock's; a shell entered before the lock moved is refused.
+#   2. Without it (plain scons, e.g. CI), the VENDORED copy under
+#      ct_writer/<platform>-<arch>/ is used, and only if its PROVENANCE.json
+#      names the locked revision and the sha256 of both the archive and
+#      ct_writer/include/codetracer_trace_writer.h match. Re-vendor with
+#      scripts/vendor-trace-writer.sh after moving the lock.
+#
+# The archive is the writer's `buildStaticLib` command plus `-d:useMalloc`
+# (see `ct-trace-writer` in flake.nix): the engine calls the writer from its
+# own worker threads, and with Nim's per-thread heaps the main thread's close
+# freed memory owned by a worker that had already exited (a SIGSEGV at exit
+# on every gf_threads.gd run).
+import hashlib
+import json
+
+
+def _ct_sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _ct_writer_locked_rev():
+    lock_path = os.path.join(Dir("#").abspath, "flake.lock")
+    try:
+        with open(lock_path) as f:
+            return json.load(f)["nodes"]["codetracer-trace-format-nim"]["locked"]["rev"]
+    except (OSError, KeyError, ValueError) as e:
+        raise RuntimeError(
+            "cannot read the pinned trace writer revision from %s (%s); the "
+            "`codetracer-trace-format-nim` input is the only declaration of it" % (lock_path, e)
+        )
+
+
+_ct_writer_rev = _ct_writer_locked_rev()
 _ct_writer_archive = "codetracer_trace_writer.lib" if env["platform"] == "windows" else "libcodetracer_trace_writer.a"
-if os.path.exists(os.path.join(str(_ct_writer_arch_dir), _ct_writer_archive)):
-    _ct_writer_dir = _ct_writer_arch_dir
-_ct_writer_archive_path = os.path.join(str(_ct_writer_dir), _ct_writer_archive)
-if not os.path.exists(_ct_writer_archive_path):
-    raise RuntimeError(
-        "missing CodeTracer trace writer archive for %s-%s: %s"
-        % (env["platform"], env["arch"], _ct_writer_archive_path)
+_ct_writer_env_dir = os.environ.get("CT_TRACE_WRITER_DIR", "")
+if _ct_writer_env_dir:
+    with open(os.path.join(_ct_writer_env_dir, "rev")) as f:
+        _built_rev = f.read().strip()
+    if _built_rev != _ct_writer_rev:
+        raise RuntimeError(
+            "CT_TRACE_WRITER_DIR holds a trace writer built from %s, but flake.lock pins %s. "
+            "The dev shell predates the lock: leave it and run `nix develop` again." % (_built_rev, _ct_writer_rev)
+        )
+    _ct_writer_include = os.path.join(_ct_writer_env_dir, "include")
+    _ct_writer_archive_path = os.path.join(_ct_writer_env_dir, "lib", _ct_writer_archive)
+    print("CodeTracer trace writer: %s, built from the pinned source (%s)" % (_ct_writer_rev[:12], _ct_writer_env_dir))
+else:
+    _ct_writer_include = Dir("ct_writer/include").srcnode().abspath
+    _ct_vendor_dir = Dir("ct_writer/%s-%s" % (env["platform"], env["arch"])).srcnode().abspath
+    _ct_writer_archive_path = os.path.join(_ct_vendor_dir, _ct_writer_archive)
+    _ct_provenance_path = os.path.join(_ct_vendor_dir, "PROVENANCE.json")
+    _ct_revendor = (
+        "Build inside `nix develop` (which builds the writer from the pinned source), "
+        "or re-vendor with scripts/vendor-trace-writer.sh."
     )
+    if not os.path.exists(_ct_writer_archive_path):
+        raise RuntimeError(
+            "no vendored CodeTracer trace writer for %s-%s under %s. %s"
+            % (env["platform"], env["arch"], _ct_vendor_dir, _ct_revendor)
+        )
+    if not os.path.exists(_ct_provenance_path):
+        raise RuntimeError(
+            "the vendored CodeTracer trace writer for %s-%s has no PROVENANCE.json, so the revision it "
+            "was built from is unknown and it cannot be checked against flake.lock (%s). %s"
+            % (env["platform"], env["arch"], _ct_writer_rev, _ct_revendor)
+        )
+    with open(_ct_provenance_path) as f:
+        _ct_provenance = json.load(f)
+    _ct_header_path = os.path.join(_ct_writer_include, "codetracer_trace_writer.h")
+    _ct_stale = []
+    if _ct_provenance.get("rev") != _ct_writer_rev:
+        _ct_stale.append("it was built from %s, and flake.lock pins %s" % (_ct_provenance.get("rev"), _ct_writer_rev))
+    if _ct_provenance.get("archive_sha256") != _ct_sha256(_ct_writer_archive_path):
+        _ct_stale.append("the archive is not the one PROVENANCE.json records")
+    if _ct_provenance.get("header_sha256") != _ct_sha256(_ct_header_path):
+        _ct_stale.append("the header is not the one PROVENANCE.json records")
+    if _ct_stale:
+        raise RuntimeError(
+            "the vendored CodeTracer trace writer for %s-%s is stale: %s. %s"
+            % (env["platform"], env["arch"], "; ".join(_ct_stale), _ct_revendor)
+        )
+    print("CodeTracer trace writer: %s, vendored (%s)" % (_ct_writer_rev[:12], _ct_vendor_dir))
+env_gdscript.Prepend(CPPPATH=[_ct_writer_include])
 # Pass an exact file node. A bare library name inherits Godot's extra suffix
 # and would incorrectly rename this prebuilt dependency in custom variants.
 env.Append(LIBS=[File(_ct_writer_archive_path)])
