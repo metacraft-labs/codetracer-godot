@@ -39,6 +39,7 @@ Usage:
                                             # param|captured|capturebyvalue|
                                             # return|nesting. exit 0 iff caught.
 """
+
 import json
 import sys
 
@@ -64,7 +65,7 @@ EXPECTED_CAPTURES = {
     "rn": [("Int", 307)],
     "total": [("Int", 379)],
     # add lambda body locals (called TWICE): param + captured outer local.
-    "seen_x": [("Int", 5), ("Int", 5)],       # the PARAM x, read at execution
+    "seen_x": [("Int", 5), ("Int", 5)],  # the PARAM x, read at execution
     "seen_base": [("Int", 10), ("Int", 10)],  # the CAPTURE base — 10 BOTH times
     # outer lambda body locals.
     "b": [("Int", 200)],
@@ -181,9 +182,14 @@ def assert_facts(doc):
         if len(got) != len(want_seq):
             raise VerifyError(
                 "capture %r: got %d occurrences %s, expected %d %s"
-                % (name, len(got),
-                   [scalar_str(v.get("kind"), v) for v in got],
-                   len(want_seq), [w[0] + " " + repr(w[1]) for w in want_seq]))
+                % (
+                    name,
+                    len(got),
+                    [scalar_str(v.get("kind"), v) for v in got],
+                    len(want_seq),
+                    [w[0] + " " + repr(w[1]) for w in want_seq],
+                )
+            )
         for i, (want_kind, want_value) in enumerate(want_seq):
             check_scalar(got[i], want_kind, want_value, "%s[%d]" % (name, i))
 
@@ -192,15 +198,15 @@ def assert_facts(doc):
     if [v.get("i") for v in caps.get("base", [])] != [10, 999]:
         raise VerifyError("outer local base not [10, 999]: %r" % [v.get("i") for v in caps.get("base", [])])
     if [v.get("i") for v in caps.get("seen_base", [])] != [10, 10]:
-        raise VerifyError("capture-by-value broken: seen_base %r != [10, 10]"
-                          % [v.get("i") for v in caps.get("seen_base", [])])
+        raise VerifyError(
+            "capture-by-value broken: seen_base %r != [10, 10]" % [v.get("i") for v in caps.get("seen_base", [])]
+        )
 
     # --- 2. lambdas stored in vars are value-captured as Callable structs -----
     for name, want_count in EXPECTED_CALLABLES.items():
         got = caps.get(name, [])
         if len(got) != want_count:
-            raise VerifyError("Callable var %r: got %d occurrences, expected %d"
-                              % (name, len(got), want_count))
+            raise VerifyError("Callable var %r: got %d occurrences, expected %d" % (name, len(got), want_count))
         node = got[0]
         if node.get("kind") != "Struct":
             raise VerifyError("Callable var %r: kind %r != Struct" % (name, node.get("kind")))
@@ -219,7 +225,8 @@ def assert_facts(doc):
         if len(got) != len(want_seq):
             raise VerifyError(
                 "returns for %r: got %d %s, expected %d"
-                % (fn, len(got), [scalar_str(v.get("kind"), v) for v in got], len(want_seq)))
+                % (fn, len(got), [scalar_str(v.get("kind"), v) for v in got], len(want_seq))
+            )
         for i, (want_kind, want_value) in enumerate(want_seq):
             check_scalar(got[i], want_kind, want_value, "return %s[%d]" % (fn, i))
 
@@ -231,16 +238,16 @@ def assert_facts(doc):
     init = inits[0]
     init_key = init["call_key"]
     if init.get("depth") != 0 or init.get("parent_call_key") != -1:
-        raise VerifyError("_init not top-level: depth=%s parent=%s"
-                          % (init.get("depth"), init.get("parent_call_key")))
+        raise VerifyError("_init not top-level: depth=%s parent=%s" % (init.get("depth"), init.get("parent_call_key")))
 
     lambdas = [c for c in ces if c.get("function") == LAMBDA]
     if len(lambdas) != 5:
         raise VerifyError("expected 5 <anonymous lambda> frames, got %d" % len(lambdas))
     for c in lambdas:
         if c.get("entry_step") > c.get("exit_step"):
-            raise VerifyError("lambda frame malformed: entry_step %s > exit_step %s"
-                              % (c.get("entry_step"), c.get("exit_step")))
+            raise VerifyError(
+                "lambda frame malformed: entry_step %s > exit_step %s" % (c.get("entry_step"), c.get("exit_step"))
+            )
 
     # 4 lambdas nest directly under _init (depth 1): add(x2), doubler, outer.
     depth1 = [c for c in lambdas if c.get("parent_call_key") == init_key]
@@ -257,8 +264,9 @@ def assert_facts(doc):
     inner = depth2[0]
     depth1_keys = {c["call_key"] for c in depth1}
     if inner.get("parent_call_key") not in depth1_keys:
-        raise VerifyError("nested lambda's parent %s is not a depth-1 lambda %s"
-                          % (inner.get("parent_call_key"), sorted(depth1_keys)))
+        raise VerifyError(
+            "nested lambda's parent %s is not a depth-1 lambda %s" % (inner.get("parent_call_key"), sorted(depth1_keys))
+        )
 
     # the nested (inner) frame returns 307 and its parent (outer) returns 307.
     exit_by_key = {e.get("call_key"): e for e in call_exits(doc)}
@@ -278,13 +286,13 @@ def assert_facts(doc):
             raise VerifyError("expected exactly 1 %r frame, got %d" % (fn, len(matches)))
         c = matches[0]
         if c.get("depth") != 0 or c.get("parent_call_key") != -1:
-            raise VerifyError("%s not top-level: depth=%s parent=%s"
-                              % (fn, c.get("depth"), c.get("parent_call_key")))
+            raise VerifyError("%s not top-level: depth=%s parent=%s" % (fn, c.get("depth"), c.get("parent_call_key")))
 
     # balance: every call_entry has a matching call_exit.
     if len(call_entries(doc)) != len(call_exits(doc)):
-        raise VerifyError("unbalanced call/return: %d call_entry vs %d call_exit"
-                          % (len(call_entries(doc)), len(call_exits(doc))))
+        raise VerifyError(
+            "unbalanced call/return: %d call_entry vs %d call_exit" % (len(call_entries(doc)), len(call_exits(doc)))
+        )
 
     # --- 5. types table: scalars + the lazily-interned Callable struct --------
     types = doc.get("types", [])
@@ -292,14 +300,16 @@ def assert_facts(doc):
     if types != want_types:
         raise VerifyError("types table %r != %r" % (types, want_types))
 
-    return ("PASS GF6: lambda frames (5 <anonymous lambda>: 4 under _init depth1, "
-            "1 nested depth2 under the outer lambda) with returns [15,15,42,307,307]; "
-            "param x readable at execution (seen_x=5x2), captured base readable "
-            "(seen_base=10x2); CAPTURE-BY-VALUE proven (outer base [10,999] but "
-            "seen_base [10,10]); lambdas value-captured as Callable{method="
-            "'<anonymous lambda>'} (add/doubler/outer/inner); nested lambda captures "
-            "two scopes (seen_a=100, seen_b=200 -> 307); types [None,Int,Float,Bool,"
-            "String,Variant,Callable].")
+    return (
+        "PASS GF6: lambda frames (5 <anonymous lambda>: 4 under _init depth1, "
+        "1 nested depth2 under the outer lambda) with returns [15,15,42,307,307]; "
+        "param x readable at execution (seen_x=5x2), captured base readable "
+        "(seen_base=10x2); CAPTURE-BY-VALUE proven (outer base [10,999] but "
+        "seen_base [10,10]); lambdas value-captured as Callable{method="
+        "'<anonymous lambda>'} (add/doubler/outer/inner); nested lambda captures "
+        "two scopes (seen_a=100, seen_b=200 -> 307); types [None,Int,Float,Bool,"
+        "String,Variant,Callable]."
+    )
 
 
 def _nth_var(doc, varname, n, pred=None):
@@ -381,7 +391,10 @@ def main():
 
     if cmd == "tamper":
         if len(sys.argv) != 4:
-            print("usage: verify_gf6.py tamper <full.json> <param|captured|capturebyvalue|return|nesting>", file=sys.stderr)
+            print(
+                "usage: verify_gf6.py tamper <full.json> <param|captured|capturebyvalue|return|nesting>",
+                file=sys.stderr,
+            )
             sys.exit(2)
         mode = sys.argv[3]
         tamper(doc, mode)

@@ -25,6 +25,7 @@ Usage:
                                             # elem|length|dictkey|dictval|nesting.
                                             # exit 0 iff the tamper was caught.
 """
+
 import json
 import sys
 
@@ -42,7 +43,7 @@ class VerifyError(Exception):
 #   ("Int", n) ("Float", x) ("String", s) ("Bool", b) ("None",)
 #   ("Seq", [v, ...])          -> Sequence with those elements, in order
 #   ("Tuple", [v, ...])        -> Tuple with those elements, in order
-def I(n):
+def Int(n):
     return ("Int", n)
 
 
@@ -69,20 +70,20 @@ def Pair(k, v):
 # (line, varname, expected-value-structure) — hand-derived from
 # test-programs/gdscript/gf_collections.gd (see EXPECTED-GF3.md).
 EXPECTED = [
-    (35, "a_untyped", Seq([I(1), S("two"), F(3.0)])),
-    (36, "a_typed", Seq([I(10), I(20), I(30)])),
-    (37, "p_byte", Seq([I(1), I(2), I(255)])),
-    (38, "p_i32", Seq([I(100), I(200), I(300)])),
-    (39, "p_i64", Seq([I(1000), I(2000)])),
+    (35, "a_untyped", Seq([Int(1), S("two"), F(3.0)])),
+    (36, "a_typed", Seq([Int(10), Int(20), Int(30)])),
+    (37, "p_byte", Seq([Int(1), Int(2), Int(255)])),
+    (38, "p_i32", Seq([Int(100), Int(200), Int(300)])),
+    (39, "p_i64", Seq([Int(1000), Int(2000)])),
     (40, "p_f32", Seq([F(1.5), F(2.5)])),
     (41, "p_f64", Seq([F(3.5), F(4.5)])),
     (42, "p_str", Seq([S("x"), S("y"), S("z")])),
-    (43, "d_untyped", Seq([Pair(S("a"), I(1)), Pair(S("b"), I(2))])),
-    (44, "d_typed", Seq([Pair(S("x"), I(10)), Pair(S("y"), I(20))])),
-    (45, "nested", Seq([Seq([I(1), I(2)]), Seq([I(3), I(4)])])),
-    (46, "d_with_arr", Seq([Pair(S("nums"), Seq([I(7), I(8), I(9)]))])),
-    (48, "mut", Seq([I(1), I(2), I(3)])),
-    (50, "mut_after", Seq([I(1), I(2), I(3), I(4)])),  # post-append: length 3 -> 4
+    (43, "d_untyped", Seq([Pair(S("a"), Int(1)), Pair(S("b"), Int(2))])),
+    (44, "d_typed", Seq([Pair(S("x"), Int(10)), Pair(S("y"), Int(20))])),
+    (45, "nested", Seq([Seq([Int(1), Int(2)]), Seq([Int(3), Int(4)])])),
+    (46, "d_with_arr", Seq([Pair(S("nums"), Seq([Int(7), Int(8), Int(9)]))])),
+    (48, "mut", Seq([Int(1), Int(2), Int(3)])),
+    (50, "mut_after", Seq([Int(1), Int(2), Int(3), Int(4)])),  # post-append: length 3 -> 4
 ]
 
 
@@ -142,8 +143,8 @@ def check_value(node, expected, path):
         if len(elems) != len(want):
             raise VerifyError(
                 "%s: %s length %d != %d (elements=%r)"
-                % (path, want_kind, len(elems), len(want),
-                   [e.get("kind") for e in elems]))
+                % (path, want_kind, len(elems), len(want), [e.get("kind") for e in elems])
+            )
         for i, (child, want_child) in enumerate(zip(elems, want)):
             check_value(child, want_child, "%s[%d]" % (path, i))
     else:
@@ -155,7 +156,8 @@ def find_var(step, varname):
     if not hits:
         raise VerifyError(
             "step line %d carries no var %r (vars=%r)"
-            % (step.get("line"), varname, [v.get("varname") for v in step.get("vars", [])]))
+            % (step.get("line"), varname, [v.get("varname") for v in step.get("vars", [])])
+        )
     if len(hits) != 1:
         raise VerifyError("step line %d carries %d copies of var %r" % (step.get("line"), len(hits), varname))
     return hits[0]
@@ -164,7 +166,7 @@ def find_var(step, varname):
 def assert_facts(doc):
     sts = all_steps(doc)
     observed = []
-    for (line, varname, expected) in EXPECTED:
+    for line, varname, expected in EXPECTED:
         st = step_at_unique_line(sts, line)
         v = find_var(st, varname)
         check_value(v.get("value", {}), expected, "%s@%d" % (varname, line))
@@ -177,8 +179,10 @@ def assert_facts(doc):
     mut = find_var(step_at_unique_line(sts, 48), "mut")["value"]
     mut_after = find_var(step_at_unique_line(sts, 50), "mut_after")["value"]
     if len(mut.get("elements", [])) != 3 or len(mut_after.get("elements", [])) != 4:
-        raise VerifyError("append mutation not reflected: len(mut)=%d len(mut_after)=%d"
-                          % (len(mut.get("elements", [])), len(mut_after.get("elements", []))))
+        raise VerifyError(
+            "append mutation not reflected: len(mut)=%d len(mut_after)=%d"
+            % (len(mut.get("elements", [])), len(mut_after.get("elements", [])))
+        )
     if mut_after["elements"][3].get("i") != 4:
         raise VerifyError("appended element != 4: %r" % mut_after["elements"][3])
     sub.append("append 3->4 (last=4)")
@@ -199,8 +203,11 @@ def assert_facts(doc):
         raise VerifyError("nested[1][1] != 4: %r" % nested)
     sub.append("nested[1][1]=4")
 
-    return ("PASS GF3: %d structured collections verified (%s); sub-facts: %s"
-            % (len(EXPECTED), ", ".join(observed), "; ".join(sub)))
+    return "PASS GF3: %d structured collections verified (%s); sub-facts: %s" % (
+        len(EXPECTED),
+        ", ".join(observed),
+        "; ".join(sub),
+    )
 
 
 def tamper(doc, mode):

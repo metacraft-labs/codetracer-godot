@@ -28,16 +28,24 @@ def reroot(doc):
     if not entries:
         raise RootError("no call_entry at all — the recording has no `<toplevel>` root")
     root = entries[0]
-    expected = {"function": TOPLEVEL, "function_id": 0, "call_key": 0,
-                "depth": 0, "parent_call_key": -1, "entry_step": 0}
+    expected = {
+        "function": TOPLEVEL,
+        "function_id": 0,
+        "call_key": 0,
+        "depth": 0,
+        "parent_call_key": -1,
+        "entry_step": 0,
+    }
     for key, want in expected.items():
         if root.get(key) != want:
-            raise RootError("first call_entry %s=%r, the spec requires %r (root: %s)"
-                            % (key, root.get(key), want, root))
+            raise RootError(
+                "first call_entry %s=%r, the spec requires %r (root: %s)" % (key, root.get(key), want, root)
+            )
     extra = [e for e in entries[1:] if e.get("function") == TOPLEVEL]
     if extra:
-        raise RootError("%d further `<toplevel>` frames after the root: %s"
-                        % (len(extra), [e.get("call_key") for e in extra]))
+        raise RootError(
+            "%d further `<toplevel>` frames after the root: %s" % (len(extra), [e.get("call_key") for e in extra])
+        )
 
     out = []
     for e in events:

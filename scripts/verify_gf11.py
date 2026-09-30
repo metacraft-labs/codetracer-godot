@@ -29,6 +29,7 @@ Usage:
   verify_gf11.py verify <full.json>
   verify_gf11.py tamper <full.json> <mode>   # missingcallback|proccount|notifcode|order
 """
+
 import json
 import sys
 
@@ -81,8 +82,7 @@ def frame_path(doc, steps, ce):
 
 def node_frames(doc, steps, fn):
     return sorted(
-        [c for c in calls(doc)
-         if c["function"] == fn and frame_path(doc, steps, c) == NODE_PATH],
+        [c for c in calls(doc) if c["function"] == fn and frame_path(doc, steps, c) == NODE_PATH],
         key=lambda c: c["entry_step"],
     )
 
@@ -146,9 +146,7 @@ def verify(doc):
     first_proc = proc[0]["entry_step"]
     first_phys = phys[0]["entry_step"]
     if not (e_init < e_enter < e_ready):
-        raise VerifyError(
-            f"lifecycle order _init<_enter_tree<_ready violated: "
-            f"{e_init},{e_enter},{e_ready}")
+        raise VerifyError(f"lifecycle order _init<_enter_tree<_ready violated: {e_init},{e_enter},{e_ready}")
     if not (e_ready < min(first_proc, first_phys)):
         raise VerifyError("_ready must precede the first _process/_physics_process")
     if not (max(f["entry_step"] for f in proc + phys) < e_exit):
@@ -162,8 +160,7 @@ def verify(doc):
             raise VerifyError("_notification frame missing Int local `n` (what)")
         captured.append((f["entry_step"], v["value"].get("i")))
     codes = [c for _, c in captured]
-    for key, label in [(PARENTED, "PARENTED"), (ENTER_TREE, "ENTER_TREE"),
-                       (READY, "READY"), (EXIT_TREE, "EXIT_TREE")]:
+    for key, label in [(PARENTED, "PARENTED"), (ENTER_TREE, "ENTER_TREE"), (READY, "READY"), (EXIT_TREE, "EXIT_TREE")]:
         if key not in codes:
             raise VerifyError(f"notification {label}={key} not captured; got {codes}")
     if PROCESS not in codes and PHYSICS_PROC not in codes:
@@ -174,6 +171,7 @@ def verify(doc):
             if c == code:
                 return st
         raise VerifyError(f"notification code {code} absent")
+
     s_par = first_step_of(PARENTED)
     s_ent = first_step_of(ENTER_TREE)
     s_rdy = first_step_of(READY)
@@ -182,7 +180,8 @@ def verify(doc):
     if not (s_par < s_ent < s_rdy < s_tick < s_exit):
         raise VerifyError(
             f"notification order PARENTED<ENTER_TREE<READY<tick<EXIT_TREE violated: "
-            f"{s_par},{s_ent},{s_rdy},{s_tick},{s_exit}")
+            f"{s_par},{s_ent},{s_rdy},{s_tick},{s_exit}"
+        )
 
     # --- 6. types table --------------------------------------------------
     if doc["types"] != EXPECTED_TYPES:
@@ -194,13 +193,13 @@ def verify(doc):
         f"_physics_process x{len(phys)} (>=1, pd==1/60), _notification x{len(notif)}; "
         "order _init<_enter_tree<_ready<_process<_exit_tree; "
         "notif codes PARENTED(18)<ENTER_TREE(10)<READY(13)<tick(16/17)<EXIT_TREE(11); "
-        "types [None,Int,Float,Bool,String,Variant,Object]")
+        "types [None,Int,Float,Bool,String,Variant,Object]"
+    )
 
 
 def _del_first_call(doc, steps, fn):
     for i, e in enumerate(doc["events"]):
-        if (e["kind"] == "call_entry" and e["function"] == fn
-                and frame_path(doc, steps, e) == NODE_PATH):
+        if e["kind"] == "call_entry" and e["function"] == fn and frame_path(doc, steps, e) == NODE_PATH:
             del doc["events"][i]
             return True
     return False
@@ -229,8 +228,7 @@ def tamper(doc, mode):
         # Move _exit_tree before _ready -> ordering check fails.
         exit_fr = node_frames(doc, steps, "_exit_tree")[0]
         ready_fr = node_frames(doc, steps, "_ready")[0]
-        exit_fr["entry_step"], ready_fr["entry_step"] = (
-            ready_fr["entry_step"], exit_fr["entry_step"])
+        exit_fr["entry_step"], ready_fr["entry_step"] = (ready_fr["entry_step"], exit_fr["entry_step"])
     else:
         raise SystemExit(f"unknown tamper mode {mode}")
 

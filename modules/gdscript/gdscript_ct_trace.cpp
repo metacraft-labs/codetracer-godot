@@ -40,6 +40,7 @@
 // markers, source bundling. It touches NO gdscript_vm.cpp internals — the hook
 // already resolved stack/member slots to declared names before calling us.
 #include "gdscript_ct_trace.h"
+
 #include "gdscript_tracer.h"
 
 #include "core/string/ustring.h"
@@ -102,9 +103,9 @@
 #undef mutable
 
 static trace_writer_t g_ct_writer = nullptr;
-static bool g_ct_inited = false;   // init attempted?
+static bool g_ct_inited = false; // init attempted?
 static bool g_ct_disabled = false; // tracing off (env unset or init failed)
-static bool g_ct_started = false;  // trace_writer_start emitted the first step?
+static bool g_ct_started = false; // trace_writer_start emitted the first step?
 
 // GDH-M6: is meta.dat bit 14 (the per-file line-count table) on for this
 // writer, and which path STRINGS have been given a recorded size? Declared
@@ -161,9 +162,9 @@ static thread_local bool g_ct_in_emit = false;
 static std::vector<uint64_t> g_ct_crossing_stack;
 
 // GF12: thread-attribution state (all guarded by g_ct_mutex).
-static bool g_ct_have_active = false;     // has any emit run yet?
-static uint64_t g_ct_active_thread = 0;   // OS thread the exec stream is currently attributed to
-static uint64_t g_ct_main_thread = 0;     // the first thread that ever emitted (implicit default)
+static bool g_ct_have_active = false; // has any emit run yet?
+static uint64_t g_ct_active_thread = 0; // OS thread the exec stream is currently attributed to
+static uint64_t g_ct_main_thread = 0; // the first thread that ever emitted (implicit default)
 // g_ct_pending_owner is the OS thread whose step currently occupies the writer's
 // single pending-step slot. A value hook attaches only when it still owns that
 // slot; any thread event flushes the pending step, so it invalidates the owner.
@@ -401,7 +402,8 @@ static bool gdscript_ct_ensure_writer() {
 			if (trace_writer_set_recording_id(g_ct_writer, pinned) == 0) {
 				fprintf(stderr, "[ct-gdh6] recording id PINNED to %s "
 								"(CT_RECORDING_ID); this recording is "
-								"deliberately not unique\n", pinned);
+								"deliberately not unique\n",
+						pinned);
 			} else {
 				fprintf(stderr, "[ct-gdh6] recording id pin REFUSED (%s): %s\n",
 						pinned, trace_writer_last_error());
@@ -773,7 +775,7 @@ static void gdscript_ct_note_and_bundle_path_locked(const String &p_res_path) {
 	// STRING-keyed early return GDH-M3 deleted. A reloaded file's string has
 	// been seen before, so its text is never bundled and the container carries
 	// ONE source view for a file that ran in three versions. This is the
-	// shipping behaviour GDH-M0 measured, and it is why that gate is phrased
+	// shipping behavior GDH-M0 measured, and it is why that gate is phrased
 	// on source-view BYTES rather than on path entries alone: the path entries
 	// are all still there under this arm.
 	{
@@ -1053,15 +1055,15 @@ static void gdscript_ct_write_raw(const Variant &value) {
 
 // GF3: encode a packed scalar array as a `Sequence` of a fixed element writer.
 // Packed*Array elements are always scalars, so no recursion (depth) is needed.
-#define CT_ENCODE_PACKED_SEQ(m_packed_type, m_elem_write)                        \
-	do {                                                                        \
-		const m_packed_type _a = value.operator m_packed_type();               \
-		const int _n = _a.size();                                              \
-		ct_value_begin_sequence(g_ct_encoder, g_ct_type_seq, _n);              \
-		for (int _i = 0; _i < _n; _i++) {                                      \
-			m_elem_write;                                                      \
-		}                                                                     \
-		ct_value_end_compound(g_ct_encoder);                                   \
+#define CT_ENCODE_PACKED_SEQ(m_packed_type, m_elem_write) \
+	do { \
+		const m_packed_type _a = value.operator m_packed_type(); \
+		const int _n = _a.size(); \
+		ct_value_begin_sequence(g_ct_encoder, g_ct_type_seq, _n); \
+		for (int _i = 0; _i < _n; _i++) { \
+			m_elem_write; \
+		} \
+		ct_value_end_compound(g_ct_encoder); \
 	} while (0)
 
 // GF4: intern a Struct type lazily by name. Idempotent (the writer's type
@@ -1255,15 +1257,15 @@ static void gct_object(Object *o) {
 // GF4: encode a packed struct-array (PackedVector2/3/4Array, PackedColorArray)
 // as a Sequence of the matching per-element Struct — picking up the GF3 Raw
 // deferrals now that the struct element encoders exist.
-#define CT_ENCODE_PACKED_STRUCT_SEQ(m_packed_type, m_elem_encode)                \
-	do {                                                                        \
-		const m_packed_type _a = value.operator m_packed_type();               \
-		const int _n = _a.size();                                              \
-		ct_value_begin_sequence(g_ct_encoder, g_ct_type_seq, _n);              \
-		for (int _i = 0; _i < _n; _i++) {                                      \
-			m_elem_encode(_a[_i]);                                             \
-		}                                                                     \
-		ct_value_end_compound(g_ct_encoder);                                   \
+#define CT_ENCODE_PACKED_STRUCT_SEQ(m_packed_type, m_elem_encode) \
+	do { \
+		const m_packed_type _a = value.operator m_packed_type(); \
+		const int _n = _a.size(); \
+		ct_value_begin_sequence(g_ct_encoder, g_ct_type_seq, _n); \
+		for (int _i = 0; _i < _n; _i++) { \
+			m_elem_encode(_a[_i]); \
+		} \
+		ct_value_end_compound(g_ct_encoder); \
 	} while (0)
 
 // GF3: recursively encode `value` into the reused CBOR encoder.
@@ -1652,10 +1654,11 @@ public:
 // analyzed — before anything is touched. `GDScript::reload()` is not the call
 // for that: it installs the result, which is the opposite of a pre-check, and
 // GDH-M5's `CT_GDH5_FALSIFY_SCRIPT_RELOAD_ONLY` arm already established it is
-// the wrong call here for a neighbouring reason. The parser and the analyzer
+// the wrong call here for a neighboring reason. The parser and the analyzer
 // used directly answer "is this a program?" without making it the program.
 #include "gdscript_analyzer.h"
 #include "gdscript_parser.h"
+
 #include "core/io/resource.h"
 
 #include <chrono>
@@ -1790,7 +1793,7 @@ int ct_reload_wait_seconds() {
 // expiring. That window is real but short, so a gate that waited for it to
 // occur naturally would be a flaky gate. Widening it on request is what makes
 // the race deterministic; it is off unless the variable is set, and the safe
-// point reports when it is honouring it.
+// point reports when it is honoring it.
 int ct_safe_point_delay_ms() {
 	static int cached = -1;
 	if (cached >= 0) {
@@ -1834,7 +1837,7 @@ void ct_collect_statics(const Ref<Script> &p_script, List<StringName> &r_names,
 	for (const PropertyInfo &pi : props) {
 		// `Object::get_property_list` merges the ClassDB properties of
 		// Object/Resource/Script — `source_code`, `resource_path`, `script`,
-		// `script/source` — with `GDScript::_get_property_list`'s statics.
+		// `script/source` — with `GDScript::_get_property_list`'s statistics.
 		// Only the latter carry `PROPERTY_USAGE_SCRIPT_VARIABLE`
 		// (gdscript_compiler.cpp:2897, set on every script-declared variable
 		// before it is filed into `static_variables_indices`).
@@ -1844,7 +1847,7 @@ void ct_collect_statics(const Ref<Script> &p_script, List<StringName> &r_names,
 		// did, the file was rewritten — and was reported as a lost static. The
 		// no-statics control arm of `gdh5_unpreserved_state_is_reported` went
 		// red on it, which is exactly what that arm is for: a report that names
-		// a loss on a script with no statics is the `oldCodeRetained: true`
+		// a loss on a script with no statistics is the `oldCodeRetained: true`
 		// shape, and it would have shipped looking like a measurement.
 		if ((pi.usage & PROPERTY_USAGE_SCRIPT_VARIABLE) == 0) {
 			continue;
@@ -2021,12 +2024,15 @@ bool ct_gdh8_inject_at(const char *p_stage) {
 	}
 	fprintf(stderr, "[ct-gdh8] FAULT INJECTED at design §8.1 stage \"%s\" "
 					"(CT_GDH8_INJECT_FAILURE); this build carries the "
-					"injection hook and it is ARMED\n", p_stage);
+					"injection hook and it is ARMED\n",
+			p_stage);
 	fflush(stderr);
 	return true;
 }
 #else
-bool ct_gdh8_inject_at(const char *) { return false; }
+bool ct_gdh8_inject_at(const char *) {
+	return false;
+}
 #endif
 
 // §8.1's recovery contract: "a failure at 4-6 is NOT recoverable by continuing:
@@ -2077,9 +2083,11 @@ void ct_close_trace_with_reason(const String &p_stage, const String &p_detail) {
 		// We explicitly wrap non-ASCII literals in String::utf8(...) to ensure cleanly
 		// encoded UTF-8 in the container's FFI_EVENT_ERROR record without 'Â'.
 		CharString content_cs = (String::utf8("codetracer: the recording was closed at design "
-								 "§8.1 stage ") + p_stage +
+											  "§8.1 stage ") +
+				p_stage +
 				" because the reload could not be completed coherently: " +
-				p_detail).utf8();
+				p_detail)
+										.utf8();
 		trace_writer_register_special_event(g_ct_writer, FFI_EVENT_ERROR,
 				meta_cs.get_data(), content_cs.get_data());
 	}
@@ -2228,7 +2236,6 @@ bool ct_reload_emit_marker_locked(CtReloadRequest &req, uint64_t p_old_id,
 	req.reload_ordinal = ordinal;
 	return true;
 #endif
-
 }
 
 // §8.1 steps 3-5, under the emit lock, at an engine safe point, and BEFORE the
@@ -2263,7 +2270,7 @@ bool ct_reload_register_in_trace_locked(CtReloadRequest &req, bool p_emit_marker
 	// exactly the state GDH-M0 measured and the state this milestone exists to
 	// leave. The reload itself still happens: the file is rewritten, the script
 	// is recompiled, the program plainly prints v2's and v3's tokens, and the
-	// acknowledgement says `applied`. Only the TRACE is wrong, and only about
+	// acknowledgment says `applied`. Only the TRACE is wrong, and only about
 	// which version ran.
 	//
 	// It also takes the marker down with it, necessarily rather than
@@ -2364,7 +2371,7 @@ bool ct_reload_register_in_trace_locked(CtReloadRequest &req, bool p_emit_marker
 	bool bundle_injected = ct_gdh8_inject_at("bundle");
 #if !defined(CT_GDH8_NO_INJECTION_HOOK)
 	if (bundle_injected) {
-		// See `g_ct_gdh8_source_views_poisoned`: the modelled failure persists,
+		// See `g_ct_gdh8_source_views_poisoned`: the modeled failure persists,
 		// so the recorder's lazy bundler cannot quietly undo it.
 		g_ct_gdh8_source_views_poisoned = true;
 	}
@@ -2515,7 +2522,7 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	//
 	// Before GDH-M8 there was no compile step AT ALL. `reload_scripts` returns
 	// void (gdscript.h:631) and drops `GDScript::reload()`'s Error on the floor
-	// (gdscript.cpp:2560), so an unparseable v2 was written to disk, handed to
+	// (gdscript.cpp:2560), so an unparsable v2 was written to disk, handed to
 	// the engine, and acknowledged `applied` with a boundary marker and a fresh
 	// path version already in the container. `REPRO_HCR_RELOAD_REASON_PARSE_
 	// ERROR` had existed in the agent's vocabulary the whole time with zero
@@ -2747,10 +2754,10 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 	// ---------------------------------------------------------------------
 #if defined(CT_GDH8_FALSIFY_IGNORE_COMPILE_FAILURE)
 	// FALSIFIER ARM (gdh8_a_reload_that_fails_the_compiler_is_refused_by_name):
-	// RESTORE THE PRE-GDH-M8b BEHAVIOUR. Never ask whether the compiler took it;
+	// RESTORE THE PRE-GDH-M8b BEHAVIOR. Never ask whether the compiler took it;
 	// report `applied`, keep the marker, keep the recording, and leave the engine
 	// on the half-cleared script. This is the defect verbatim, and the gate must
-	// go red on the ACKNOWLEDGEMENT — a v2 the compiler refused must not come
+	// go red on the ACKNOWLEDGMENT — a v2 the compiler refused must not come
 	// back `applied` — rather than merely on the process having stopped.
 	const bool ct_gdh8b_check_compiled = false;
 #else
@@ -2759,7 +2766,7 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 #if defined(CT_GDH8_FALSIFY_NO_RESTORE_AFTER_COMPILE_FAILURE)
 	// FALSIFIER ARM (same gate, second arm): detect the compile failure, name it
 	// on the wire and close the trace correctly — and DO NOT PUT THE ENGINE BACK.
-	// The ACKNOWLEDGEMENT claims stay green — `outcome: failed`, `reason:
+	// The ACKNOWLEDGMENT claims stay green — `outcome: failed`, `reason:
 	// compile-error`, the stage, the compiler's own message, the closed trace —
 	// so what kills this arm is the claim that the SESSION SURVIVES: the process
 	// is left on a script the compiler refused and never reaches its own end.
@@ -2943,7 +2950,7 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 				// §5.3: `_save_old_static_data` / `_restore_old_static_data` are
 				// TOOLS_ENABLED-only (gdscript.cpp:806-810, :890-899), so a
 				// `template_debug` build re-defaults every static through
-				// `_static_init()`. That is a real behavioural divergence from
+				// `_static_init()`. That is a real behavioral divergence from
 				// the editor and it is reported, never silently absorbed.
 				req.unpreserved.push_back("static-variable-lost:" + String(ne->get()) +
 						":" + String(be->get()) + "->" + String(now));
@@ -2953,7 +2960,7 @@ void ct_apply_reload_locked(CtReloadRequest &req) {
 
 #if defined(CT_GDH5_FALSIFY_UNCONDITIONAL_LOSS)
 	// FALSIFIER ARM (gdh5_unpreserved_state_is_reported): report a
-	// static-variable loss whether or not the script has statics, and whether
+	// static-variable loss whether or not the script has statistics, and whether
 	// or not anything changed. This is the `oldCodeRetained: true` shape — an
 	// unconditional literal in a status field — and it is here to keep that out
 	// of a report the whole milestone rests on. The gate must go red on the
@@ -2998,7 +3005,7 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 	// FALSIFIER ARM (gdh5_reload_is_refused_while_a_step_is_pending): remove
 	// the pending-step guard and apply the reload WHERE THE NOTIFICATION
 	// LANDED, on the agent's own thread, whether or not the VM is mid-step.
-	// The emit lock still serialises the writer, so nothing crashes — the
+	// The emit lock still serializes the writer, so nothing crashes — the
 	// recorder's single pending-step slot is simply flushed in the middle of a
 	// step whose values have not all arrived, and the marker lands between a
 	// step and its values. The gate must go red by finding that split IN THE
@@ -3079,10 +3086,12 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 			out->reason = REPRO_HCR_RELOAD_REASON_NO_SAFE_POINT;
 			static CharString s_timeout;
 			s_timeout = (String("no engine safe point was reached within ") +
-					itos(bound_s) + " s").utf8();
+					itos(bound_s) + " s")
+								.utf8();
 			out->detail = s_timeout.get_data();
 			fprintf(stderr, "[ct-gdh6] deferral TIMED OUT: no engine safe point "
-							"was reached within %d s\n", bound_s);
+							"was reached within %d s\n",
+					bound_s);
 			fflush(stderr);
 			return -1;
 		}
@@ -3176,8 +3185,8 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 			(unsigned long long)req.path_id,
 			(unsigned long long)req.in_flight_frames,
 			(unsigned long long)(g_ct_writer != nullptr
-					? trace_writer_source_reload_count(g_ct_writer)
-					: 0));
+							? trace_writer_source_reload_count(g_ct_writer)
+							: 0));
 	for (int i = 0; i < reported; i++) {
 		fprintf(stderr, "[ct-gdh5]   unpreserved: %s\n", out->unpreserved[i]);
 	}
@@ -3217,7 +3226,8 @@ void gdscript_ct_hcr_safe_point() {
 			const int delay_ms = ct_safe_point_delay_ms();
 			if (delay_ms > 0) {
 				fprintf(stderr, "[ct-gdh6] safe point holding the apply for %d ms "
-								"(CT_GDH6_SAFE_POINT_DELAY_MS)\n", delay_ms);
+								"(CT_GDH6_SAFE_POINT_DELAY_MS)\n",
+						delay_ms);
 				fflush(stderr);
 				std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
 			}

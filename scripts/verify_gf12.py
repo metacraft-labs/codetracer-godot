@@ -42,6 +42,7 @@ Usage:
   verify_gf12.py tamper <full.json> <mode>
     # wrongaddone | missingworker | threadidmain | workerwork
 """
+
 import json
 import sys
 
@@ -50,18 +51,18 @@ from ct_toplevel import reroot
 MAIN_TID = 1  # Thread::MAIN_ID
 EXPECTED_TYPES = ["None", "Int", "Float", "Bool", "String", "Variant", "Object"]
 
-ADD_ONE_LINE = 51        # `var r := x + 1`
+ADD_ONE_LINE = 51  # `var r := x + 1`
 WORKER_SEMPOST_LINE = 64  # `sem.post()`   — unique to worker()
 WORKER_COUNTER_LINE = 62  # `counter += total` in worker()
-POOL_COUNTER_LINE = 73    # `counter += total` in pool_task() — unique to pool
+POOL_COUNTER_LINE = 73  # `counter += total` in pool_task() — unique to pool
 MAIN_ONLY_LINES = (77, 82)  # `t := Thread.new()` / `sem.wait()` — main only
 
-EXPECTED_ADD_ONE = 5 + 3    # WORKER_ITERS + POOL_ITERS
+EXPECTED_ADD_ONE = 5 + 3  # WORKER_ITERS + POOL_ITERS
 WORKER_ADD_ONE = 5
 POOL_ADD_ONE = 3
 COHERENT_COUNTERS = {0, 3, 5, 8}
 FINAL_COUNTER = 8
-R_MIN_CAPTURED = 5          # ≥5 of 8 (rare single drop tolerated; never misattach)
+R_MIN_CAPTURED = 5  # ≥5 of 8 (rare single drop tolerated; never misattach)
 
 
 class VerifyError(Exception):
@@ -74,8 +75,7 @@ def load(path):
 
 
 def steps_of(doc):
-    return sorted((e for e in doc["events"] if e["kind"] == "step"),
-                  key=lambda s: s["step_index"])
+    return sorted((e for e in doc["events"] if e["kind"] == "step"), key=lambda s: s["step_index"])
 
 
 def calls_of(doc):
@@ -119,8 +119,8 @@ def verify(doc):
     pool = frames(doc, "pool_task")
     if len(add_one) != EXPECTED_ADD_ONE:
         raise VerifyError(
-            f"add_one must be called exactly {EXPECTED_ADD_ONE} times "
-            f"(5 worker + 3 pool), got {len(add_one)}")
+            f"add_one must be called exactly {EXPECTED_ADD_ONE} times (5 worker + 3 pool), got {len(add_one)}"
+        )
     if len(worker) != 1:
         raise VerifyError(f"expected exactly 1 worker frame, got {len(worker)}")
     if len(pool) != 1:
@@ -142,8 +142,7 @@ def verify(doc):
     if pool_tid == MAIN_TID or pool_tid == 0:
         raise VerifyError(f"pool thread is not a distinct worker thread: {pool_tid}")
     if worker_tid == pool_tid:
-        raise VerifyError(
-            f"worker and pool_task must be on DISTINCT threads, both {worker_tid}")
+        raise VerifyError(f"worker and pool_task must be on DISTINCT threads, both {worker_tid}")
 
     # main-only lines really run on the main thread
     for ln in MAIN_ONLY_LINES:
@@ -154,23 +153,19 @@ def verify(doc):
     # --- 4. deterministic per-thread WORK: add_one body line 51 ------------
     l51 = [(tid) for ln, tid, _ in walk_steps(doc) if ln == ADD_ONE_LINE]
     if len(l51) != EXPECTED_ADD_ONE:
-        raise VerifyError(
-            f"add_one body (line 51) must run {EXPECTED_ADD_ONE}x, got {len(l51)}")
+        raise VerifyError(f"add_one body (line 51) must run {EXPECTED_ADD_ONE}x, got {len(l51)}")
     if any(tid == MAIN_TID for tid in l51):
         raise VerifyError("add_one body ran on the main thread (impossible)")
     n_worker = sum(1 for tid in l51 if tid == worker_tid)
     n_pool = sum(1 for tid in l51 if tid == pool_tid)
     if n_worker != WORKER_ADD_ONE:
-        raise VerifyError(
-            f"worker thread must run add_one {WORKER_ADD_ONE}x, got {n_worker}")
+        raise VerifyError(f"worker thread must run add_one {WORKER_ADD_ONE}x, got {n_worker}")
     if n_pool != POOL_ADD_ONE:
-        raise VerifyError(
-            f"pool thread must run add_one {POOL_ADD_ONE}x, got {n_pool}")
+        raise VerifyError(f"pool thread must run add_one {POOL_ADD_ONE}x, got {n_pool}")
 
     # --- 5. thread-lifecycle events present + ≥2 distinct non-main threads --
     tevs = [e for e in steps_of(doc) if is_thread_event(e)]
-    nonmain_starts = [e for e in tevs
-                      if e.get("step_kind") == "sekThreadStart" and e["thread_id"] != MAIN_TID]
+    nonmain_starts = [e for e in tevs if e.get("step_kind") == "sekThreadStart" and e["thread_id"] != MAIN_TID]
     if not nonmain_starts:
         raise VerifyError("no ThreadStart with a non-main thread id was emitted")
     nonmain_threads = {tid for _, tid, _ in walk_steps(doc) if tid != MAIN_TID}
@@ -178,17 +173,12 @@ def verify(doc):
         raise VerifyError(f"expected ≥2 distinct non-main threads, got {nonmain_threads}")
 
     # --- 6. Mutex-guarded counter captured coherently ----------------------
-    counter_vals = [
-        v["value"].get("i")
-        for e in steps_of(doc) for v in e.get("vars", [])
-        if v["varname"] == "counter"
-    ]
+    counter_vals = [v["value"].get("i") for e in steps_of(doc) for v in e.get("vars", []) if v["varname"] == "counter"]
     bad = [c for c in counter_vals if c not in COHERENT_COUNTERS]
     if bad:
         raise VerifyError(f"incoherent counter value(s) captured (racy write?): {bad}")
     if FINAL_COUNTER not in counter_vals:
-        raise VerifyError(
-            f"final Mutex-guarded counter=={FINAL_COUNTER} not captured; got {counter_vals}")
+        raise VerifyError(f"final Mutex-guarded counter=={FINAL_COUNTER} not captured; got {counter_vals}")
 
     # --- 7. worker-thread VALUE capture: add_one's `r` ---------------------
     r_vals = []
@@ -205,14 +195,12 @@ def verify(doc):
                 raise VerifyError(f"add_one `r` out of range on worker thread: {rv}")
             r_vals.append(rv)
     if len(r_vals) < R_MIN_CAPTURED:
-        raise VerifyError(
-            f"too few worker-thread `r` values captured: {len(r_vals)} < {R_MIN_CAPTURED}")
+        raise VerifyError(f"too few worker-thread `r` values captured: {len(r_vals)} < {R_MIN_CAPTURED}")
 
     # --- 8. well-formedness ------------------------------------------------
     for c in calls_of(doc):
         if c["entry_step"] > c["exit_step"]:
-            raise VerifyError(
-                f"call {c.get('function')} entry_step>{c['exit_step']} (malformed)")
+            raise VerifyError(f"call {c.get('function')} entry_step>{c['exit_step']} (malformed)")
     for e in steps_of(doc):
         if e.get("step_kind") == "sekRaise":
             raise VerifyError("unexpected exception (sekRaise) event in trace")
@@ -225,9 +213,9 @@ def verify(doc):
         f"add_one body line51 x{len(l51)} split {n_worker}/{n_pool}; "
         f"counter coherent {sorted(set(counter_vals))} (final 8); "
         f"worker-thread `r` captured x{len(r_vals)} ({sorted(r_vals)}); "
-        "types [None,Int,Float,Bool,String,Variant,Object]; well-formed")
-    return {"worker_tid": worker_tid, "pool_tid": pool_tid,
-            "n_worker": n_worker, "n_pool": n_pool}
+        "types [None,Int,Float,Bool,String,Variant,Object]; well-formed"
+    )
+    return {"worker_tid": worker_tid, "pool_tid": pool_tid, "n_worker": n_worker, "n_pool": n_pool}
 
 
 def _del_first(doc, pred):

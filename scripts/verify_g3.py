@@ -10,11 +10,11 @@ Usage:
   verify_g3.py g3 <full.json>   # gf_calls.gd call/return nesting
   verify_g3.py g2 <full.json>   # g2probe.gd per-line steps (regression)
 """
+
 import json
 import sys
 
 from ct_toplevel import reroot
-
 
 # The recording's entry step (trace-events.md, "The entry step is part of
 # `start`"). The first frame the engine enters is `@implicit_new`, which has no
@@ -72,11 +72,9 @@ def verify_g3(doc):
 
     # --- 2. nesting: inner under outer under _init -------------------------
     if c_inner["parent_call_key"] != c_outer["call_key"]:
-        fail("inner.parent_call_key=%s != outer.call_key=%s"
-             % (c_inner["parent_call_key"], c_outer["call_key"]))
+        fail("inner.parent_call_key=%s != outer.call_key=%s" % (c_inner["parent_call_key"], c_outer["call_key"]))
     if c_outer["parent_call_key"] != c_init["call_key"]:
-        fail("outer.parent_call_key=%s != _init.call_key=%s"
-             % (c_outer["parent_call_key"], c_init["call_key"]))
+        fail("outer.parent_call_key=%s != _init.call_key=%s" % (c_outer["parent_call_key"], c_init["call_key"]))
 
     # --- 3. depth ladder ---------------------------------------------------
     if c_init["depth"] != 0:
@@ -90,19 +88,18 @@ def verify_g3(doc):
 
     # --- 4. sibling: same parent + depth as outer, runs AFTER outer --------
     if c_sibling["parent_call_key"] != c_init["call_key"]:
-        fail("sibling.parent_call_key=%s != _init.call_key=%s"
-             % (c_sibling["parent_call_key"], c_init["call_key"]))
+        fail("sibling.parent_call_key=%s != _init.call_key=%s" % (c_sibling["parent_call_key"], c_init["call_key"]))
     if c_sibling["depth"] != c_outer["depth"]:
-        fail("sibling.depth=%s != outer.depth=%s"
-             % (c_sibling["depth"], c_outer["depth"]))
+        fail("sibling.depth=%s != outer.depth=%s" % (c_sibling["depth"], c_outer["depth"]))
     if not (c_sibling["entry_step"] > c_outer["exit_step"]):
-        fail("sibling.entry_step=%s not > outer.exit_step=%s (sibling must run after outer returns)"
-             % (c_sibling["entry_step"], c_outer["exit_step"]))
+        fail(
+            "sibling.entry_step=%s not > outer.exit_step=%s (sibling must run after outer returns)"
+            % (c_sibling["entry_step"], c_outer["exit_step"])
+        )
 
     # --- 5. children lists reflect the tree --------------------------------
     if c_inner["call_key"] not in c_outer.get("children", []):
-        fail("outer.children=%s does not contain inner.call_key=%s"
-             % (c_outer.get("children"), c_inner["call_key"]))
+        fail("outer.children=%s does not contain inner.call_key=%s" % (c_outer.get("children"), c_inner["call_key"]))
     init_children = c_init.get("children", [])
     for child in (c_outer["call_key"], c_sibling["call_key"]):
         if child not in init_children:
@@ -126,14 +123,15 @@ def verify_g3(doc):
     # return (the writer persists a call on its return), so the record count is
     # the balanced-pair count: 4 source functions + @implicit_new + _process.
     if len(cs) != 6:
-        fail("expected 6 call_entry records (balanced pairs), got %d: %s"
-             % (len(cs), [c.get("function") for c in cs]))
+        fail("expected 6 call_entry records (balanced pairs), got %d: %s" % (len(cs), [c.get("function") for c in cs]))
 
     # every call's range must be well-formed
     for c in cs:
         if c["entry_step"] > c["exit_step"]:
-            fail("%s has entry_step=%s > exit_step=%s (malformed frame)"
-                 % (c["function"], c["entry_step"], c["exit_step"]))
+            fail(
+                "%s has entry_step=%s > exit_step=%s (malformed frame)"
+                % (c["function"], c["entry_step"], c["exit_step"])
+            )
 
     # --- 7. deterministic printed value ------------------------------------
     check_stdout(doc, "CT_G3_RESULT=107")
@@ -144,9 +142,11 @@ def verify_g3(doc):
     if got != expected:
         fail("G3 step lines %s != expected %s" % (got, expected))
 
-    print("PASS G3: _init -> outer -> inner nested; sibling after outer; "
-          "6 balanced call/return pairs (4 source + @implicit_new + _process); "
-          "CT_G3_RESULT=107; steps %s" % got)
+    print(
+        "PASS G3: _init -> outer -> inner nested; sibling after outer; "
+        "6 balanced call/return pairs (4 source + @implicit_new + _process); "
+        "CT_G3_RESULT=107; steps %s" % got
+    )
 
 
 def verify_g2(doc):
@@ -161,8 +161,7 @@ def verify_g2(doc):
             fail("G2: no step attributed to function %r (got %s)" % (n, sorted(fns)))
 
     check_stdout(doc, "CT_G2_STEPS=30")
-    print("PASS G2 regression: 7 per-line steps at %s across _init/add/_process; "
-          "CT_G2_STEPS=30" % got)
+    print("PASS G2 regression: 7 per-line steps at %s across _init/add/_process; CT_G2_STEPS=30" % got)
 
 
 def check_stdout(doc, needle):
@@ -179,8 +178,7 @@ def check_stdout(doc, needle):
         # live process stdout, so only warn here rather than hard-fail if the
         # io stream is absent entirely.
         if not blobs:
-            print("WARN: no io events in trace; stdout %r checked by runner instead"
-                  % needle, file=sys.stderr)
+            print("WARN: no io events in trace; stdout %r checked by runner instead" % needle, file=sys.stderr)
             return
         fail("expected %r in trace stdout, got: %r" % (needle, joined))
 

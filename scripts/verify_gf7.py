@@ -29,6 +29,7 @@ Usage:
                                             # srcpath|missingsuper|ctorarg|
                                             # nesting. exit 0 iff caught.
 """
+
 import json
 import sys
 
@@ -141,9 +142,11 @@ def assert_facts(doc):
             raise VerifyError("file %r absent from frame sources %r" % (f, sorted(frame_srcs)))
 
     # --- C. the MAIN driver _init (gf_zoo) ------------------------------------
-    main_inits = [c for c in ces
-                  if c.get("function") == "_init" and c.get("depth") == 0
-                  and c.get("parent_call_key") == -1 and src(c) == ZOO]
+    main_inits = [
+        c
+        for c in ces
+        if c.get("function") == "_init" and c.get("depth") == 0 and c.get("parent_call_key") == -1 and src(c) == ZOO
+    ]
     if len(main_inits) != 1:
         raise VerifyError("expected exactly 1 top-level gf_zoo _init, got %d" % len(main_inits))
     main_key = main_inits[0]["call_key"]
@@ -161,24 +164,22 @@ def assert_facts(doc):
     derived_speak_keys = set()
     for c in derived_speaks:
         if c.get("depth") != 1 or c.get("parent_call_key") != main_key:
-            raise VerifyError("derived speak not depth1/parent=MAIN: depth=%s parent=%s"
-                              % (c.get("depth"), c.get("parent_call_key")))
+            raise VerifyError(
+                "derived speak not depth1/parent=MAIN: depth=%s parent=%s" % (c.get("depth"), c.get("parent_call_key"))
+            )
         derived_speak_keys.add(c["call_key"])
-        check_scalar(exits[c["call_key"]].get("return_value", {}), "String", "...woof",
-                     "derived speak return")
+        check_scalar(exits[c["call_key"]].get("return_value", {}), "String", "...woof", "derived speak return")
     used = set()
     for c in base_speaks:
         if c.get("depth") != 2:
             raise VerifyError("base speak not depth2: depth=%s" % c.get("depth"))
         p = c.get("parent_call_key")
         if p not in derived_speak_keys:
-            raise VerifyError("base speak parent %s is not a derived speak %s"
-                              % (p, sorted(derived_speak_keys)))
+            raise VerifyError("base speak parent %s is not a derived speak %s" % (p, sorted(derived_speak_keys)))
         if p in used:
             raise VerifyError("two base speaks share the same derived parent %s" % p)
         used.add(p)
-        check_scalar(exits[c["call_key"]].get("return_value", {}), "String", "...",
-                     "base speak return")
+        check_scalar(exits[c["call_key"]].get("return_value", {}), "String", "...", "base speak return")
 
     # --- E. _init ctor chain across files -------------------------------------
     inits = [c for c in ces if c.get("function") == "_init"]
@@ -191,8 +192,9 @@ def assert_facts(doc):
     derived_init_keys = set()
     for c in derived_inits:
         if c.get("depth") != 1 or c.get("parent_call_key") != main_key:
-            raise VerifyError("derived _init not depth1/parent=MAIN: depth=%s parent=%s"
-                              % (c.get("depth"), c.get("parent_call_key")))
+            raise VerifyError(
+                "derived _init not depth1/parent=MAIN: depth=%s parent=%s" % (c.get("depth"), c.get("parent_call_key"))
+            )
         derived_init_keys.add(c["call_key"])
     used = set()
     for c in base_inits:
@@ -200,8 +202,7 @@ def assert_facts(doc):
             raise VerifyError("base _init not depth2: depth=%s" % c.get("depth"))
         p = c.get("parent_call_key")
         if p not in derived_init_keys:
-            raise VerifyError("base _init parent %s is not a derived _init %s"
-                              % (p, sorted(derived_init_keys)))
+            raise VerifyError("base _init parent %s is not a derived _init %s" % (p, sorted(derived_init_keys)))
         if p in used:
             raise VerifyError("two base _init share the same derived parent %s" % p)
         used.add(p)
@@ -215,14 +216,16 @@ def assert_facts(doc):
         raise VerifyError("pup (derived ctor arg) %r != ['rex','spot']" % pup)
     # super return value flows back derived<-base.
     if scalar_list(caps.get("sound", []), "String", "text") != ["...", "..."]:
-        raise VerifyError("sound (base body) %r != ['...','...']"
-                          % scalar_list(caps.get("sound", []), "String", "text"))
+        raise VerifyError(
+            "sound (base body) %r != ['...','...']" % scalar_list(caps.get("sound", []), "String", "text")
+        )
     if scalar_list(caps.get("base_sound", []), "String", "text") != ["...", "..."]:
-        raise VerifyError("base_sound (derived reads super) %r != ['...','...']"
-                          % scalar_list(caps.get("base_sound", []), "String", "text"))
+        raise VerifyError(
+            "base_sound (derived reads super) %r != ['...','...']"
+            % scalar_list(caps.get("base_sound", []), "String", "text")
+        )
     if scalar_list(caps.get("out", []), "String", "text") != ["...woof", "...woof"]:
-        raise VerifyError("out %r != ['...woof','...woof']"
-                          % scalar_list(caps.get("out", []), "String", "text"))
+        raise VerifyError("out %r != ['...woof','...woof']" % scalar_list(caps.get("out", []), "String", "text"))
 
     # --- G. inner-class method frames -----------------------------------------
     labels = [c for c in ces if c.get("function") == "label"]
@@ -230,39 +233,37 @@ def assert_facts(doc):
         raise VerifyError("expected 1 inner-class label frame, got %d" % len(labels))
     lc = labels[0]
     if lc.get("depth") != 1 or src(lc) != ANIMAL:
-        raise VerifyError("label frame not depth1/gf_animal.gd: depth=%s src=%s"
-                          % (lc.get("depth"), src(lc)))
+        raise VerifyError("label frame not depth1/gf_animal.gd: depth=%s src=%s" % (lc.get("depth"), src(lc)))
     check_scalar(exits[lc["call_key"]].get("return_value", {}), "String", "tag", "label return")
     if scalar_list(caps.get("made", []), "String", "text") != ["tag"]:
-        raise VerifyError("inner Tag.label local made %r != ['tag']"
-                          % scalar_list(caps.get("made", []), "String", "text"))
+        raise VerifyError(
+            "inner Tag.label local made %r != ['tag']" % scalar_list(caps.get("made", []), "String", "text")
+        )
 
     sizes = [c for c in ces if c.get("function") == "size"]
     if len(sizes) != 1:
         raise VerifyError("expected 1 inner-class size frame, got %d" % len(sizes))
     sc = sizes[0]
     if sc.get("depth") != 1 or src(sc) != DOG:
-        raise VerifyError("size frame not depth1/gf_dog.gd: depth=%s src=%s"
-                          % (sc.get("depth"), src(sc)))
+        raise VerifyError("size frame not depth1/gf_dog.gd: depth=%s src=%s" % (sc.get("depth"), src(sc)))
     check_scalar(exits[sc["call_key"]].get("return_value", {}), "Int", 3, "size return")
     if scalar_list(caps.get("s", []), "Int", "i") != [3]:
-        raise VerifyError("inner Kennel.size local s %r != [3]"
-                          % scalar_list(caps.get("s", []), "Int", "i"))
+        raise VerifyError("inner Kennel.size local s %r != [3]" % scalar_list(caps.get("s", []), "Int", "i"))
 
     # --- H. _static_init frame ------------------------------------------------
-    statics = [c for c in ces if c.get("function") == "_static_init"]
-    if len(statics) != 1:
-        raise VerifyError("expected 1 _static_init frame, got %d" % len(statics))
-    stc = statics[0]
+    static_inits = [c for c in ces if c.get("function") == "_static_init"]
+    if len(static_inits) != 1:
+        raise VerifyError("expected 1 _static_init frame, got %d" % len(static_inits))
+    stc = static_inits[0]
     if src(stc) != DOG:
         raise VerifyError("_static_init source %r != gf_dog.gd" % src(stc))
     parent = next((c for c in ces if c.get("call_key") == stc.get("parent_call_key")), None)
     if parent is None or parent.get("function") != "@static_initializer":
-        raise VerifyError("_static_init parent is not @static_initializer: %r"
-                          % (parent.get("function") if parent else None))
+        raise VerifyError(
+            "_static_init parent is not @static_initializer: %r" % (parent.get("function") if parent else None)
+        )
     if scalar_list(caps.get("marker", []), "Int", "i") != [7]:
-        raise VerifyError("_static_init local marker %r != [7]"
-                          % scalar_list(caps.get("marker", []), "Int", "i"))
+        raise VerifyError("_static_init local marker %r != [7]" % scalar_list(caps.get("marker", []), "Int", "i"))
 
     # --- I. member values (GF8) -----------------------------------------------
     # Updated for GF8 (2026-08-18): member/static writes are now captured, so the
@@ -274,27 +275,28 @@ def assert_facts(doc):
     # unchanged.
     species = scalar_list(caps.get("species", []), "String", "text")
     if species != ["rex", "spot"]:
-        raise VerifyError("member `species` captures %r != ['rex','spot'] (GF8 member writes)"
-                          % species)
+        raise VerifyError("member `species` captures %r != ['rex','spot'] (GF8 member writes)" % species)
     for member in ("v", "count"):
         if member in caps:
-            raise VerifyError("member %r captured but is never written (only declared)"
-                              % member)
+            raise VerifyError("member %r captured but is never written (only declared)" % member)
 
     # --- J. balance -----------------------------------------------------------
     if len(call_entries(doc)) != len(call_exits(doc)):
-        raise VerifyError("unbalanced call/return: %d entry vs %d exit"
-                          % (len(call_entries(doc)), len(call_exits(doc))))
+        raise VerifyError(
+            "unbalanced call/return: %d entry vs %d exit" % (len(call_entries(doc)), len(call_exits(doc)))
+        )
 
-    return ("PASS GF7: cross-FILE call tree over {gf_animal.gd, gf_dog.gd, "
-            "gf_zoo.gd}; super proven x2 (Dog.speak@gf_dog.gd depth1 -> "
-            "Animal.speak@gf_animal.gd depth2, returns '...woof'->'...'); ctor "
-            "chain x2 (Dog._init -> super Animal._init) with the arg propagated "
-            "cross-file (got_name=pup=['rex','spot']); inner classes label@"
-            "gf_animal.gd->'tag' and size@gf_dog.gd->3; _static_init@gf_dog.gd "
-            "under @static_initializer (marker=7); member species=['rex','spot'] "
-            "captured (GF8), v/count never written (absent); types [None,Int,"
-            "Float,Bool,String,Variant,Object]; call/return balanced.")
+    return (
+        "PASS GF7: cross-FILE call tree over {gf_animal.gd, gf_dog.gd, "
+        "gf_zoo.gd}; super proven x2 (Dog.speak@gf_dog.gd depth1 -> "
+        "Animal.speak@gf_animal.gd depth2, returns '...woof'->'...'); ctor "
+        "chain x2 (Dog._init -> super Animal._init) with the arg propagated "
+        "cross-file (got_name=pup=['rex','spot']); inner classes label@"
+        "gf_animal.gd->'tag' and size@gf_dog.gd->3; _static_init@gf_dog.gd "
+        "under @static_initializer (marker=7); member species=['rex','spot'] "
+        "captured (GF8), v/count never written (absent); types [None,Int,"
+        "Float,Bool,String,Variant,Object]; call/return balanced."
+    )
 
 
 # --- tamper -----------------------------------------------------------------
@@ -340,8 +342,9 @@ def tamper(doc, mode):
         raise VerifyError("tamper(ctorarg): no got_name capture")
     if mode == "nesting":
         # Reparent a base speak (depth 2) up to the MAIN _init (breaks super nesting).
-        main_key = next(c["call_key"] for c in call_entries(doc)
-                        if c.get("function") == "_init" and c.get("depth") == 0)
+        main_key = next(
+            c["call_key"] for c in call_entries(doc) if c.get("function") == "_init" and c.get("depth") == 0
+        )
         c = _base_speak(doc)
         if c is None:
             raise VerifyError("tamper(nesting): no base speak")
@@ -369,8 +372,7 @@ def main():
 
     if cmd == "tamper":
         if len(sys.argv) != 4:
-            print("usage: verify_gf7.py tamper <full.json> <srcpath|missingsuper|ctorarg|nesting>",
-                  file=sys.stderr)
+            print("usage: verify_gf7.py tamper <full.json> <srcpath|missingsuper|ctorarg|nesting>", file=sys.stderr)
             sys.exit(2)
         mode = sys.argv[3]
         tamper(doc, mode)

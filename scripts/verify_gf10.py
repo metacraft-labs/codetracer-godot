@@ -30,6 +30,7 @@ Usage:
   verify_gf10.py verify <full.json>
   verify_gf10.py tamper <full.json> <mode>   # markers|surviving|joinvalue|balance
 """
+
 import json
 import sys
 
@@ -109,8 +110,10 @@ def verify(doc):
     if doc["types"] != EXPECTED_TYPES:
         raise VerifyError(f"types table mismatch: {doc['types']}")
 
-    print("GF10 verify OK: 2 suspend + 2 resume markers; work/_initialize each 2 balanced frames; "
-          "base=10 survived -> kept=10; result=42; r=42")
+    print(
+        "GF10 verify OK: 2 suspend + 2 resume markers; work/_initialize each 2 balanced frames; "
+        "base=10 survived -> kept=10; result=42; r=42"
+    )
 
 
 def tamper(doc, mode):

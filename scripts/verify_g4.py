@@ -18,6 +18,7 @@ Usage:
                                            # tamper was caught (assertions
                                            # failed as required).
 """
+
 import json
 import sys
 
@@ -72,12 +73,9 @@ def value_scalar(val):
 def find_step(sts, function, line):
     matches = [s for s in sts if s.get("function") == function and s.get("line") == line]
     if not matches:
-        raise VerifyError(
-            "no step for function=%r line=%r" % (function, line))
+        raise VerifyError("no step for function=%r line=%r" % (function, line))
     if len(matches) != 1:
-        raise VerifyError(
-            "expected exactly 1 step for function=%r line=%r, got %d"
-            % (function, line, len(matches)))
+        raise VerifyError("expected exactly 1 step for function=%r line=%r, got %d" % (function, line, len(matches)))
     return matches[0]
 
 
@@ -92,31 +90,27 @@ def assert_facts(doc):
         raise VerifyError("types table %r != expected %r" % (types, EXPECTED_TYPES))
 
     observed = []
-    for (function, line, varname, kind, expected_val) in EXPECTED:
+    for function, line, varname, kind, expected_val in EXPECTED:
         st = find_step(sts, function, line)
         vars_here = st.get("vars", [])
         hit = [v for v in vars_here if v.get("varname") == varname]
         if not hit:
             raise VerifyError(
                 "step %s:%d carries no variable %r (vars=%r)"
-                % (function, line, varname,
-                   [v.get("varname") for v in vars_here]))
+                % (function, line, varname, [v.get("varname") for v in vars_here])
+            )
         if len(hit) != 1:
-            raise VerifyError(
-                "step %s:%d carries %d copies of %r"
-                % (function, line, len(hit), varname))
+            raise VerifyError("step %s:%d carries %d copies of %r" % (function, line, len(hit), varname))
         v = hit[0]
         val = v.get("value", {})
         got_kind = val.get("kind")
         if got_kind != kind:
-            raise VerifyError(
-                "%s:%d %s has kind %r, expected %r"
-                % (function, line, varname, got_kind, kind))
+            raise VerifyError("%s:%d %s has kind %r, expected %r" % (function, line, varname, got_kind, kind))
         got_val = value_scalar(val)
         if got_val != expected_val:
             raise VerifyError(
-                "%s:%d %s = %r (kind %s), expected %r"
-                % (function, line, varname, got_val, got_kind, expected_val))
+                "%s:%d %s = %r (kind %s), expected %r" % (function, line, varname, got_val, got_kind, expected_val)
+            )
         observed.append("%s:%d %s=%r:%s" % (function, line, varname, expected_val, kind))
 
     # Parallel-index integrity: a value must NOT leak onto a step that did not
@@ -132,11 +126,14 @@ def assert_facts(doc):
     if sorted(i_captures) != [(35, 10), (40, 15)]:
         raise VerifyError(
             "`i` captures %r != expected [(35, 10), (40, 15)] "
-            "(a value leaked onto the wrong step)" % (sorted(i_captures),))
+            "(a value leaked onto the wrong step)" % (sorted(i_captures),)
+        )
 
-    return ("PASS G4: %d captured values on their own steps; "
-            "types=%s; i=10@35 & i=15@40 parallel-indexed. %s"
-            % (len(EXPECTED), types, observed))
+    return "PASS G4: %d captured values on their own steps; types=%s; i=10@35 & i=15@40 parallel-indexed. %s" % (
+        len(EXPECTED),
+        types,
+        observed,
+    )
 
 
 def tamper(doc, mode):
@@ -199,8 +196,7 @@ def main():
         except VerifyError as e:
             print("OK: tamper(%s) correctly rejected: %s" % (mode, e))
             sys.exit(0)
-        print("FAIL: tamper(%s) slipped through the verifier (assertions still passed)"
-              % mode, file=sys.stderr)
+        print("FAIL: tamper(%s) slipped through the verifier (assertions still passed)" % mode, file=sys.stderr)
         sys.exit(1)
 
     print("unknown command %r" % cmd, file=sys.stderr)

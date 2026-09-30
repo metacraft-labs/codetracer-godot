@@ -27,6 +27,7 @@ Usage:
   verify_gf13.py verify <full.json>
   verify_gf13.py tamper <full.json> <mode>   # fmtvalue|assertstep|pushmsg|pushmissing
 """
+
 import json
 import sys
 
@@ -112,8 +113,7 @@ def verify(doc):
         if val.get("kind") != "String":
             raise VerifyError(f"{name} is not a String (kind={val.get('kind')})")
         if val.get("text") != expected:
-            raise VerifyError(
-                f"{name} value mismatch: got {val.get('text')!r}, expected {expected!r}")
+            raise VerifyError(f"{name} value mismatch: got {val.get('text')!r}, expected {expected!r}")
 
     # length sanity (guards against a silent truncation of raw/triple-quoted).
     lens = {name: len(exp) for _, name, exp in EXPECTED_STRINGS}
@@ -137,8 +137,7 @@ def verify(doc):
         raise VerifyError(f"assert line {ASSERT_LINE} did not record a step")
     for ln in CONTINUE_LINES:
         if step_at_line(doc, ln) is None:
-            raise VerifyError(
-                f"no step at line {ln}: execution did not continue past the passing assert")
+            raise VerifyError(f"no step at line {ln}: execution did not continue past the passing assert")
 
     # 3. push_warning / push_error — each recorded ONCE as an io event with the
     #    right kind and message (text). push_warning -> ioStderr, push_error ->
@@ -149,20 +148,24 @@ def verify(doc):
     if len(warns) != 1:
         raise VerifyError(
             f"expected exactly 1 push_warning io event ({WARN_KIND}, {WARN_MSG!r}), "
-            f"got {len(warns)}; all io={[ (e.get('io_kind'), e.get('text')) for e in io ]}")
+            f"got {len(warns)}; all io={[(e.get('io_kind'), e.get('text')) for e in io]}"
+        )
     if len(errs) != 1:
         raise VerifyError(
             f"expected exactly 1 push_error io event ({ERR_KIND}, {ERR_MSG!r}), "
-            f"got {len(errs)}; all io={[ (e.get('io_kind'), e.get('text')) for e in io ]}")
+            f"got {len(errs)}; all io={[(e.get('io_kind'), e.get('text')) for e in io]}"
+        )
 
     # 4. Types table unchanged (scalar-only; format arrays are temporaries).
     if doc["types"] != EXPECTED_TYPES:
         raise VerifyError(f"types table mismatch: {doc['types']}")
 
-    print("GF13 verify OK: formatting pf='7/a/3.14' ff='x y' raw='a\\\\nb'(len4) "
-          "tq='line1\\nline2'(len11) cc='a-x'; i=7 ok=true; assert step@55 + "
-          "continued 56/57/58/59; push_warning('gf13 warning',ioStderr) + "
-          "push_error('gf13 error',ioError); types [None,Int,Float,Bool,String,Variant]")
+    print(
+        "GF13 verify OK: formatting pf='7/a/3.14' ff='x y' raw='a\\\\nb'(len4) "
+        "tq='line1\\nline2'(len11) cc='a-x'; i=7 ok=true; assert step@55 + "
+        "continued 56/57/58/59; push_warning('gf13 warning',ioStderr) + "
+        "push_error('gf13 error',ioError); types [None,Int,Float,Bool,String,Variant]"
+    )
 
 
 def tamper(doc, mode):
