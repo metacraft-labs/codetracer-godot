@@ -117,6 +117,18 @@ if os.environ.get("CT_GDH6_ASAN", "") not in ("", "0"):
 # (`nim c --app:staticlib --mm:arc --noMain -d:release
 #  --nimMainPrefix:codetracerTraceWriter --passC:-fPIC -p:src`), run inside
 # that repo's `nix develop` shell so libzstd's headers resolve.
+# Current Linux x86_64 archive and ct_writer/include/codetracer_trace_writer.h:
+# codetracer-trace-format-nim ded420b (dev, 2026-09-30), built with the
+# `buildStaticLib` command above plus `-d:useMalloc`:
+#   nim c --app:staticlib --mm:arc --noMain -d:release -d:useMalloc
+#     --nimMainPrefix:codetracerTraceWriter --passC:-fPIC -p:src
+#     -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+# `-d:useMalloc` is required here. The engine calls the writer from its own
+# worker threads (GF12), and Nim's default allocator gives each thread its own
+# heap; memory a worker allocated is freed by the main thread at close, after
+# the worker has exited, and `trace_writer_close` then crashes in rawDealloc
+# (measured with gf_threads.gd: SIGSEGV on every run without it, a complete
+# and verified recording on every run with it).
 #
 # RESOLVED, HX-D-0 (2026-09-14): `ct_writer/libcodetracer_trace_writer.a`,
 # the macOS-arm64 fallback archive, was regenerated on a macOS arm64 host

@@ -420,6 +420,35 @@ void trace_writer_register_variable_raw(trace_writer_t handle,
                                         int type_kind,
                                         const char* type_name);
 
+/* Register a variable whose type is ALREADY interned.
+ *
+ * The `_by_type_id` forms exist because a caller may hold a type ID and no
+ * name. Every entry above takes a type NAME and interns it internally, which is
+ * fine for a recorder that names its types and impossible for one that does
+ * not: `codetracer_trace_types::ValueRecord::{Int,Float,Bool}` carries an ID
+ * and nothing else. Faced with that, a caller's only other option is to invent
+ * a name, and an invented name interns a type the recorder never declared.
+ *
+ * A type ID that was never returned by `trace_writer_ensure_type_id` is
+ * REFUSED: the call records nothing and `trace_writer_last_error` names the id
+ * and says it was never registered. These entry points return void, so that is
+ * the only channel they have — and a silent return would make a refused
+ * registration indistinguishable from a successful one.
+ */
+void trace_writer_register_return_int_by_type_id(trace_writer_t handle,
+                                                 int64_t value,
+                                                 size_t type_id);
+
+void trace_writer_register_variable_int_by_type_id(trace_writer_t handle,
+                                                   const char* name,
+                                                   int64_t value,
+                                                   size_t type_id);
+
+void trace_writer_register_variable_raw_by_type_id(trace_writer_t handle,
+                                                   const char* name,
+                                                   const char* value_repr,
+                                                   size_t type_id);
+
 void trace_writer_register_variable_cbor(trace_writer_t handle,
     const char* name,
     const uint8_t* cbor_data,
@@ -442,6 +471,40 @@ int trace_writer_register_assignment(trace_writer_t handle,
     uint8_t pass_by,
     const uint8_t* rvalue_cbor,
     size_t rvalue_cbor_len);
+
+/* Record a SCOPE EXIT on the step currently being buffered: the `count`
+ * variables named by `names` are going out of scope together.
+ *
+ * The record reaches the trace as a tag-3 `DropVariables` value-stream event
+ * (trace-events.md §"Value Stream Events": `count: varint, ids: [varint]`)
+ * inside the step's value record.  The ids are interned varname ids, resolved
+ * through the same varnames.dat table as the step's values.
+ *
+ * The names go in as ONE event rather than `count` single drops because which
+ * variables left together is what makes a drop a scope boundary.  A `count`
+ * of 0 is accepted and records an empty drop; `names` may be NULL only then.
+ *
+ * Returns 0 on success, 1 on failure (see trace_writer_last_error).
+ */
+int trace_writer_register_drop_variables(trace_writer_t handle,
+    const char* const* names,
+    size_t count);
+
+/* Record that ONE variable has ended its life, on the step currently being
+ * buffered.
+ *
+ * The record reaches the trace as a tag-2 `DropVariable` value-stream event
+ * (trace-events.md §"Value Stream Events": `variable_id: varint`).
+ *
+ * This is NOT the call above with a count of one.  Tag 2 says a variable
+ * ended; tag 3 says a SCOPE ended and took its bindings with it.  Reporting a
+ * lone drop as a one-variable scope exit asserts a program structure that was
+ * never there, so the two have separate entry points.
+ *
+ * Returns 0 on success, 1 on failure (see trace_writer_last_error).
+ */
+int trace_writer_register_drop_variable(trace_writer_t handle,
+    const char* name);
 
 void trace_writer_register_return_cbor(trace_writer_t handle,
     const uint8_t* cbor_data,
