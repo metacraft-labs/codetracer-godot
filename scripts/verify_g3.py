@@ -13,6 +13,14 @@ Usage:
 import json
 import sys
 
+from ct_toplevel import reroot
+
+
+# The recording's entry step (trace-events.md, "The entry step is part of
+# `start`"). The first frame the engine enters is `@implicit_new`, which has no
+# source line of its own, so the recording starts at line 1 of the script.
+ENTRY_STEP_LINE = 1
+
 
 def fail(msg):
     print("FAIL: " + msg, file=sys.stderr)
@@ -21,7 +29,7 @@ def fail(msg):
 
 def load(path):
     with open(path) as f:
-        return json.load(f)
+        return reroot(json.load(f))
 
 
 def events(doc):
@@ -132,7 +140,7 @@ def verify_g3(doc):
 
     # --- 8. step lines in execution order ----------------------------------
     got = [s["line"] for s in steps(doc)]
-    expected = [37, 30, 26, 27, 31, 38, 34, 39, 42]
+    expected = [ENTRY_STEP_LINE, 37, 30, 26, 27, 31, 38, 34, 39, 42]
     if got != expected:
         fail("G3 step lines %s != expected %s" % (got, expected))
 
@@ -143,7 +151,7 @@ def verify_g3(doc):
 
 def verify_g2(doc):
     got = [s["line"] for s in steps(doc)]
-    expected = [18, 19, 20, 14, 15, 21, 24]
+    expected = [ENTRY_STEP_LINE, 18, 19, 20, 14, 15, 21, 24]
     if got != expected:
         fail("G2 step lines %s != expected %s" % (got, expected))
 

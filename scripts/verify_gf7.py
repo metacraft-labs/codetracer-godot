@@ -32,6 +32,8 @@ Usage:
 import json
 import sys
 
+from ct_toplevel import reroot
+
 ANIMAL = "res://gf_animal.gd"
 DOG = "res://gf_dog.gd"
 ZOO = "res://gf_zoo.gd"
@@ -43,7 +45,7 @@ class VerifyError(Exception):
 
 def load(path):
     with open(path) as f:
-        return json.load(f)
+        return reroot(json.load(f))
 
 
 def events(doc):

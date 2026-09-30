@@ -60,10 +60,11 @@ x + y = 107
 
 so stdout contains `CT_G3_RESULT=107`.
 
-Per-line step lines, in execution order (9 steps):
+Per-line step lines, in execution order (9 executed lines, plus the entry
+step — see "The recording's root and entry step" below):
 
 ```
-37, 30, 26, 27, 31, 38, 34, 39, 42
+1, 37, 30, 26, 27, 31, 38, 34, 39, 42
 ```
 
 (37 = `x = outer(2)`; 30 = `a = inner(m+1)`; 26,27 = inner body; 31 = outer
@@ -72,10 +73,10 @@ Per-line step lines, in execution order (9 steps):
 
 ## `test-programs/gdscript/g2probe.gd` — per-line steps regression (G2)
 
-Step lines, in execution order (7 steps):
+Step lines, in execution order (7 executed lines, plus the entry step):
 
 ```
-18, 19, 20, 14, 15, 21, 24
+1, 18, 19, 20, 14, 15, 21, 24
 ```
 
 (18,19,20 = `_init` body up to the `add(x,y)` call site; 14,15 = `add` body;
@@ -85,3 +86,18 @@ Step lines, in execution order (7 steps):
 The G2 regression check requires this exact ordered line sequence to still be
 emitted after the G3 call/return hooks were added — proving the call hooks did
 not perturb the step stream.
+
+## The recording's root and entry step
+
+These follow from the trace format, not from the programs:
+`codetracer-trace-format-spec/trace-events.md`, "Recorder Integration —
+Starting a Recording". `trace_writer_start` opens a `<toplevel>` frame
+(function_id 0, call_key 0, depth 0) before any other call, and emits one entry
+step. The recorder issues it as the first engine frame (`@implicit_new`) is
+entered; that frame has no source line, so the entry step is at line 1 and is
+the first step of every program above, attributed to `@implicit_new`.
+
+Every engine frame is therefore one level below `<toplevel>`. The depths and
+parents stated in these notes are the ENGINE's (`_init` at depth 0, parent -1);
+`scripts/ct_toplevel.py` checks the root is exactly as the spec requires and
+sets it aside before any of them is asserted.

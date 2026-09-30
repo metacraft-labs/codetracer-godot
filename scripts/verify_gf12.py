@@ -45,6 +45,8 @@ Usage:
 import json
 import sys
 
+from ct_toplevel import reroot
+
 MAIN_TID = 1  # Thread::MAIN_ID
 EXPECTED_TYPES = ["None", "Int", "Float", "Bool", "String", "Variant", "Object"]
 
@@ -68,7 +70,7 @@ class VerifyError(Exception):
 
 def load(path):
     with open(path) as f:
-        return json.load(f)
+        return reroot(json.load(f))
 
 
 def steps_of(doc):

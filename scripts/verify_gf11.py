@@ -32,6 +32,8 @@ Usage:
 import json
 import sys
 
+from ct_toplevel import reroot
+
 NODE_PATH = "res://gf_node.gd"
 DRIVER_PATH = "res://gf_node_main.gd"
 EXPECTED_TYPES = ["None", "Int", "Float", "Bool", "String", "Variant", "Object"]
@@ -52,7 +54,7 @@ class VerifyError(Exception):
 
 def load(path):
     with open(path) as f:
-        return json.load(f)
+        return reroot(json.load(f))
 
 
 def step_index_map(doc):

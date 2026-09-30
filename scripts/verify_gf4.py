@@ -37,6 +37,8 @@ Usage:
 import json
 import sys
 
+from ct_toplevel import reroot
+
 FLOAT_TOL = 1e-6
 
 
@@ -122,7 +124,7 @@ EXPECTED = [
 
 def load(path):
     with open(path) as f:
-        return json.load(f)
+        return reroot(json.load(f))
 
 
 def all_steps(doc):
