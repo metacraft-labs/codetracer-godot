@@ -1843,6 +1843,26 @@ int ct_safe_point_delay_ms() {
 	return cached;
 }
 
+// GDH-M5 residual test hook: how long the safe point waits BEFORE it takes a
+// queued request. `CT_GDH6_SAFE_POINT_DELAY_MS` holds the apply after the
+// request is taken; this one holds the engine short of taking it, so a waiter's
+// bound can expire while the request is still only queued. Off unless asked for.
+int ct_safe_point_claim_hold_ms() {
+	static int cached = -1;
+	if (cached >= 0) {
+		return cached;
+	}
+	cached = 0;
+	const char *raw = getenv("CT_GDH6_SAFE_POINT_CLAIM_HOLD_MS");
+	if (raw != nullptr && raw[0] != '\0') {
+		int parsed = atoi(raw);
+		if (parsed > 0) {
+			cached = parsed;
+		}
+	}
+	return cached;
+}
+
 // Counters the gates read off stderr. They are the harness's evidence that the
 // deferral path was ENTERED, which the milestone's `anti_vacuity` requires:
 // a run in which the race window never opened must fail loudly rather than be
@@ -3244,6 +3264,21 @@ void gdscript_ct_hcr_safe_point() {
 #else
 		std::shared_ptr<CtReloadRequest> req;
 #endif
+		const int claim_hold_ms = ct_safe_point_claim_hold_ms();
+		if (claim_hold_ms > 0) {
+			bool queued;
+			{
+				std::lock_guard<std::mutex> lock(g_ct_reload_mutex);
+				queued = (bool)g_ct_reload_queued;
+			}
+			if (queued) {
+				fprintf(stderr, "[ct-gdh6] safe point holding for %d ms before taking the queued reload "
+								"(CT_GDH6_SAFE_POINT_CLAIM_HOLD_MS)\n",
+						claim_hold_ms);
+				fflush(stderr);
+				std::this_thread::sleep_for(std::chrono::milliseconds(claim_hold_ms));
+			}
+		}
 		{
 			std::lock_guard<std::mutex> lock(g_ct_reload_mutex);
 			req = g_ct_reload_queued;

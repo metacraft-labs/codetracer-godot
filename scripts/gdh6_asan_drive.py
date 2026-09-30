@@ -14,27 +14,34 @@ This driver makes the waiter's bound expire INSIDE that window, by setting
 (both read from the environment by the recorder itself, and both reported by
 it on stderr when they are in effect).
 
-It then asserts three things, in this order, and the FIRST TWO ARE
-PRECONDITIONS rather than the finding:
+It runs in one of three SHAPES, chosen by the environment it is given:
 
-  1. the deferral path was ENTERED — `[ct-gdh5] reload deferred to the next
-     safe point` appears.  A run in which the notification happened to land at
-     a safe point never opened the race window and must FAIL, never pass;
-  2. the timeout actually FIRED — `no engine safe point was reached within N s`
-     appears, and N is the bound this driver set rather than the shipping 30;
-  3. the waiter answered `failed` with a NAMED reason, the safe point
-     nonetheless COMPLETED its apply, and the process exited without dying.
+  late-apply  `CT_GDH6_SAFE_POINT_DELAY_MS` > the bound: the safe point takes
+              the request and the bound expires during the apply. The waiter
+              must report what the apply did — APPLIED — and the program must
+              then run v2. (Reporting "no safe point was reached" here was the
+              GDH-M5 residual: the coordinator was told a reload was refused
+              that the engine then applied.)
+  withdrawn   `CT_GDH6_SAFE_POINT_CLAIM_HOLD_MS` > the bound: the bound expires
+              while the request is still only queued. It is withdrawn, refused
+              as `no-safe-point`, and the program must never run v2.
+  control     neither: the safe point wins, the reload is applied, nothing
+              expires.
+
+In every shape the deferral path must have been ENTERED (`reload deferred to
+the next safe point`) and the hold that shape needs must have been taken; a
+run in which the race window never opened fails rather than passes.
 
 Whether AddressSanitizer said anything is decided by the SHELL DRIVER over
 this process's captured output, not here — the two runs (clean and mutated)
 want opposite verdicts on the same text, and putting that decision in one
 place keeps them from drifting.
 
-`--delay-ms 0` selects the CONTROL shape: the safe point wins the race, the
-reload is applied, the waiter is woken, and nothing times out.  It is what
-makes "ASan is quiet" mean something; without it a quiet run could simply be
-a run in which the window never opened.
+The control shape is what makes "ASan is quiet" mean something in the ASan
+gate; without it a quiet run could simply be a run in which the window never
+opened.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -45,6 +52,7 @@ import socket
 import subprocess
 import sys
 import time
+from typing import NoReturn
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -58,11 +66,15 @@ APPLIED_RE = re.compile(r"\[ct-gdh5\] reload applied: ")
 # HANDLER after its wait returns, so a run in which the wait TIMED OUT never
 # reaches it — the handler has already answered `failed` and gone. Reading it
 # would have made this gate assert the absence of a message on a path that
-# structurally cannot print one. Godot's own behaviour is the better witness
+# structurally cannot print one. Godot's own behavior is the better witness
 # and it is the one the gate uses.
 V1_RE = re.compile(r"GDH6_ASAN_V1=(\d+) ")
 V2_RE = re.compile(r"GDH6_ASAN_V2=(\d+) ")
 HOLD_RE = re.compile(r"\[ct-gdh6\] safe point holding the apply for (\d+) ms")
+CLAIM_HOLD_RE = re.compile(r"\[ct-gdh6\] safe point holding for (\d+) ms before taking")
+BOUND_EXPIRED_APPLYING_RE = re.compile(
+    r"\[ct-gdh6\] deferral bound of (\d+) s expired while the safe point was applying"
+)
 
 FAILURES: list[str] = []
 ASSERTED = 0
@@ -83,7 +95,7 @@ def ck(ok: bool, msg: str) -> bool:
     return ok
 
 
-def die(msg: str) -> "NoReturn":  # noqa: F821
+def die(msg: str) -> NoReturn:
     print("DRIVER-FAIL: %s" % msg, file=sys.stderr)
     sys.exit(2)
 
@@ -104,33 +116,39 @@ def main() -> int:
     want_bound = os.environ.get("CT_GDH6_RELOAD_WAIT_SECONDS", "")
     want_delay = int(os.environ.get("CT_GDH6_SAFE_POINT_DELAY_MS", "0") or 0)
     if not want_bound:
-        die("CT_GDH6_RELOAD_WAIT_SECONDS is unset. This driver's whole subject "
+        die(
+            "CT_GDH6_RELOAD_WAIT_SECONDS is unset. This driver's whole subject "
             "is a bound that expires during the apply, and the shipping bound "
             "is 30 s; a run without the override would either take half a "
-            "minute or never reach the timeout at all.")
-    expect_timeout = want_delay > int(want_bound) * 1000
+            "minute or never reach the timeout at all."
+        )
+    want_claim_hold = int(os.environ.get("CT_GDH6_SAFE_POINT_CLAIM_HOLD_MS", "0") or 0)
+    if want_claim_hold > int(want_bound) * 1000:
+        shape = "withdrawn"
+    elif want_delay > int(want_bound) * 1000:
+        shape = "late-apply"
+    else:
+        shape = "control"
+    print("[gdh6-asan] shape: %s" % shape)
 
     project = os.path.join(args.work, "project")
     if os.path.isdir(project):
         shutil.rmtree(project)
     os.makedirs(project)
-    shutil.copyfile(os.path.join(args.fixtures, "project.godot"),
-                    os.path.join(project, "project.godot"))
+    shutil.copyfile(os.path.join(args.fixtures, "project.godot"), os.path.join(project, "project.godot"))
     # The ASan gate uses its OWN fixture pair, not the gate fixtures.  It
     # needs the program to STILL BE RUNNING when the safe point finishes its
     # deliberately delayed apply, and probe_v1.gd runs 1.8 s in total — shorter
     # than the hold that makes the timeout deterministic.  Measured: with a 2 s
     # bound and a 9 s hold the program ended first and "the safe point
     # completed its apply" went red for a reason that was the FIXTURE's.
-    shutil.copyfile(os.path.join(args.fixtures, "asan_v1.gd"),
-                    os.path.join(project, "probe.gd"))
+    shutil.copyfile(os.path.join(args.fixtures, "asan_v1.gd"), os.path.join(project, "probe.gd"))
     trace_dir = os.path.join(args.work, "trace")
     os.makedirs(trace_dir, exist_ok=True)
 
     sock_path = os.path.join(args.socket_dir, "gdh6a-%d.sock" % os.getpid())
     if len(sock_path) >= 100:
-        die("the agent socket path is %d bytes; sun_path holds 108"
-            % len(sock_path))
+        die("the agent socket path is %d bytes; sun_path holds 108" % len(sock_path))
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -146,10 +164,13 @@ def main() -> int:
     env["CT_GDSCRIPT_TRACE"] = trace_dir
 
     proc = subprocess.Popen(
-        [args.engine, "--headless", "--path", project, "--script",
-         "res://probe.gd"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True,
-        bufsize=1)
+        [args.engine, "--headless", "--path", project, "--script", "res://probe.gd"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
 
     lines: list[str] = []
 
@@ -202,78 +223,113 @@ def main() -> int:
 
     with open(os.path.join(args.fixtures, "asan_v2.gd"), "rb") as handle:
         content = handle.read()
-    peer.send(agentwire.source_changed("gdh6-asan-0002", "res://probe.gd", 2,
-                                       content))
+    peer.send(agentwire.source_changed("gdh6-asan-0002", "res://probe.gd", 2, content))
     kind, obj = peer.read(args.bound)
-    result = obj.get("sourceReloadResult") if kind == "sourceReloadResult" \
-        else None
+    result = obj.get("sourceReloadResult") if kind == "sourceReloadResult" else None
 
     out, rc = finish(None)
     print(out)
     print("[gdh6-asan] engine exit: %d" % rc)
 
     # --- 1. the deferral path was ENTERED ---------------------------------
-    ck(bool(DEFERRED_RE.search(out)),
-       "the deferral path was ENTERED: a run in which the notification landed "
-       "at a safe point never opened the race window and must fail, not pass")
-    # --- the hold really happened, when one was asked for ------------------
-    if want_delay > 0:
-        m = HOLD_RE.search(out)
-        ck(m is not None and int(m.group(1)) == want_delay,
-           "the safe point honoured the %d ms hold this run asked for "
-           "(reported: %r)" % (want_delay, m.group(1) if m else None))
-    else:
-        ck(HOLD_RE.search(out) is None,
-           "CONTROL: no hold was asked for and none was taken")
+    ck(
+        bool(DEFERRED_RE.search(out)),
+        "the deferral path was ENTERED: a run in which the notification landed "
+        "at a safe point never opened the race window and must fail, not pass",
+    )
+    n_v1, n_v2 = len(V1_RE.findall(out)), len(V2_RE.findall(out))
+    refused = ((result or {}).get("refusedFiles") or [{}])[0]
+    reason_text = "%s %s %s" % ((result or {}).get("reason", ""), refused.get("reason", ""), refused.get("detail", ""))
 
-    if expect_timeout:
-        # --- 2. the timeout FIRED, at the bound THIS run set ---------------
+    # --- the hold really happened, when one was asked for ------------------
+    if shape == "withdrawn":
+        m = CLAIM_HOLD_RE.search(out)
+        ck(
+            m is not None and int(m.group(1)) == want_claim_hold,
+            "the safe point held %d ms BEFORE taking the request, as this run "
+            "asked (reported: %r)" % (want_claim_hold, m.group(1) if m else None),
+        )
+    elif want_delay > 0:
+        m = HOLD_RE.search(out)
+        ck(
+            m is not None and int(m.group(1)) == want_delay,
+            "the safe point honored the %d ms hold this run asked for "
+            "(reported: %r)" % (want_delay, m.group(1) if m else None),
+        )
+    else:
+        ck(
+            HOLD_RE.search(out) is None and CLAIM_HOLD_RE.search(out) is None,
+            "CONTROL: no hold was asked for and none was taken",
+        )
+
+    if shape == "late-apply":
+        # The bound expired AFTER the safe point took the request: the apply
+        # was already under way, so the waiter must report what the apply
+        # did, not that no safe point came.
+        m = BOUND_EXPIRED_APPLYING_RE.search(out)
+        ck(m is not None, "the waiter's bound EXPIRED while the apply was in flight")
+        ck(
+            m is not None and m.group(1) == want_bound,
+            "and it expired at the bound this run set (%s s), not the shipping 30 s" % want_bound,
+        )
+        ck(
+            result is not None,
+            "the coordinator got an answer at all; a waiter that neither "
+            "applied nor refused is a hang, and a hang is not a diagnosis",
+        )
+        ck(
+            result is not None and result.get("outcome") == "applied",
+            "the coordinator was told the reload was APPLIED, which is what "
+            "happened (it was told %r, reason %r)" % ((result or {}).get("outcome"), reason_text.strip()),
+        )
+        # Measured from the PROGRAM: v1's tokens before the reload and v2's
+        # after it. That the reload landed is Godot's statement.
+        ck(
+            n_v1 > 0 and n_v2 > 0,
+            "the safe point COMPLETED its apply after the bound expired — the "
+            "program printed %d v1 token(s) and then %d v2 token(s). Shared "
+            'ownership is what makes that safe: a timeout means "stop '
+            'waiting", not "delete what the other thread is using"' % (n_v1, n_v2),
+        )
+        ck(TIMEOUT_RE.search(out) is None, "and nothing claimed that no safe point was reached, because one was")
+    elif shape == "withdrawn":
+        # The bound expired while the request was still only QUEUED: it is
+        # withdrawn, refused by name, and never applied.
         m = TIMEOUT_RE.search(out)
-        ck(m is not None,
-           "the waiter's bound EXPIRED while the apply was in flight")
-        ck(m is not None and m.group(1) == want_bound,
-           "and it expired at the bound this run set (%s s), not the shipping "
-           "30 s — a message naming 30 would mean the override was ignored "
-           "and the window was not the one we think we measured" % want_bound)
-        # --- 3a. the waiter answered `failed`, with a NAMED reason ---------
-        ck(result is not None,
-           "the coordinator got an answer at all; a waiter that neither "
-           "applied nor refused is a hang, and a hang is not a diagnosis")
-        if result is not None:
-            ck(result.get("outcome") != "applied",
-               "the waiter did NOT claim the reload was applied (it reported "
-               "%r)" % result.get("outcome"))
-            refused = (result.get("refusedFiles") or [{}])[0]
-            detail = "%s %s %s" % (result.get("reason", ""),
-                                   refused.get("reason", ""),
-                                   refused.get("detail", ""))
-            ck("safe point" in detail.lower() or "reason" in result,
-               "and the refusal is NAMED rather than bare: %r" % (detail,))
-        else:
-            ck(False, "no result to inspect")
-            ck(False, "no result to inspect")
-        # --- 3b. the safe point nonetheless COMPLETED its apply ------------
-        # Measured from the PROGRAM, not from a log line: v1's tokens before
-        # the reload and v2's after it. That the reload really landed is
-        # Godot's statement, not the recorder's.
-        n_v1, n_v2 = len(V1_RE.findall(out)), len(V2_RE.findall(out))
-        ck(n_v1 > 0 and n_v2 > 0,
-           "the safe point COMPLETED its apply after the waiter gave up — the "
-           "program printed %d v1 token(s) and then %d v2 token(s), so the "
-           "reload landed. This is the whole point of shared ownership: a "
-           "timeout means \"stop waiting\", not \"delete what the other "
-           "thread is using\"" % (n_v1, n_v2))
+        ck(m is not None, "the waiter's bound EXPIRED before the safe point took the request")
+        ck(m is not None and m.group(1) == want_bound, "and it expired at the bound this run set (%s s)" % want_bound)
+        ck(result is not None, "the coordinator got an answer at all")
+        ck(
+            result is not None and result.get("outcome") != "applied" and "no-safe-point" in reason_text,
+            "the coordinator was told the reload was REFUSED with reason "
+            "no-safe-point (it was told %r, %r)" % ((result or {}).get("outcome"), reason_text.strip()),
+        )
+        ck(
+            "safe point" in reason_text.lower(),
+            "and the refusal detail names the missing safe point: %r" % reason_text.strip(),
+        )
+        ck(
+            n_v1 > 0 and n_v2 == 0,
+            "and the withdrawn reload was NEVER applied: %d v1 token(s), %d v2 "
+            "token(s) — a refusal the engine then applied anyway would be the "
+            "same lie in the other direction" % (n_v1, n_v2),
+        )
     else:
         # CONTROL: the safe point wins.
-        ck(TIMEOUT_RE.search(out) is None,
-           "CONTROL: nothing timed out")
-        ck(result is not None and result.get("outcome") == "applied",
-           "CONTROL: the reload was APPLIED and the waiter woken (%r)"
-           % (result.get("outcome") if result else None,))
-        ck(len(V1_RE.findall(out)) > 0 and len(V2_RE.findall(out)) > 0,
-           "CONTROL: the program ran v1 and then v2, so the apply landed "
-           "(and here the recorder's own `reload applied` line is present "
-           "too: %r)" % bool(APPLIED_RE.search(out)))
+        ck(
+            TIMEOUT_RE.search(out) is None and BOUND_EXPIRED_APPLYING_RE.search(out) is None,
+            "CONTROL: no bound expired",
+        )
+        ck(
+            result is not None and result.get("outcome") == "applied",
+            "CONTROL: the reload was APPLIED and the waiter woken (%r)" % (result.get("outcome") if result else None,),
+        )
+        ck(
+            n_v1 > 0 and n_v2 > 0,
+            "CONTROL: the program ran v1 and then v2, so the apply landed "
+            "(and here the recorder's own `reload applied` line is present "
+            "too: %r)" % bool(APPLIED_RE.search(out)),
+        )
         ck(True, "CONTROL: no refusal to inspect")
         ck(True, "CONTROL: no refusal to inspect")
         ck(True, "CONTROL: no bound to check")
@@ -282,10 +338,12 @@ def main() -> int:
     # shell driver decides on the sanitizer's report — but a run that died is
     # a run whose other assertions were made over a truncated transcript, and
     # that has to be visible.
-    ck(rc == 0 or rc == 1,
-       "the engine exited %d; a signal death (negative rc) means the "
-       "transcript above is truncated and every assertion over it is weaker "
-       "than it looks" % rc)
+    ck(
+        rc == 0 or rc == 1,
+        "the engine exited %d; a signal death (negative rc) means the "
+        "transcript above is truncated and every assertion over it is weaker "
+        "than it looks" % rc,
+    )
 
     # Trap 4c, ADDED AT REVIEW (2026-09-11).  `ASSERTED == 0` catches a driver
     # that checked NOTHING; it does not catch one that checked five things
@@ -299,10 +357,11 @@ def main() -> int:
     # already pads with three `ck(True, "CONTROL: nothing to inspect")` lines
     # to keep them equal — so one number covers both.  Written from a run, not
     # counted off the source.
-    ck(ASSERTED + 1 == EXPECTED_ASSERTIONS,
-       "this arm made all %d of its claims (it made %d) — a branch that "
-       "quietly asserts fewer is a weaker gate reporting the same verdict"
-       % (EXPECTED_ASSERTIONS, ASSERTED + 1))
+    ck(
+        ASSERTED + 1 == EXPECTED_ASSERTIONS,
+        "this arm made all %d of its claims (it made %d) — a branch that "
+        "quietly asserts fewer is a weaker gate reporting the same verdict" % (EXPECTED_ASSERTIONS, ASSERTED + 1),
+    )
     print("[gdh6-asan] assertions: %d, failures: %d" % (ASSERTED, len(FAILURES)))
     if ASSERTED == 0:
         die("no check ran at all")
