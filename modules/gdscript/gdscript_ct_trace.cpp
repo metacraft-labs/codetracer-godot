@@ -95,6 +95,10 @@
 #include <mutex> // GF12: serialize the shared writer/encoder across worker threads
 #include <vector> // MT3: LIFO stack of open native<->VM crossing span ids
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <dlfcn.h> // MT3: probe for the native recorder's interposer
+#endif
+
 // The CTFS writer's C header names a parameter `mutable`, which is a C++
 // keyword. Shim it out for this C++ translation unit (we never call that
 // entry point here).
@@ -160,6 +164,24 @@ static thread_local bool g_ct_in_emit = false;
 // resumes) simply leaves its crossing OPEN — the OPEN record was already flushed,
 // and atexit close commits it — which is acceptable degradation, not corruption.
 static std::vector<uint64_t> g_ct_crossing_stack;
+
+// MT3: is this process being recorded by the native recorder (MCR)? Crossing
+// spans bound the VM frames inside a NATIVE recording; with no native recording
+// there is no other altitude to cross from, and the spec requires a standalone
+// recording to carry none. The native recorder's in-process interposer exports
+// `ct_mcr_now` (codetracer-native-recorder ct_interpose trace_context.nim) to
+// language adapters; resolving it weakly means the engine neither links nor
+// depends on the recorder. Decided once, when the writer is created.
+static bool g_ct_mcr_session = false;
+
+static bool gdscript_ct_detect_mcr_session() {
+#if defined(__unix__) || defined(__APPLE__)
+	return dlsym(RTLD_DEFAULT, "ct_mcr_now") != nullptr;
+#else
+	// No native recorder injects into a Windows engine process.
+	return false;
+#endif
+}
 
 // GF12: thread-attribution state (all guarded by g_ct_mutex).
 static bool g_ct_have_active = false; // has any emit run yet?
@@ -379,6 +401,12 @@ static bool gdscript_ct_ensure_writer() {
 		g_ct_disabled = true;
 		return false;
 	}
+
+	g_ct_mcr_session = gdscript_ct_detect_mcr_session();
+	fprintf(stderr, "[ct-mt3] crossing spans %s\n",
+			g_ct_mcr_session ? "ON: a native recording session is present (ct_mcr_now resolved)"
+							 : "off: no native recording session (ct_mcr_now unresolved)");
+	fflush(stderr);
 
 	// GDH-M6: pin the recording identity when asked to.
 	//
@@ -958,8 +986,13 @@ void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source
 	// this call's entry_step. Always push exactly one entry per on_call (0 on
 	// failure) so the matching on_return pops exactly one and the stack stays
 	// balanced with the call/return pairs. Guarded by the live writer handle.
+	//
+	// The crossing is RECORDED only inside a native recording session: a
+	// standalone recording emits no crossing spans (Mixed-Trace-Implicit-Switch.md
+	// §4; GDScript-Recorder MT3). The stack entry is pushed either way, as 0,
+	// because it is also the recorder's count of open frames.
 	if (g_ct_writer) {
-		uint64_t span_id = trace_writer_begin_crossing(g_ct_writer, "gdscript-frame");
+		uint64_t span_id = g_ct_mcr_session ? trace_writer_begin_crossing(g_ct_writer, "gdscript-frame") : 0;
 		g_ct_crossing_stack.push_back(span_id);
 	}
 }
