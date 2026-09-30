@@ -90,7 +90,7 @@ failures=0
 # the tree the plain one" — a question this campaign has repeatedly needed a
 # checkable answer to.
 # NOTE THE FILENAME, it is the whole point. `$OUT/godot-plain.hcr` is ALREADY
-# TAKEN in this driver: its first ASan build is LABELLED `plain` (meaning "ASan
+# TAKEN in this driver: its first ASan build is LABELED `plain` (meaning "ASan
 # but unmutated"), and `build_asan` copies that SANITIZED engine to
 # `$OUT/godot-$label.hcr`. A snapshot written there is overwritten by the first
 # build and the exit trap then "restores" a sanitized engine over the driver's
@@ -122,7 +122,7 @@ cp -f "$BIN" "$PLAIN" || die "could not copy the un-sanitized engine aside"
 # its own process group (`setsid`) and stopped by the handler before it copies;
 # that is a restructuring of the build invocations in three drivers and is left
 # as owed work rather than done blind. Until then the two oracles below are the
-# defence, and both are cheap: `$PLAIN` is a byte-exact comparison target, and
+# defense, and both are cheap: `$PLAIN` is a byte-exact comparison target, and
 # the patchable build is bit-reproducible (measured: two independent builds of
 # the same tree both sha256 3a97806f…), so `sha256sum` against a fresh build
 # also answers it.
@@ -203,7 +203,8 @@ log "waiter bound: ${WAIT_S}s   safe-point hold: ${DELAY_MS}ms"
 echo
 
 # ---------------------------------------------------------------------------
-# 1. The clean run: the waiter times out, the safe point finishes, ASan quiet.
+# 1. The clean run: the bound expires during the apply, the waiter reports the
+#    apply's outcome, the safe point finishes, ASan quiet.
 # ---------------------------------------------------------------------------
 if [[ "$REBUILD" == "1" ]]; then
   log "building the ASan engine (plain)"
@@ -350,7 +351,7 @@ echo "GDH-M6: a deferral whose bound expires while the safe point is still"
 # then a sentence with a hole in it.  Harmless to the verdict — `failures` is
 # already decided above — but it is the gate's own summary of what it proved,
 # and a summary that runs a stray command and drops the word it was
-# emphasising is not one to quote.
-echo "        applying answers 'failed' with a named reason, the safe point"
+# emphasizing is not one to quote.
+echo "        applying waits for the apply and answers 'applied', the safe point"
 echo "        completes, and AddressSanitizer reports nothing — while the"
 echo "        raw-pointer form of the same code is killed by ASan's report."

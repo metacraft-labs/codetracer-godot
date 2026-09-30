@@ -1711,6 +1711,11 @@ struct CtReloadRequest {
 	Vector<uint8_t> content;
 	unsigned int generation = 0;
 
+	// Set, under g_ct_reload_mutex, when the safe point takes the request. From
+	// then on the apply WILL run, so a waiter whose bound expires must wait for
+	// its outcome rather than report that no safe point came.
+	bool claimed = false;
+
 	// Result, filled at the safe point.
 	bool done = false;
 	bool applied = false;
@@ -3114,28 +3119,37 @@ static int gdscript_ct_hcr_source_reload(void *ctx, const char *reload_id,
 		// Bounded: a safe point that never comes must be a named failure, not a
 		// stall in the host's reply. The bound is reported in the message, so a
 		// run under a test override cannot be read as having waited 30 s.
-		if (!g_ct_reload_cv.wait_for(lock, std::chrono::seconds(bound_s),
-					[&watched] { return watched->done; })) {
+		bool timed_out = !g_ct_reload_cv.wait_for(lock, std::chrono::seconds(bound_s),
+				[&watched] { return watched->done; });
+#if !defined(CT_GDH6_FALSIFY_RAW_POINTER_QUEUE)
+		if (timed_out && watched->claimed) {
+			// The safe point took the request before the bound expired: the
+			// apply is under way and will finish. Its outcome is the answer —
+			// reporting `no-safe-point` here told the coordinator a reload was
+			// refused that the engine then applied.
+			fprintf(stderr, "[ct-gdh6] deferral bound of %d s expired while the safe point was applying; "
+							"waiting for the apply to finish\n",
+					bound_s);
+			fflush(stderr);
+			g_ct_reload_cv.wait(lock, [&watched] { return watched->done; });
+			timed_out = false;
+		}
+#endif
+		if (timed_out) {
 #if defined(CT_GDH6_FALSIFY_RAW_POINTER_QUEUE)
 			// The waiter DELETES what the other thread is using: it clears the
 			// queue and then returns, destroying `req` — which the safe point
 			// is still writing into.
 			g_ct_reload_queued = nullptr;
 #else
-			// Drop OUR reference only. The safe point may still be inside the
-			// apply and still owns its own.
-			g_ct_reload_queued.reset();
+			// Not yet taken: WITHDRAW it. The safe point takes a request only
+			// under this lock and only from the slot, so once it is out of the
+			// slot it can never be applied, and `no-safe-point` is true.
+			if (g_ct_reload_queued == watched) {
+				g_ct_reload_queued.reset();
+			}
 #endif
 			out->applied = 0;
-			// GDH-M5's RESIDUAL, and GDH-M8 does not hide it. A reload queued
-			// in the window between this timeout and the safe point's own
-			// clear can still be DROPPED (`g_ct_reload_queued.reset()` here
-			// and at the safe point's exit). It has always failed BY NAME and
-			// it still does; what GDH-M8 changed is only that the name is now
-			// its OWN — `no-safe-point` rather than the `writer-refused` it
-			// used to share with five unrelated conditions. The detail
-			// sentence is unchanged, so a harness matching on it still
-			// matches.
 			out->reason = REPRO_HCR_RELOAD_REASON_NO_SAFE_POINT;
 			static CharString s_timeout;
 			s_timeout = (String("no engine safe point was reached within ") +
@@ -3282,6 +3296,9 @@ void gdscript_ct_hcr_safe_point() {
 		{
 			std::lock_guard<std::mutex> lock(g_ct_reload_mutex);
 			req = g_ct_reload_queued;
+			if (req) {
+				req->claimed = true;
+			}
 		}
 		// Holding `req` here is what keeps the object alive across the apply
 		// even if the waiting thread gives up on it — see the note on
@@ -3316,7 +3333,11 @@ void gdscript_ct_hcr_safe_point() {
 #if defined(CT_GDH6_FALSIFY_RAW_POINTER_QUEUE)
 				g_ct_reload_queued = nullptr;
 #else
-				g_ct_reload_queued.reset();
+				// Only OUR request: the slot is cleared by whoever finishes with
+				// it, and must not take a later request down with it.
+				if (g_ct_reload_queued == req) {
+					g_ct_reload_queued.reset();
+				}
 #endif
 			}
 			g_ct_reload_cv.notify_all();
