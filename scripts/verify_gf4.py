@@ -34,6 +34,7 @@ Usage:
                                             # fieldval|kind|typename|shape.
                                             # exit 0 iff the tamper was caught.
 """
+
 import json
 import sys
 
@@ -53,7 +54,7 @@ class VerifyError(Exception):
 #   ("Struct", type_name, [v])  -> Struct with those field_values, in order, and
 #                                  the given registered type name
 #   ("Seq", type_name, [v])     -> Sequence (type_name usually "Array")
-def I(n):
+def Int(n):
     return ("Int", n)
 
 
@@ -83,18 +84,29 @@ def SeqT(type_name, elems):
 
 # (line, varname, expected-value-structure) — hand-derived from
 # test-programs/gdscript/gf_variant_types.gd (see EXPECTED-GF4.md).
-V2 = lambda a, b: St("Vector2", [F(a), F(b)])
-V2I = lambda a, b: St("Vector2i", [I(a), I(b)])
-V3 = lambda a, b, c: St("Vector3", [F(a), F(b), F(c)])
-V4 = lambda a, b, c, d: St("Vector4", [F(a), F(b), F(c), F(d)])
+def V2(a, b):
+    return St("Vector2", [F(a), F(b)])
+
+
+def V2I(a, b):
+    return St("Vector2i", [Int(a), Int(b)])
+
+
+def V3(a, b, c):
+    return St("Vector3", [F(a), F(b), F(c)])
+
+
+def V4(a, b, c, d):
+    return St("Vector4", [F(a), F(b), F(c), F(d)])
+
 
 EXPECTED = [
     (28, "v2", V2(1.5, 2.5)),
     (29, "v2i", V2I(3, 4)),
     (30, "v3", V3(1.5, 2.5, 3.5)),
-    (31, "v3i", St("Vector3i", [I(5), I(6), I(7)])),
+    (31, "v3i", St("Vector3i", [Int(5), Int(6), Int(7)])),
     (32, "v4", V4(1.0, 2.0, 3.0, 4.0)),
-    (33, "v4i", St("Vector4i", [I(8), I(9), I(10), I(11)])),
+    (33, "v4i", St("Vector4i", [Int(8), Int(9), Int(10), Int(11)])),
     (35, "r2", St("Rect2", [V2(1.0, 2.0), V2(3.0, 4.0)])),
     (36, "r2i", St("Rect2i", [V2I(5, 6), V2I(7, 8)])),
     (37, "col", St("Color", [F(0.1), F(0.2), F(0.3), F(1.0)])),
@@ -103,15 +115,22 @@ EXPECTED = [
     (40, "ab", St("AABB", [V3(1.0, 2.0, 3.0), V3(4.0, 5.0, 6.0)])),
     (41, "bs", St("Basis", [V3(2.0, 0.0, 0.0), V3(0.0, 3.0, 0.0), V3(0.0, 0.0, 4.0)])),
     (42, "t2", St("Transform2D", [V2(1.0, 0.0), V2(0.0, 1.0), V2(9.0, 10.0)])),
-    (43, "t3", St("Transform3D",
-                  [St("Basis", [V3(1.0, 0.0, 0.0), V3(0.0, 1.0, 0.0), V3(0.0, 0.0, 1.0)]),
-                   V3(7.0, 8.0, 9.0)])),
-    (44, "proj", St("Projection",
-                    [V4(1.0, 0.0, 0.0, 0.0), V4(0.0, 1.0, 0.0, 0.0),
-                     V4(0.0, 0.0, 1.0, 0.0), V4(0.0, 0.0, 0.0, 1.0)])),
+    (
+        43,
+        "t3",
+        St("Transform3D", [St("Basis", [V3(1.0, 0.0, 0.0), V3(0.0, 1.0, 0.0), V3(0.0, 0.0, 1.0)]), V3(7.0, 8.0, 9.0)]),
+    ),
+    (
+        44,
+        "proj",
+        St(
+            "Projection",
+            [V4(1.0, 0.0, 0.0, 0.0), V4(0.0, 1.0, 0.0, 0.0), V4(0.0, 0.0, 1.0, 0.0), V4(0.0, 0.0, 0.0, 1.0)],
+        ),
+    ),
     (46, "sname", S("foo")),
     (47, "npath", S("a/b")),
-    (48, "rid", St("RID", [I(0)])),
+    (48, "rid", St("RID", [Int(0)])),
     (49, "callable", St("Callable", [S("my_method")])),
     (50, "sig", St("Signal", [S("my_signal")])),
     (51, "obj", St("Object", [S("RefCounted"), AnyI()])),
@@ -187,9 +206,7 @@ def check_value(doc, node, expected, path):
         if not isinstance(fields, list):
             raise VerifyError("%s: Struct has no field_values array" % path)
         if len(fields) != len(want_fields):
-            raise VerifyError(
-                "%s: Struct %s field count %d != %d"
-                % (path, want_type, len(fields), len(want_fields)))
+            raise VerifyError("%s: Struct %s field count %d != %d" % (path, want_type, len(fields), len(want_fields)))
         for i, (child, want_child) in enumerate(zip(fields, want_fields)):
             check_value(doc, child, want_child, "%s.%d" % (path, i))
     elif kind == "Seq":
@@ -203,8 +220,7 @@ def check_value(doc, node, expected, path):
         if not isinstance(elems, list):
             raise VerifyError("%s: Sequence has no elements array" % path)
         if len(elems) != len(want_elems):
-            raise VerifyError(
-                "%s: Sequence length %d != %d" % (path, len(elems), len(want_elems)))
+            raise VerifyError("%s: Sequence length %d != %d" % (path, len(elems), len(want_elems)))
         for i, (child, want_child) in enumerate(zip(elems, want_elems)):
             check_value(doc, child, want_child, "%s[%d]" % (path, i))
     else:
@@ -216,7 +232,8 @@ def find_var(step, varname):
     if not hits:
         raise VerifyError(
             "step line %d carries no var %r (vars=%r)"
-            % (step.get("line"), varname, [v.get("varname") for v in step.get("vars", [])]))
+            % (step.get("line"), varname, [v.get("varname") for v in step.get("vars", [])])
+        )
     if len(hits) != 1:
         raise VerifyError("step line %d carries %d copies of var %r" % (step.get("line"), len(hits), varname))
     return hits[0]
@@ -232,7 +249,7 @@ def assert_types_table_has(doc, names):
 def assert_facts(doc):
     sts = all_steps(doc)
     observed = []
-    for (line, varname, expected) in EXPECTED:
+    for line, varname, expected in EXPECTED:
         st = step_at_unique_line(sts, line)
         v = find_var(st, varname)
         check_value(doc, v.get("value", {}), expected, "%s@%d" % (varname, line))
@@ -244,18 +261,40 @@ def assert_facts(doc):
     types = doc.get("types", [])
     if types[:6] != ["None", "Int", "Float", "Bool", "String", "Variant"]:
         raise VerifyError("base types table changed: %r" % types[:6])
-    assert_types_table_has(doc, [
-        "Vector2", "Vector2i", "Vector3", "Vector3i", "Vector4", "Vector4i",
-        "Rect2", "Rect2i", "Color", "Plane", "Quaternion", "AABB", "Basis",
-        "Transform2D", "Transform3D", "Projection", "RID", "Callable", "Signal",
-        "Object"])
+    assert_types_table_has(
+        doc,
+        [
+            "Vector2",
+            "Vector2i",
+            "Vector3",
+            "Vector3i",
+            "Vector4",
+            "Vector4i",
+            "Rect2",
+            "Rect2i",
+            "Color",
+            "Plane",
+            "Quaternion",
+            "AABB",
+            "Basis",
+            "Transform2D",
+            "Transform3D",
+            "Projection",
+            "RID",
+            "Callable",
+            "Signal",
+            "Object",
+        ],
+    )
 
     # Human-legible sub-facts (subsumed by the recursive check, restated so the
     # evidence is concrete in the log).
     sub = []
     v3 = find_var(step_at_unique_line(sts, 30), "v3")["value"]
-    sub.append("v3=Struct Vector3{%.1f,%.1f,%.1f}" % (
-        v3["field_values"][0]["f"], v3["field_values"][1]["f"], v3["field_values"][2]["f"]))
+    sub.append(
+        "v3=Struct Vector3{%.1f,%.1f,%.1f}"
+        % (v3["field_values"][0]["f"], v3["field_values"][1]["f"], v3["field_values"][2]["f"])
+    )
     col = find_var(step_at_unique_line(sts, 37), "col")["value"]
     sub.append("col.a=%.1f" % col["field_values"][3]["f"])
     t3 = find_var(step_at_unique_line(sts, 43), "t3")["value"]
@@ -263,12 +302,21 @@ def assert_facts(doc):
     obj = find_var(step_at_unique_line(sts, 51), "obj")["value"]
     sub.append("obj.class=%s" % obj["field_values"][0]["text"])
     pv2 = find_var(step_at_unique_line(sts, 54), "pv2")["value"]
-    sub.append("pv2=Seq[Vector2{%.1f,%.1f}, Vector2{%.1f,%.1f}]" % (
-        pv2["elements"][0]["field_values"][0]["f"], pv2["elements"][0]["field_values"][1]["f"],
-        pv2["elements"][1]["field_values"][0]["f"], pv2["elements"][1]["field_values"][1]["f"]))
+    sub.append(
+        "pv2=Seq[Vector2{%.1f,%.1f}, Vector2{%.1f,%.1f}]"
+        % (
+            pv2["elements"][0]["field_values"][0]["f"],
+            pv2["elements"][0]["field_values"][1]["f"],
+            pv2["elements"][1]["field_values"][0]["f"],
+            pv2["elements"][1]["field_values"][1]["f"],
+        )
+    )
 
-    return ("PASS GF4: %d structured Variant types verified (%s); sub-facts: %s"
-            % (len(EXPECTED), ", ".join(observed), "; ".join(sub)))
+    return "PASS GF4: %d structured Variant types verified (%s); sub-facts: %s" % (
+        len(EXPECTED),
+        ", ".join(observed),
+        "; ".join(sub),
+    )
 
 
 def tamper(doc, mode):

@@ -23,8 +23,7 @@ env_gdscript = env_modules.Clone()
 # for a plain one.
 _ct_gdh5_falsify = os.environ.get("CT_GDH5_FALSIFY", "")
 if _ct_gdh5_falsify:
-    print("CodeTracer GDH-M5 FALSIFIER ARM: -D%s (this is NOT a plain build)"
-          % _ct_gdh5_falsify)
+    print("CodeTracer GDH-M5 FALSIFIER ARM: -D%s (this is NOT a plain build)" % _ct_gdh5_falsify)
     env_gdscript.Append(CPPDEFINES=[_ct_gdh5_falsify])
 
 # --- GDH-M6 falsifier arms ---------------------------------------------
@@ -35,8 +34,7 @@ if _ct_gdh5_falsify:
 _ct_gdh6_falsify = os.environ.get("CT_GDH6_FALSIFY", "")
 if _ct_gdh6_falsify:
     for _arm in [a.strip() for a in _ct_gdh6_falsify.split(",") if a.strip()]:
-        print("CodeTracer GDH-M6 FALSIFIER ARM: -D%s (this is NOT a plain build)"
-              % _arm)
+        print("CodeTracer GDH-M6 FALSIFIER ARM: -D%s (this is NOT a plain build)" % _arm)
         env_gdscript.Append(CPPDEFINES=[_arm])
 
 # --- GDH-M8 falsifier arms, and the injection-hook OPT-OUT ---------------
@@ -56,8 +54,7 @@ if _ct_gdh6_falsify:
 _ct_gdh8_falsify = os.environ.get("CT_GDH8_FALSIFY", "")
 if _ct_gdh8_falsify:
     for _arm in [a.strip() for a in _ct_gdh8_falsify.split(",") if a.strip()]:
-        print("CodeTracer GDH-M8 FALSIFIER ARM: -D%s (this is NOT a plain build)"
-              % _arm)
+        print("CodeTracer GDH-M8 FALSIFIER ARM: -D%s (this is NOT a plain build)" % _arm)
         env_gdscript.Append(CPPDEFINES=[_arm])
 
 # --- GDH-M6 AddressSanitizer, scoped to this module ---------------------
@@ -91,10 +88,9 @@ if _ct_gdh8_falsify:
 # CCFLAGS), and this mirrors that pairing at the scope we use. It is defined on
 # `env_gdscript` only, matching where the flag is applied: the rest of the tree
 # is not sanitized and must not claim to be, since `ASAN_ENABLED` also gates
-# real behaviour in the engine (allocator hooks, poisoning helpers).
+# real behavior in the engine (allocator hooks, poisoning helpers).
 if os.environ.get("CT_GDH6_ASAN", "") not in ("", "0"):
-    print("CodeTracer GDH-M6: -fsanitize=address on modules/gdscript "
-          "(this is NOT a plain build)")
+    print("CodeTracer GDH-M6: -fsanitize=address on modules/gdscript (this is NOT a plain build)")
     env_gdscript.Append(CPPDEFINES=["ASAN_ENABLED"])
     env_gdscript.Append(CCFLAGS=["-fsanitize=address", "-fno-omit-frame-pointer"])
     env.Append(LINKFLAGS=["-fsanitize=address"])
@@ -152,11 +148,7 @@ if os.environ.get("CT_GDH6_ASAN", "") not in ("", "0"):
 env_gdscript.Prepend(CPPPATH=[Dir("ct_writer/include").srcnode()])
 _ct_writer_dir = Dir("ct_writer").srcnode()
 _ct_writer_arch_dir = Dir("ct_writer/%s-%s" % (env["platform"], env["arch"])).srcnode()
-_ct_writer_archive = (
-    "codetracer_trace_writer.lib"
-    if env["platform"] == "windows"
-    else "libcodetracer_trace_writer.a"
-)
+_ct_writer_archive = "codetracer_trace_writer.lib" if env["platform"] == "windows" else "libcodetracer_trace_writer.a"
 if os.path.exists(os.path.join(str(_ct_writer_arch_dir), _ct_writer_archive)):
     _ct_writer_dir = _ct_writer_arch_dir
 _ct_writer_archive_path = os.path.join(str(_ct_writer_dir), _ct_writer_archive)

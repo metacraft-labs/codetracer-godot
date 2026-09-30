@@ -29,6 +29,7 @@ Usage:
                                             # validatedvalue.
                                             # exit 0 iff the tamper was caught.
 """
+
 import json
 import sys
 
@@ -134,12 +135,10 @@ def find_capture(sts, function, line, varname):
     if not carrying:
         raise VerifyError(
             "no step %s:%d carries variable %r (vars at that line: %r)"
-            % (function, line, varname,
-               [[v.get("varname") for v in s.get("vars", [])] for s in at]))
+            % (function, line, varname, [[v.get("varname") for v in s.get("vars", [])] for s in at])
+        )
     if len(carrying) != 1:
-        raise VerifyError(
-            "%d steps at %s:%d carry %r (expected exactly 1)"
-            % (len(carrying), function, line, varname))
+        raise VerifyError("%d steps at %s:%d carry %r (expected exactly 1)" % (len(carrying), function, line, varname))
     return carrying[0][1]
 
 
@@ -155,28 +154,31 @@ def assert_facts(doc):
 
     # --- B. member / static / property captures, each on its own step ---------
     observed = []
-    for (function, line, varname, kind, expected_val) in EXPECTED:
+    for function, line, varname, kind, expected_val in EXPECTED:
         v = find_capture(sts, function, line, varname)
         val = v.get("value", {})
         got_kind = val.get("kind")
         if got_kind != kind:
-            raise VerifyError(
-                "%s:%d %s has kind %r, expected %r" % (function, line, varname, got_kind, kind))
+            raise VerifyError("%s:%d %s has kind %r, expected %r" % (function, line, varname, got_kind, kind))
         got_val = value_scalar(val)
         if got_val != expected_val:
             raise VerifyError(
-                "%s:%d %s = %r (kind %s), expected %r"
-                % (function, line, varname, got_val, got_kind, expected_val))
+                "%s:%d %s = %r (kind %s), expected %r" % (function, line, varname, got_val, got_kind, expected_val)
+            )
         observed.append("%s=%r:%s" % (varname, expected_val, kind))
 
     # --- C. static-var initializer path: total==0 on @static_initializer ------
-    static_total = [v for s in sts if s.get("function") == "@static_initializer"
-                    for v in s.get("vars", []) if v.get("varname") == "total"]
+    static_total = [
+        v
+        for s in sts
+        if s.get("function") == "@static_initializer"
+        for v in s.get("vars", [])
+        if v.get("varname") == "total"
+    ]
     if not static_total:
         raise VerifyError("no @static_initializer step captured `total` (static-var init path)")
     if value_scalar(static_total[0].get("value", {})) != 0:
-        raise VerifyError(
-            "static-var init total != 0 (got %r)" % value_scalar(static_total[0].get("value", {})))
+        raise VerifyError("static-var init total != 0 (got %r)" % value_scalar(static_total[0].get("value", {})))
 
     # --- D. the `run` frame (parent of the property accessor frames) ----------
     runs = [c for c in ces if c.get("function") == "run"]
@@ -192,7 +194,8 @@ def assert_facts(doc):
     if sc.get("depth") != 2 or sc.get("parent_call_key") != run_key:
         raise VerifyError(
             "@temp_setter not depth2/child-of-run: depth=%s parent=%s (run=%s)"
-            % (sc.get("depth"), sc.get("parent_call_key"), run_key))
+            % (sc.get("depth"), sc.get("parent_call_key"), run_key)
+        )
     setter_ret = exits[sc["call_key"]].get("return_value", {})
     if setter_ret.get("kind") != "None":
         raise VerifyError("@temp_setter return kind %r != None" % setter_ret.get("kind"))
@@ -205,12 +208,11 @@ def assert_facts(doc):
     if gc.get("depth") != 2 or gc.get("parent_call_key") != run_key:
         raise VerifyError(
             "@temp_getter not depth2/child-of-run: depth=%s parent=%s (run=%s)"
-            % (gc.get("depth"), gc.get("parent_call_key"), run_key))
+            % (gc.get("depth"), gc.get("parent_call_key"), run_key)
+        )
     getter_ret = exits[gc["call_key"]].get("return_value", {})
     if getter_ret.get("kind") != "Float" or getter_ret.get("f") != 100.0:
-        raise VerifyError(
-            "@temp_getter return %r/%r != Float/100.0"
-            % (getter_ret.get("kind"), getter_ret.get("f")))
+        raise VerifyError("@temp_getter return %r/%r != Float/100.0" % (getter_ret.get("kind"), getter_ret.get("f")))
 
     # --- G. the backing member write _t=100.0 is INSIDE the setter frame ------
     # The EXPECTED entry (@temp_setter, 71, _t)=100.0 is matched by find_capture
@@ -220,18 +222,19 @@ def assert_facts(doc):
     # --- H. call/return balance ----------------------------------------------
     if len(call_entries(doc)) != len(call_exits(doc)):
         raise VerifyError(
-            "unbalanced call/return: %d entry vs %d exit"
-            % (len(call_entries(doc)), len(call_exits(doc))))
+            "unbalanced call/return: %d entry vs %d exit" % (len(call_entries(doc)), len(call_exits(doc)))
+        )
 
-    return ("PASS GF8: %d member/static/property values captured by NAME on their "
-            "own steps (hp=100,level=3 @export; _t=0.0 init; x=5 plain member; "
-            "total 0->7 static var; got=150.0/_t=100.0 in @temp_setter backing "
-            "write; ready_mark=42 @onready in @implicit_ready; read_back=100.0 via "
-            "getter; member_ops: x=9.0 SET_NAMED, y=8.0 SET_NAMED_VALIDATED "
-            "[typed-base, previously dropped], name='gadget1' SET_MEMBER); property "
-            "accessors are FRAMES (@temp_setter void / @temp_getter -> 100.0), both "
-            "children of run; types=%s; call/return balanced. %s"
-            % (len(EXPECTED), types, observed))
+    return (
+        "PASS GF8: %d member/static/property values captured by NAME on their "
+        "own steps (hp=100,level=3 @export; _t=0.0 init; x=5 plain member; "
+        "total 0->7 static var; got=150.0/_t=100.0 in @temp_setter backing "
+        "write; ready_mark=42 @onready in @implicit_ready; read_back=100.0 via "
+        "getter; member_ops: x=9.0 SET_NAMED, y=8.0 SET_NAMED_VALIDATED "
+        "[typed-base, previously dropped], name='gadget1' SET_MEMBER); property "
+        "accessors are FRAMES (@temp_setter void / @temp_getter -> 100.0), both "
+        "children of run; types=%s; call/return balanced. %s" % (len(EXPECTED), types, observed)
+    )
 
 
 def tamper(doc, mode):
@@ -256,10 +259,10 @@ def tamper(doc, mode):
         var_at("_init", 74, "x")["varname"] = "notx"
     elif mode == "missingsetter":
         # drop the @temp_setter call_entry + its call_exit.
-        setter_keys = {c.get("call_key") for c in call_entries(doc)
-                       if c.get("function") == "@temp_setter"}
+        setter_keys = {c.get("call_key") for c in call_entries(doc) if c.get("function") == "@temp_setter"}
         doc["events"] = [
-            e for e in doc.get("events", [])
+            e
+            for e in doc.get("events", [])
             if not (e.get("kind") == "call_entry" and e.get("function") == "@temp_setter")
             and not (e.get("kind") == "call_exit" and e.get("call_key") in setter_keys)
         ]
@@ -292,9 +295,10 @@ def main():
 
     if cmd == "tamper":
         if len(sys.argv) != 4:
-            print("usage: verify_gf8.py tamper <full.json> "
-                  "<value|membername|missingsetter|validatedvalue>",
-                  file=sys.stderr)
+            print(
+                "usage: verify_gf8.py tamper <full.json> <value|membername|missingsetter|validatedvalue>",
+                file=sys.stderr,
+            )
             sys.exit(2)
         mode = sys.argv[3]
         tamper(doc, mode)
@@ -303,8 +307,7 @@ def main():
         except VerifyError as e:
             print("OK: tamper(%s) correctly rejected: %s" % (mode, e))
             sys.exit(0)
-        print("FAIL: tamper(%s) slipped through the verifier (assertions still passed)"
-              % mode, file=sys.stderr)
+        print("FAIL: tamper(%s) slipped through the verifier (assertions still passed)" % mode, file=sys.stderr)
         sys.exit(1)
 
     print("unknown command %r" % cmd, file=sys.stderr)

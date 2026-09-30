@@ -33,6 +33,7 @@ Usage:
                                             # retvalue. exit 0 iff the tamper was
                                             # caught.
 """
+
 import json
 import sys
 
@@ -50,11 +51,11 @@ EXPECTED_TYPES = ["None", "Int", "Float", "Bool", "String", "Variant"]
 # The five emits (source lines) and the EXACT handler set each must produce, in
 # dispatch (connect) order. This is the connect/disconnect teeth.
 EXPECTED_EMIT_BUCKETS = {
-    66: [],                          # emit #1: nothing connected -> no handler
-    71: ["_on_hit_a"],               # emit #2: one handler
+    66: [],  # emit #1: nothing connected -> no handler
+    71: ["_on_hit_a"],  # emit #2: one handler
     76: ["_on_hit_a", "_on_hit_b"],  # emit #3: both, in connect order
-    82: ["_on_hit_b"],               # emit #4: _on_hit_a DISCONNECTED -> absent
-    86: [],                          # emit #5: all disconnected -> no handler
+    82: ["_on_hit_b"],  # emit #4: _on_hit_a DISCONNECTED -> absent
+    86: [],  # emit #5: all disconnected -> no handler
 }
 
 # Per handler frame (entry order = call_key order): its triggering emit line, the
@@ -131,25 +132,30 @@ def build_frames(doc):
                 stack.remove(key)
         elif k == "step":
             if stack:
-                by_key[stack[-1]]["steps"].append(
-                    {"line": e.get("line"), "vars": e.get("vars", [])})
+                by_key[stack[-1]]["steps"].append({"line": e.get("line"), "vars": e.get("vars", [])})
     return order, by_key
 
 
 def frame_capture(frame, varname):
     """Return the value node for `varname` captured in this frame invocation, or
     raise if it is not captured on exactly one step."""
-    found = [v for s in frame["steps"] for v in s.get("vars", [])
-             if v.get("varname") == varname]
+    found = [v for s in frame["steps"] for v in s.get("vars", []) if v.get("varname") == varname]
     if not found:
         raise VerifyError(
             "frame %s (call_key=%s, emit=%s) does not capture %r (captured: %r)"
-            % (frame["function"], frame["call_key"], frame["emit_line"], varname,
-               [v.get("varname") for s in frame["steps"] for v in s.get("vars", [])]))
+            % (
+                frame["function"],
+                frame["call_key"],
+                frame["emit_line"],
+                varname,
+                [v.get("varname") for s in frame["steps"] for v in s.get("vars", [])],
+            )
+        )
     if len(found) != 1:
         raise VerifyError(
             "frame %s (call_key=%s) captures %r %d times (expected 1)"
-            % (frame["function"], frame["call_key"], varname, len(found)))
+            % (frame["function"], frame["call_key"], varname, len(found))
+        )
     return found[0]
 
 
@@ -175,11 +181,13 @@ def assert_facts(doc):
         if f["depth"] != 1:
             raise VerifyError(
                 "handler %s (call_key=%s) depth=%s, expected 1 (child of emitter)"
-                % (f["function"], f["call_key"], f["depth"]))
+                % (f["function"], f["call_key"], f["depth"])
+            )
         if f["parent"] != init_key:
             raise VerifyError(
                 "handler %s (call_key=%s) parent=%s, expected _initialize (%s)"
-                % (f["function"], f["call_key"], f["parent"], init_key))
+                % (f["function"], f["call_key"], f["parent"], init_key)
+            )
 
     # bucket handler frames by their triggering emit line.
     buckets = {}
@@ -192,8 +200,8 @@ def assert_facts(doc):
         if got != expected_handlers:
             raise VerifyError(
                 "emit@line %d dispatched %r, expected %r "
-                "(connect/disconnect state not faithfully reflected)"
-                % (emit_line, got, expected_handlers))
+                "(connect/disconnect state not faithfully reflected)" % (emit_line, got, expected_handlers)
+            )
 
     # no handler frame may be bucketed to any line OTHER than the known emits.
     unexpected = set(buckets) - set(EXPECTED_EMIT_BUCKETS)
@@ -210,15 +218,15 @@ def assert_facts(doc):
 
     # --- D. emitted args + return value captured, per frame invocation --------
     if len(handler_frames) != len(EXPECTED_FRAMES):
-        raise VerifyError("handler-frame count %d != expected %d"
-                          % (len(handler_frames), len(EXPECTED_FRAMES)))
+        raise VerifyError("handler-frame count %d != expected %d" % (len(handler_frames), len(EXPECTED_FRAMES)))
     observed = []
     for frame, exp in zip(handler_frames, EXPECTED_FRAMES):
         if frame["function"] != exp["fn"]:
             raise VerifyError("frame order: got %s, expected %s" % (frame["function"], exp["fn"]))
         if frame["emit_line"] != exp["emit"]:
-            raise VerifyError("%s frame emit_line=%s, expected %s"
-                              % (frame["function"], frame["emit_line"], exp["emit"]))
+            raise VerifyError(
+                "%s frame emit_line=%s, expected %s" % (frame["function"], frame["emit_line"], exp["emit"])
+            )
         # emitted args (read into locals)
         for varname, (kind, val) in exp["caps"].items():
             v = frame_capture(frame, varname)
@@ -227,18 +235,25 @@ def assert_facts(doc):
             if gk != kind or gv != val:
                 raise VerifyError(
                     "%s@emit%d capture %s=%r:%s, expected %r:%s"
-                    % (frame["function"], frame["emit_line"], varname, gv, gk, val, kind))
+                    % (frame["function"], frame["emit_line"], varname, gv, gk, val, kind)
+                )
         # captured return value (GF5)
         rv = frame["return_value"] or {}
         rk, rval = exp["ret"]
         if rv.get("kind") != rk or value_scalar(rv) != rval:
             raise VerifyError(
                 "%s@emit%d return=%r:%s, expected %r:%s"
-                % (frame["function"], frame["emit_line"], value_scalar(rv), rv.get("kind"), rval, rk))
-        observed.append("%s@emit%d(%s)->%r"
-                        % (frame["function"], frame["emit_line"],
-                           ",".join("%s=%r" % (k, v[1]) for k, v in exp["caps"].items()),
-                           exp["ret"][1]))
+                % (frame["function"], frame["emit_line"], value_scalar(rv), rv.get("kind"), rval, rk)
+            )
+        observed.append(
+            "%s@emit%d(%s)->%r"
+            % (
+                frame["function"],
+                frame["emit_line"],
+                ",".join("%s=%r" % (k, v[1]) for k, v in exp["caps"].items()),
+                exp["ret"][1],
+            )
+        )
 
     # --- E. call/return balance ----------------------------------------------
     n_entry = sum(1 for e in doc.get("events", []) if e.get("kind") == "call_entry")
@@ -246,14 +261,15 @@ def assert_facts(doc):
     if n_entry != n_exit:
         raise VerifyError("unbalanced call/return: %d entry vs %d exit" % (n_entry, n_exit))
 
-    return ("PASS GF9: per-emit handler dispatch reflects connect/disconnect state "
-            "exactly — emit@66=[] (none connected), emit@71=[_on_hit_a], "
-            "emit@76=[_on_hit_a,_on_hit_b] (both), emit@82=[_on_hit_b] "
-            "(_on_hit_a ABSENT post-disconnect), emit@86=[] (all disconnected); "
-            "4 handler frames, each depth-1 child of the emitter (_initialize) with "
-            "no intervening emit frame; emitted args + returns captured per "
-            "invocation [%s]; types=%s; call/return balanced."
-            % ("; ".join(observed), types))
+    return (
+        "PASS GF9: per-emit handler dispatch reflects connect/disconnect state "
+        "exactly — emit@66=[] (none connected), emit@71=[_on_hit_a], "
+        "emit@76=[_on_hit_a,_on_hit_b] (both), emit@82=[_on_hit_b] "
+        "(_on_hit_a ABSENT post-disconnect), emit@86=[] (all disconnected); "
+        "4 handler frames, each depth-1 child of the emitter (_initialize) with "
+        "no intervening emit frame; emitted args + returns captured per "
+        "invocation [%s]; types=%s; call/return balanced." % ("; ".join(observed), types)
+    )
 
 
 def tamper(doc, mode):
@@ -280,20 +296,31 @@ def tamper(doc, mode):
         if idx is None:
             raise VerifyError("tamper: could not find emit#4 step (line 82)")
         fake = [
-            {"kind": "call_entry", "function": "_on_hit_a", "call_key": 99991,
-             "depth": 1, "parent_call_key": init_key, "line": None},
-            {"kind": "step", "function": "_on_hit_a", "line": 51,
-             "vars": [{"varname": "a_dmg", "value": {"kind": "Int", "i": 5}}]},
+            {
+                "kind": "call_entry",
+                "function": "_on_hit_a",
+                "call_key": 99991,
+                "depth": 1,
+                "parent_call_key": init_key,
+                "line": None,
+            },
+            {
+                "kind": "step",
+                "function": "_on_hit_a",
+                "line": 51,
+                "vars": [{"varname": "a_dmg", "value": {"kind": "Int", "i": 5}}],
+            },
             {"kind": "call_exit", "call_key": 99991, "return_value": {"kind": "Int", "i": 7}},
         ]
-        events[idx + 1:idx + 1] = fake
+        events[idx + 1 : idx + 1] = fake
     elif mode == "dropframe":
         # delete the first _on_hit_b frame (emit #3) — breaks the "both handlers
         # on a multi-connect" count/bucket.
         target = next(f for f in handler_frames if f["function"] == "_on_hit_b")
         key = target["call_key"]
         doc["events"] = [
-            e for e in doc.get("events", [])
+            e
+            for e in doc.get("events", [])
             if not (e.get("kind") == "call_entry" and e.get("call_key") == key)
             and not (e.get("kind") == "call_exit" and e.get("call_key") == key)
         ]
@@ -327,8 +354,7 @@ def main():
 
     if cmd == "tamper":
         if len(sys.argv) != 4:
-            print("usage: verify_gf9.py tamper <full.json> "
-                  "<argvalue|disconnected|dropframe|retvalue>", file=sys.stderr)
+            print("usage: verify_gf9.py tamper <full.json> <argvalue|disconnected|dropframe|retvalue>", file=sys.stderr)
             sys.exit(2)
         mode = sys.argv[3]
         tamper(doc, mode)
@@ -337,8 +363,7 @@ def main():
         except VerifyError as e:
             print("OK: tamper(%s) correctly rejected: %s" % (mode, e))
             sys.exit(0)
-        print("FAIL: tamper(%s) slipped through the verifier (assertions still passed)"
-              % mode, file=sys.stderr)
+        print("FAIL: tamper(%s) slipped through the verifier (assertions still passed)" % mode, file=sys.stderr)
         sys.exit(1)
 
     print("unknown command %r" % cmd, file=sys.stderr)

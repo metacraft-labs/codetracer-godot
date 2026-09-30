@@ -43,6 +43,7 @@ Usage:
                                             # default|return|staticargs|void.
                                             # exit 0 iff the tamper was caught.
 """
+
 import json
 import sys
 
@@ -188,12 +189,19 @@ def assert_facts(doc):
         if len(got) != len(want_seq):
             raise VerifyError(
                 "capture %r: got %d occurrences %s, expected %d %s"
-                % (name, len(got),
-                   [scalar_str(v.get("kind"), v) for v in got],
-                   len(want_seq), [w[0] + " " + repr(w[1]) for w in want_seq]))
+                % (
+                    name,
+                    len(got),
+                    [scalar_str(v.get("kind"), v) for v in got],
+                    len(want_seq),
+                    [w[0] + " " + repr(w[1]) for w in want_seq],
+                )
+            )
         for i, (want_kind, want_value) in enumerate(want_seq):
             check_scalar(got[i], want_kind, want_value, "%s[%d]" % (name, i))
-        observed.append("%s=%s" % (name, [scalar_str(w[0], {"i": w[1], "f": w[1], "text": w[1], "b": w[1]}) for w in want_seq]))
+        observed.append(
+            "%s=%s" % (name, [scalar_str(w[0], {"i": w[1], "f": w[1], "text": w[1], "b": w[1]}) for w in want_seq])
+        )
 
     # --- 2. return values on call_exit events -------------------------------
     rets = returns_by_function(doc)
@@ -202,7 +210,8 @@ def assert_facts(doc):
         if len(got) != len(want_seq):
             raise VerifyError(
                 "returns for %r: got %d %s, expected %d"
-                % (fn, len(got), [scalar_str(v.get("kind"), v) for v in got], len(want_seq)))
+                % (fn, len(got), [scalar_str(v.get("kind"), v) for v in got], len(want_seq))
+            )
         for i, (want_kind, want_value) in enumerate(want_seq):
             check_scalar(got[i], want_kind, want_value, "return %s[%d]" % (fn, i))
 
@@ -213,21 +222,22 @@ def assert_facts(doc):
         raise VerifyError("expected exactly 1 _init call_entry, got %d" % len(inits))
     init_key = inits[0]["call_key"]
     if inits[0].get("depth") != 0 or inits[0].get("parent_call_key") != -1:
-        raise VerifyError("_init not a top-level frame: depth=%s parent=%s"
-                          % (inits[0].get("depth"), inits[0].get("parent_call_key")))
+        raise VerifyError(
+            "_init not a top-level frame: depth=%s parent=%s" % (inits[0].get("depth"), inits[0].get("parent_call_key"))
+        )
 
     nested = [c for c in ces if c.get("parent_call_key") == init_key]
     nested_fns = sorted(c.get("function") for c in nested)
     if nested_fns != sorted(NESTED_UNDER_INIT):
-        raise VerifyError("functions nested under _init %s != expected %s"
-                          % (nested_fns, sorted(NESTED_UNDER_INIT)))
+        raise VerifyError("functions nested under _init %s != expected %s" % (nested_fns, sorted(NESTED_UNDER_INIT)))
     for c in nested:
         if c.get("depth") != 1:
-            raise VerifyError("%s nested under _init has depth %s (expected 1)"
-                              % (c.get("function"), c.get("depth")))
+            raise VerifyError("%s nested under _init has depth %s (expected 1)" % (c.get("function"), c.get("depth")))
         if c.get("entry_step") > c.get("exit_step"):
-            raise VerifyError("%s malformed frame entry_step %s > exit_step %s"
-                              % (c.get("function"), c.get("entry_step"), c.get("exit_step")))
+            raise VerifyError(
+                "%s malformed frame entry_step %s > exit_step %s"
+                % (c.get("function"), c.get("entry_step"), c.get("exit_step"))
+            )
 
     for fn in TOP_LEVEL:
         matches = [c for c in ces if c.get("function") == fn]
@@ -235,15 +245,15 @@ def assert_facts(doc):
             raise VerifyError("expected exactly 1 %r frame, got %d" % (fn, len(matches)))
         c = matches[0]
         if c.get("depth") != 0 or c.get("parent_call_key") != -1:
-            raise VerifyError("%s not top-level: depth=%s parent=%s"
-                              % (fn, c.get("depth"), c.get("parent_call_key")))
+            raise VerifyError("%s not top-level: depth=%s parent=%s" % (fn, c.get("depth"), c.get("parent_call_key")))
 
     # balance: ct-print reconstructs a call_entry only for a returned call, so
     # every call_entry has a matching call_exit (the writer persists the call on
     # its return). Count them and require equality.
     if len(call_entries(doc)) != len(call_exits(doc)):
-        raise VerifyError("unbalanced call/return: %d call_entry vs %d call_exit"
-                          % (len(call_entries(doc)), len(call_exits(doc))))
+        raise VerifyError(
+            "unbalanced call/return: %d call_entry vs %d call_exit" % (len(call_entries(doc)), len(call_exits(doc)))
+        )
 
     # --- 4. static-function frame present at depth 1 under _init ------------
     mul = [c for c in nested if c.get("function") == "mul"]
@@ -263,12 +273,14 @@ def assert_facts(doc):
     if types != ["None", "Int", "Float", "Bool", "String", "Variant"]:
         raise VerifyError("types table changed (return-value capture is scalar): %r" % types)
 
-    return ("PASS GF5: defaults captured (b=10,c=\"x\" direct + got_[a,b,c] "
-            "[1,2]/[10,20]/[x,yz]); static mul fa=6,fb=7 ret 42; return values "
-            "configure[12,24] mul 42 area 12.56636(Float) do_void None(void) "
-            "pick 42(untyped) _process Bool; call tree nested under _init; "
-            "print variadic-builtin as caller-frame steps L69/70 (no print frame); "
-            "types table 6 base entries. Captures: %s" % "; ".join(observed))
+    return (
+        'PASS GF5: defaults captured (b=10,c="x" direct + got_[a,b,c] '
+        "[1,2]/[10,20]/[x,yz]); static mul fa=6,fb=7 ret 42; return values "
+        "configure[12,24] mul 42 area 12.56636(Float) do_void None(void) "
+        "pick 42(untyped) _process Bool; call tree nested under _init; "
+        "print variadic-builtin as caller-frame steps L69/70 (no print frame); "
+        "types table 6 base entries. Captures: %s" % "; ".join(observed)
+    )
 
 
 def tamper(doc, mode):

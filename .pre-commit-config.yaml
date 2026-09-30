@@ -4,6 +4,7 @@ default_language_version:
 exclude: |
   (?x)^(
     .*thirdparty/.*|
+    modules/gdscript/ct_writer/.*|
     .*-(dll|dylib|so)_wrap\.[ch]|
     platform/android/java/editor/src/main/java/com/android/.*|
     platform/android/java/lib/src/main/java/com/google/.*
@@ -176,6 +177,7 @@ repos:
         exclude: |
           (?x)^(
             core/math/bvh_.*\.inc|
+            modules/gdscript/gdscript_ct_trace\.(cpp|h)|
             platform/(?!android|ios|linuxbsd|macos|web|windows)\w+/.*|
             platform/android/java/lib/src/main/java/org/godotengine/godot/gl/GLSurfaceView\.java|
             platform/android/java/lib/src/main/java/org/godotengine/godot/gl/EGLLogWrapper\.java|
