@@ -30,6 +30,8 @@ Usage:
 import json
 import sys
 
+from ct_toplevel import reroot
+
 
 class VerifyError(Exception):
     pass
@@ -71,7 +73,7 @@ CONTINUE_LINES = [57, 58, 59, 60]
 
 def load(path):
     with open(path) as f:
-        return json.load(f)
+        return reroot(json.load(f))
 
 
 def steps(doc):

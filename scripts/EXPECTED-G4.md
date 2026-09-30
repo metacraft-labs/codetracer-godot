@@ -97,9 +97,9 @@ None, Int, Float, Bool, String, Variant
 
 ## Regression (must be unchanged by value capture)
 
-- G2 (`g2probe.gd`): step lines `18, 19, 20, 14, 15, 21, 24`; `CT_G2_STEPS=30`.
+- G2 (`g2probe.gd`): step lines `1, 18, 19, 20, 14, 15, 21, 24` (1 = the entry step, see EXPECTED-G3.md); `CT_G2_STEPS=30`.
 - G3 (`gf_calls.gd`): `_init → outer → inner` nesting, `sibling` after `outer`,
-  6 balanced call/return pairs, steps `37, 30, 26, 27, 31, 38, 34, 39, 42`;
+  6 balanced call/return pairs, steps `1, 37, 30, 26, 27, 31, 38, 34, 39, 42`;
   `CT_G3_RESULT=107`.
 
 Value capture must not perturb the step or call streams: the value hooks fire

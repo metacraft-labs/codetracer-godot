@@ -10,7 +10,7 @@
 //   codetracer_trace_writer_init()  -> once (Nim runtime init)
 //   trace_writer_new(program, 2)    -> format 2 == CTFS multi-stream
 //   begin_metadata/events/paths     -> lifecycle stubs
-//   trace_writer_start(path, line)  -> first (pending) step
+//   trace_writer_start(path, line)  -> <toplevel> frame + entry step
 //   trace_writer_register_step(...) -> per executed line (from OPCODE_LINE)
 //   ensure_function_id + register_call / register_return
 //                                   -> per GDScriptFunction::call frame (G3)
@@ -20,10 +20,11 @@
 //
 // G3 note on ordering: the FIRST hook to fire on the outermost function is its
 // call entry (enter_function precedes the first OPCODE_LINE), so the writer is
-// created there. trace_writer_start is deferred to the first *step* so the step
-// stream is byte-identical to G2 (no synthetic declaration-line step is
-// emitted). register_call before the first step is fine — the multi-stream
-// writer captures the call's entry_step as the next step index.
+// created there, and trace_writer_start is issued there too, before that call is
+// registered: start opens the `<toplevel>` root frame, which has to be the first
+// call in the recording. Its entry step sits at the first function's declaration
+// site and is the one step the recording holds beyond the engine's executed
+// lines.
 //
 // G4 note on parallel-indexing: a value is emitted from a write opcode, which
 // always executes AFTER that line's OPCODE_LINE (its register_step) and BEFORE
@@ -790,6 +791,25 @@ static void gdscript_ct_note_and_bundle_path_locked(const String &p_res_path) {
 	gdscript_ct_bundle_source_locked(p_res_path, path_id);
 }
 
+// Open the recording: `trace_writer_start` registers the `<toplevel>`
+// function, opens its call (function_id 0, call_key 0, depth 0) and buffers
+// the entry step at (p_source, p_line) — trace-events.md "Recorder Integration
+// — Starting a Recording". It must therefore precede EVERY other call and
+// step, or `<toplevel>` would open inside whatever frame was already open and
+// every later return would close the wrong frame.
+//
+// The first hook to fire is normally a call (enter_function precedes the first
+// OPCODE_LINE), so the entry step is then that function's declaration site.
+// The writer keeps the entry step pending across the first register_call, so it
+// lands inside the first frame the engine entered.
+static void gdscript_ct_begin_recording_locked(const String &p_source, int64_t p_line, uint64_t p_thread) {
+	g_ct_started = true;
+	CharString src_cs = p_source.utf8();
+	trace_writer_start(g_ct_writer, src_cs.get_data(), p_line > 0 ? p_line : 1);
+	gdscript_ct_note_and_bundle_path_locked(p_source);
+	g_ct_pending_owner = p_thread; // GF12: this thread owns the pending entry step
+}
+
 void gdscript_ct_trace_step(const StringName &p_source, int64_t p_line) {
 	CtEmitLock lk; // GF12: serialize + reentrancy-guard the emit path
 	if (!lk.engaged) {
@@ -810,11 +830,8 @@ void gdscript_ct_trace_step(const StringName &p_source, int64_t p_line) {
 	// size is recorded FIRST. A no-op when the table is off.
 	gdscript_ct_ensure_path_sized_locked(source_str);
 	if (unlikely(!g_ct_started)) {
-		g_ct_started = true;
-		// Registers the first (pending) step at this real source line.
-		trace_writer_start(g_ct_writer, src_cs.get_data(), p_line);
-		gdscript_ct_note_and_bundle_path_locked(source_str);
-		g_ct_pending_owner = cur; // GF12: this thread owns the pending step
+		// No call has opened the recording, so this line is its entry step.
+		gdscript_ct_begin_recording_locked(source_str, p_line, cur);
 		return;
 	}
 
@@ -917,10 +934,17 @@ void gdscript_ct_trace_call(const StringName &p_name, const StringName &p_source
 	}
 	// GF12: attribute this call to the emitting OS thread (before register_call so
 	// the call's entry_step lands in the correct thread region).
-	gdscript_ct_note_thread_locked(gdscript_ct_current_thread());
+	uint64_t cur = gdscript_ct_current_thread();
+	gdscript_ct_note_thread_locked(cur);
+
+	String source_str = String(p_source);
+	if (unlikely(!g_ct_started)) {
+		gdscript_ct_ensure_path_sized_locked(source_str);
+		gdscript_ct_begin_recording_locked(source_str, p_line, cur);
+	}
 
 	CharString name_cs = String(p_name).utf8();
-	CharString src_cs = String(p_source).utf8();
+	CharString src_cs = source_str.utf8();
 	size_t fid = trace_writer_ensure_function_id(g_ct_writer,
 			name_cs.get_data(), src_cs.get_data(), p_line);
 	trace_writer_register_call(g_ct_writer, fid);

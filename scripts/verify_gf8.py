@@ -32,6 +32,8 @@ Usage:
 import json
 import sys
 
+from ct_toplevel import reroot
+
 
 class VerifyError(Exception):
     pass
@@ -39,7 +41,7 @@ class VerifyError(Exception):
 
 def load(path):
     with open(path) as f:
-        return json.load(f)
+        return reroot(json.load(f))
 
 
 def events(doc):
