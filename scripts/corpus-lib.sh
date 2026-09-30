@@ -153,3 +153,29 @@ doc = json.load(open(sys.argv[1]))
 print(sum(1 for e in doc.get("events", []) if e.get("kind") == "step"))
 PY
 }
+
+# corpus_check_crossing_spans <file.ct> <standalone|mcr>
+#   Grades the recording's native<->VM crossing spans with
+#   scripts/verify_crossing_spans.py. The span stream is read with the reader's
+#   own `--spans`, and a reader failure is a failure, never "no spans".
+corpus_check_crossing_spans() {
+	local ct="$1" mode="$2" spans_json calls
+	spans_json="$(mktemp "${TMPDIR:-/tmp}/ct-spans.XXXXXX")"
+	if ! "$CT_PRINT" --spans --json-out "$ct" >"$spans_json"; then
+		rm -f "$spans_json"
+		echo "FAIL: 'ct-print --spans' could not read $ct" >&2
+		return 1
+	fi
+	# Frames the ENGINE entered: every call except the `<toplevel>` root the
+	# writer opens itself, which is not a VM frame and is never crossed into.
+	calls="$("$CT_PRINT" --full "$ct" | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+print(sum(1 for e in doc["events"] if e.get("kind") == "call_entry" and e.get("function") != "<toplevel>"))
+')"
+	[[ -n "$calls" ]] || { rm -f "$spans_json"; echo "FAIL: no call count for $ct" >&2; return 1; }
+	python3 "$REPO/scripts/verify_crossing_spans.py" "$mode" "$spans_json" "$calls"
+	local rc=$?
+	rm -f "$spans_json"
+	return $rc
+}

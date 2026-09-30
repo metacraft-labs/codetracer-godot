@@ -96,6 +96,11 @@ while IFS='|' read -r program milestone role entry verifier cmd golden markers; 
 			python3 "$REPO/scripts/$verifier" "$cmd" "$FULL" || ok=0
 		fi
 	fi
+	# MT3: every corpus recording is standalone (no native recorder), so it
+	# carries no crossing spans. The MCR arm is scripts/verify-crossing-spans.sh.
+	if [[ "$ok" == 1 ]]; then
+		corpus_check_crossing_spans "$CT" standalone || ok=0
+	fi
 
 	if [[ "$ok" == 1 ]]; then
 		passed=$((passed + 1))
