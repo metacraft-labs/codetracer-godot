@@ -39,10 +39,10 @@ CODETRACER="${CODETRACER:-$REPO/../codetracer}"
 FIXTURES="$CODETRACER/src/db-backend/tests/fixtures/gdscript"
 [[ -d "$FIXTURES" ]] || die "no GDScript fixture directory at $FIXTURES (set CODETRACER)"
 
-# A recording that never reloads a source carries no source-reload marker, so
-# its meta.dat is written at the base schema version, 4
-# (codetracer-trace-format-spec/internal-files.md).
-EXPECTED_META_VERSION=4
+# Every recording's meta.dat is version 6, and one made without a reload agent
+# does not declare source reloads: flags_ext is 0
+# (codetracer-trace-format-spec/internal-files.md §"Extended flags").
+EXPECTED_META_VERSION=6
 
 corpus_require_tools
 corpus_ensure_engine
@@ -50,7 +50,7 @@ corpus_ensure_engine
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ct-fixtures.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-meta_dat_version() { # <file.ct> -> the u16 after meta.dat's "CTMD" magic
+meta_dat_version() { # <file.ct> -> meta.dat's version and flags_ext
 	python3 - "$1" <<'PY'
 import struct, sys
 data = open(sys.argv[1], "rb").read()
@@ -58,7 +58,9 @@ hits = data.count(b"CTMD")
 if hits != 1:
     sys.exit("expected exactly one meta.dat header in %s, found %d" % (sys.argv[1], hits))
 at = data.find(b"CTMD")
-print(struct.unpack("<H", data[at + 4:at + 6])[0])
+version, = struct.unpack("<H", data[at + 4:at + 6])
+flags_ext, = struct.unpack("<I", data[at + 8:at + 12])
+print(version, flags_ext)
 PY
 }
 
@@ -75,9 +77,11 @@ for row in "${FIXTURE_PROGRAMS[@]}"; do
 	IFS=$'\t' read -r full stdout_log ct < <(corpus_record "$WORK" "$program.gd")
 	grep -qF "$marker" "$stdout_log" || die "$program.gd: stdout is missing '$marker'"
 	python3 "$REPO/scripts/$verifier" "$cmd" "$full" || die "$program.gd: $verifier $cmd failed"
-	version="$(meta_dat_version "$ct")"
+	read -r version flags_ext < <(meta_dat_version "$ct")
 	[[ "$version" == "$EXPECTED_META_VERSION" ]] \
 		|| die "$program.gd: meta.dat schema version $version, expected $EXPECTED_META_VERSION"
+	[[ "$flags_ext" == 0 ]] \
+		|| die "$program.gd: meta.dat flags_ext $flags_ext, expected 0 (recorded without a reload agent)"
 	log "$program.gd: graded, meta.dat v$version, $(corpus_step_count "$full") steps"
 	staged+=("$program|$ct")
 done

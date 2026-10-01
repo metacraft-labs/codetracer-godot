@@ -102,7 +102,9 @@ ATTRIBUTION_CLAIMS = 14
 # than a second that can drift — and `verify_gdh0.py`'s reader in particular
 # carries the offset-table validation that makes an under-reported record count
 # raise instead of answering.
-from verify_gdh0 import CtfsContainer, _varint  # noqa: E402
+from verify_gdh0 import (  # noqa: E402
+    CtfsContainer, META_FLAG_ALTERNATE_SOURCE_VIEWS,
+    META_FLAG_EXT_SOURCE_RELOAD, _varint)
 import verify_gdh5 as agentwire  # noqa: E402
 
 
@@ -799,8 +801,18 @@ def gate_retrievable(ck: Checker, fixtures: list[dict],
     # depends on the stream being present, but "the flag that says the stream
     # is there" and "the stream happened to decode" are different statements
     # and G0b made the first one.
-    ck.ck(bool(container.meta_flags() & 0x0020),
-          "meta.dat bit 5 (FlagHasAlternateSourceViews) is SET")
+    #
+    # From meta.dat version 6 the stream is found by its presence (asserted
+    # above) and bit 5 is never set: meta.dat is written at the first record,
+    # before any view exists.  What a reload session declares up front instead
+    # is that it MAY record reloads, flags_ext bit 0, without which the writer
+    # refuses every marker.
+    ck.ck(not (container.meta_flags() & META_FLAG_ALTERNATE_SOURCE_VIEWS),
+          "meta.dat bit 5 (FlagHasAlternateSourceViews) is CLEAR, as version 6 "
+          "requires")
+    ck.ck(bool(container.meta_flags_ext() & META_FLAG_EXT_SOURCE_RELOAD),
+          "meta.dat flags_ext bit 0 (source reload) is SET: the recorder "
+          "declared, before the first record, that a reload may arrive")
 
     sized = resolver.sized
     ck.ck(len(sized) > 0, "paths.dat decoded at least one record")
@@ -1232,8 +1244,9 @@ def main() -> int:
         # 10 -> 14 at review, when four GDH-G0b claims the deletion note
         # promised were found to be made by nothing: meta.dat bit 5, the
         # two-reader agreement on paths.dat (two assertions), and the view
-        # name.
-        ck.expect_count(14)
+        # name.  14 -> 15 with meta.dat version 6, where bit 5 is never set
+        # and became two claims: bit 5 clear, and flags_ext bit 0 declared.
+        ck.expect_count(15)
         checkers.append(ck)
         ck.report()
 
@@ -1242,7 +1255,7 @@ def main() -> int:
         print("== %s ==" % cck.gate)
         gate_retrievable(cck, fixtures, c_container, c_resolver, c_dump,
                           control=True)
-        cck.expect_count(14)
+        cck.expect_count(15)
         checkers.append(cck)
         cck.report()
 

@@ -454,6 +454,29 @@ static bool gdscript_ct_ensure_writer() {
 	// qualifier on its keys (the reader strips it for display).
 	trace_writer_set_interning_qualifier(g_ct_writer, "gdscript");
 	trace_writer_begin_events(g_ct_writer, events_cs.get_data());
+
+	// A reload can only arrive through the hot-code-reload agent, so a process
+	// running one may record SourceReload markers. That is a capability
+	// declared before the first record (meta.dat flags_ext bit 0): meta.dat is
+	// written once, at the first record, and the writer refuses a marker in a
+	// trace that did not declare it. A declared trace that never reloads is
+	// well-formed. The result is reported either way, like the line-count
+	// table's below: a refused declaration surfaces later as a refused marker,
+	// and the log is where the two are told apart.
+	const char *agent_socket = getenv("REPRO_HCR_AGENT_SOCKET");
+	const bool reload_agent = agent_socket != nullptr && agent_socket[0] != '\0';
+	if (reload_agent) {
+		trace_writer_clear_last_error();
+		if (trace_writer_declare_source_reload(g_ct_writer) == 0) {
+			fprintf(stderr, "[ct-gdh6] source reload DECLARED (meta.dat flags_ext "
+							"bit 0); a reload can record a SourceReload marker\n");
+		} else {
+			fprintf(stderr, "[ct-gdh6] source reload declaration REFUSED: %s\n",
+					trace_writer_last_error());
+		}
+		fflush(stderr);
+	}
+
 	trace_writer_begin_paths(g_ct_writer, "");
 
 	// GDH-M6: the line-count table, and ONLY when a reload can arrive. See the
@@ -466,8 +489,7 @@ static bool gdscript_ct_ensure_writer() {
 	// the container — and the second is the falsifier arm for the corpus gate,
 	// so they must not be allowed to look identical from the log either.
 	{
-		const char *agent_socket = getenv("REPRO_HCR_AGENT_SOCKET");
-		bool reload_possible = agent_socket != nullptr && agent_socket[0] != '\0';
+		bool reload_possible = reload_agent;
 #if defined(CT_GDH6_FALSIFY_ALWAYS_LINE_COUNT_TABLE)
 		// FALSIFIER ARM (gdh6_corpus_is_unchanged): set the new meta.dat bit
 		// UNCONDITIONALLY. Every container in the GT1 corpus then changes —
@@ -946,8 +968,8 @@ void gdscript_ct_trace_utility_diagnostic(const StringName &p_function,
 	}
 	CharString msg_cs = message.utf8();
 	const char *tag = is_error ? CT_PUSH_ERROR_TAG : CT_PUSH_WARNING_TAG;
-	// push_error -> FFI_EVENT_ERROR (io_kind ioError); push_warning ->
-	// FFI_EVENT_TRACE_LOG_EVENT (io_kind ioStderr) — two distinct io kinds.
+	// push_error -> FFI_EVENT_ERROR; push_warning -> FFI_EVENT_TRACE_LOG_EVENT.
+	// events.dat stores the kind as given, so the two stay distinct.
 	const int kind = is_error ? FFI_EVENT_ERROR : FFI_EVENT_TRACE_LOG_EVENT;
 	// content == the message (surfaced by the reader as the io event's `text`);
 	// metadata == the level tag (for a real event-log pane; not surfaced by ct-print).

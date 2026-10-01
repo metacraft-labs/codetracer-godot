@@ -34,7 +34,7 @@
     # vendored archive stamped with any other revision. Bump it with
     #   nix flake update codetracer-trace-format-nim
     # and re-vendor with scripts/vendor-trace-writer.sh.
-    codetracer-trace-format-nim.url = "github:metacraft-labs/codetracer-trace-format-nim/dev";
+    codetracer-trace-format-nim.url = "github:metacraft-labs/codetracer-trace-format-nim/agents";
   };
 
   outputs =

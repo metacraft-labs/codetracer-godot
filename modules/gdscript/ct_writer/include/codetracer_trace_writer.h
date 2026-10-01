@@ -191,6 +191,13 @@ int trace_writer_set_recording_id(trace_writer_t handle,
                                   const char* recording_id);
 
 void trace_writer_start(trace_writer_t handle, const char* path, int64_t line);
+/*
+ * meta.dat is written once, at the trace's first record (trace_writer_start
+ * included), and never rewritten: the working directory, the arguments and
+ * every capability (enable_*, declare_source_reload, filter provenance) must
+ * be set before it.  A later call is refused (trace_writer_last_error) and
+ * the recording's close fails.
+ */
 void trace_writer_set_workdir(trace_writer_t handle, const char* workdir);
 /* IC-M2: stamp a fully-qualified-key origin namespace (the VM language, e.g.
  * "gdscript") on every interned string when this materialized writer shares a
@@ -304,6 +311,34 @@ uint64_t trace_writer_register_path_version(trace_writer_t handle,
 uint64_t trace_writer_current_path_id(trace_writer_t handle,
                                       const char* path);
 
+/*
+ * Intern `path` in paths.dat NOW and return its id: the id a step at `path`
+ * registered afterwards is attributed to.  A path is interned when it is
+ * registered, whether or not a step ever refers to it, so ids follow the
+ * caller's registrations rather than the order in which steps first reach
+ * each file.  Registering a path twice returns the id it already has.
+ *
+ * Under the line-count table an unseen path registered here has no count to
+ * record and is refused by name, like the implicit registration
+ * trace_writer_register_step performs; use
+ * trace_writer_register_path_with_line_count there.
+ *
+ * Returns CT_TW_INVALID_PATH_ID on failure, with trace_writer_last_error set.
+ * The error buffer is cleared on entry.
+ */
+uint64_t trace_writer_register_path(trace_writer_t handle, const char* path);
+
+/*
+ * Intern `name` in varnames.dat NOW and return its id: the id a value
+ * registered under `name` afterwards carries.  Registering a name twice
+ * returns the id it already has.
+ *
+ * Returns UINT64_MAX on failure, with trace_writer_last_error set.  The error
+ * buffer is cleared on entry.
+ */
+uint64_t trace_writer_register_variable_name(trace_writer_t handle,
+                                             const char* name);
+
 /* --------------------------------------------------------------------------
  * Source-reload markers (GDH-M6 — design §6.3)
  *
@@ -376,6 +411,16 @@ typedef struct {
  * buffer is CLEARED on entry, so a non-empty buffer afterwards is always this
  * call's message and never a stale one.
  */
+/*
+ * Declare, before the first record, that this trace MAY carry source reload
+ * markers (meta.dat flags_ext bit 0).  meta.dat is written once, at the first
+ * record, so the declaration is refused after it; and
+ * trace_writer_register_source_reload is refused in a trace that did not
+ * declare.  A declared trace that records no reload is well-formed.
+ * Returns 0 on success, 1 on refusal (trace_writer_last_error).
+ */
+int trace_writer_declare_source_reload(trace_writer_t handle);
+
 uint64_t trace_writer_register_source_reload(
     trace_writer_t handle,
     const ct_tw_source_reload_change* changed,
@@ -506,10 +551,35 @@ int trace_writer_register_drop_variables(trace_writer_t handle,
 int trace_writer_register_drop_variable(trace_writer_t handle,
     const char* name);
 
+/*
+ * The place model: value-stream tags 1 and 4-8 (trace-events.md §"Value
+ * Stream").  Each attaches to the step being buffered and reaches the trace in
+ * that step's value record.  Values are pre-encoded CBOR ValueRecords (the
+ * ct_value_* encoder), stored verbatim; places are signed.  Variable names are
+ * interned in varnames.dat.  Each returns 0 on success, 1 on failure.
+ */
+int trace_writer_bind_variable(trace_writer_t handle,
+    const char* variable_name, int64_t place);                  /* tag 1 */
+int trace_writer_register_cell_value(trace_writer_t handle, int64_t place,
+    const uint8_t* value_cbor, size_t value_cbor_len);          /* tag 4 */
+int trace_writer_register_compound_value(trace_writer_t handle, int64_t place,
+    const uint8_t* value_cbor, size_t value_cbor_len);          /* tag 5 */
+int trace_writer_assign_cell(trace_writer_t handle, int64_t place,
+    const uint8_t* new_value_cbor, size_t new_value_cbor_len);  /* tag 6 */
+int trace_writer_assign_compound_item(trace_writer_t handle, int64_t place,
+    uint64_t index, int64_t item_place);                        /* tag 7 */
+int trace_writer_register_variable_cell(trace_writer_t handle,
+    const char* variable_name, int64_t place);                  /* tag 8 */
+
 void trace_writer_register_return_cbor(trace_writer_t handle,
     const uint8_t* cbor_data,
     size_t cbor_len);
 
+/*
+ * `kind` is the event's exact EventLogKind ordinal (0-13, trace-events.md
+ * §"EventLogKind (u8 enum)"): it is stored as given and read back as given.
+ * An unassigned value is refused (trace_writer_last_error; close fails).
+ */
 void trace_writer_register_special_event(trace_writer_t handle,
     int kind, const char* metadata, const char* content);
 
@@ -812,7 +882,6 @@ int ct_write_meta_dat_to_buffer(
     const uint8_t* program, size_t program_len,
     const uint8_t* workdir, size_t workdir_len,
     const uint8_t* const* args, const size_t* arg_lens, size_t args_count,
-    const uint8_t* const* paths, const size_t* path_lens, size_t paths_count,
     const uint8_t* recorder_id, size_t recorder_id_len,
     const uint8_t* recording_id, size_t recording_id_len,
     uint8_t** out_buf, size_t* out_len);
@@ -878,8 +947,6 @@ const uint8_t* ct_meta_dat_program(meta_dat_reader_t h, size_t* out_len);
 const uint8_t* ct_meta_dat_workdir(meta_dat_reader_t h, size_t* out_len);
 size_t ct_meta_dat_args_count(meta_dat_reader_t h);
 const uint8_t* ct_meta_dat_arg(meta_dat_reader_t h, size_t idx, size_t* out_len);
-size_t ct_meta_dat_paths_count(meta_dat_reader_t h);
-const uint8_t* ct_meta_dat_path(meta_dat_reader_t h, size_t idx, size_t* out_len);
 const uint8_t* ct_meta_dat_recorder_id(meta_dat_reader_t h, size_t* out_len);
 void ct_meta_dat_free(meta_dat_reader_t h);
 

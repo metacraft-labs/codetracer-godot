@@ -12,9 +12,9 @@
 # The producer is scripts/verify_gdh6.py, the GDH-M6 gate driver: it records
 # both runs over the patchable engine and grades them. The recordings are
 # installed only if EVERY GDH-M6 gate is green over them and their meta.dat
-# schema versions are the ones the format prescribes: 5 for the reloaded run
-# (it carries source-reload markers, which need the extended flags) and 4 for
-# the control.
+# headers are the ones the format prescribes: version 6 for both, and both
+# declaring source reloads (flags_ext bit 0), because both runs are made with a
+# reload agent attached; the control simply never reloads.
 #
 # Usage: scripts/regenerate-codetracer-gdh7-fixtures.sh
 # Env:   CODETRACER (default ../codetracer), CT_PRINT (the `nix develop` shell
@@ -59,20 +59,23 @@ hits = data.count(b"CTMD")
 if hits != 1:
     sys.exit("expected exactly one meta.dat header in %s, found %d" % (sys.argv[1], hits))
 at = data.find(b"CTMD")
-print(struct.unpack("<H", data[at + 4:at + 6])[0])
+version, = struct.unpack("<H", data[at + 4:at + 6])
+flags_ext, = struct.unpack("<I", data[at + 8:at + 12])
+print(version, flags_ext)
 PY
 }
 
 RELOADED="$WORK/run/reloaded/trace/gdscript_trace.ct"
 CONTROL="$WORK/run/control/trace/gdscript_trace.ct"
 [[ -f "$RELOADED" && -f "$CONTROL" ]] || die "the driver did not leave both recordings under $WORK/run"
-v="$(meta_dat_version "$RELOADED")"
-[[ "$v" == 5 ]] || die "reloaded recording: meta.dat v$v, expected 5 (it carries source-reload markers)"
-v="$(meta_dat_version "$CONTROL")"
-[[ "$v" == 4 ]] || die "control recording: meta.dat v$v, expected 4 (no reload)"
+for arm in RELOADED CONTROL; do
+	read -r v flags_ext < <(meta_dat_version "${!arm}")
+	[[ "$v" == 6 ]] || die "$arm recording: meta.dat v$v, expected 6"
+	(( flags_ext & 1 )) || die "$arm recording: meta.dat flags_ext $flags_ext does not declare source reloads (bit 0)"
+done
 
 mkdir -p "$FIXTURES/gdh7_reloaded" "$FIXTURES/gdh7_control"
 cp "$RELOADED" "$FIXTURES/gdh7_reloaded/gdscript_trace.ct"
 for n in 1 2 3; do cp "$PROGRAMS/probe_v$n.gd" "$FIXTURES/gdh7_reloaded/probe_v$n.gd"; done
 cp "$CONTROL" "$FIXTURES/gdh7_control/gdscript_trace.ct"
-log "installed gdh7_reloaded (meta.dat v5) and gdh7_control (meta.dat v4) into $FIXTURES"
+log "installed gdh7_reloaded and gdh7_control (meta.dat v6, source reloads declared) into $FIXTURES"

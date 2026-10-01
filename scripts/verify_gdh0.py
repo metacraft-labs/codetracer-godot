@@ -158,21 +158,28 @@ def die(msg: str) -> "NoReturn":  # noqa: F821
 # ---------------------------------------------------------------------------
 # A minimal CTFS container reader.
 #
-# Ported from the Nim implementation, not from the spec: the spec's §1
-# describes a free-list root area between the header and the file entries, and
-# the in-tree writer does not emit one — its entries start at
-# HeaderSize(8) + ExtHeaderSize(8) = 16 with DefaultMaxRootEntries = 31
-# (`codetracer_ctfs/types.nim:17-22`).  Reading the code rather than the prose
-# is the difference between a reader that works and one that silently reads
-# the wrong 24 bytes.
+# Container version 5 (`ctfs-container.md` §1-§2), the version the recorder's
+# writer produces.  The header is 16 bytes; an unsharded container
+# (`max_shards = 0`) has no free-list root area, so the file entries start
+# right after it.  A member's `MapBlock` is 0 when it is empty, its only data
+# block tagged with bit 63 when it fits one block, and its level-1 mapping
+# block otherwise.  Any other version, or a sharded container, is refused by
+# name rather than read under rules it does not follow.
 # ---------------------------------------------------------------------------
 
 CTFS_MAGIC = bytes([0xC0, 0xDE, 0x72, 0xAC, 0xE2])
+CTFS_VERSION = 5
 _B40_ALPHABET = "\0" + "0123456789" + "abcdefghijklmnopqrstuvwxyz" + "./-"
-_HEADER_SIZE = 8
-_EXT_HEADER_SIZE = 8
+_HEADER_SIZE = 16
 _FILE_ENTRY_SIZE = 24
 _MAX_CHAIN_LEVELS = 5
+_CTFS_DIRECT = 1 << 63
+
+# meta.dat version 6 (`internal-files.md` §"Metadata (meta.dat)"): magic,
+# u16 version, u16 flags, then u32 flags_ext, always present.
+META_DAT_VERSION = 6
+META_FLAG_ALTERNATE_SOURCE_VIEWS = 1 << 5
+META_FLAG_EXT_SOURCE_RELOAD = 1 << 0
 
 
 def _b40_encode(name: str) -> int:
@@ -206,6 +213,17 @@ class CtfsContainer:
         if self.data[:5] != CTFS_MAGIC:
             raise ValueError("%s is not a CTFS container (bad magic)" % path)
         self.version = self.data[5]
+        if self.version != CTFS_VERSION:
+            raise ValueError("%s is a CTFS container version %d; this reader "
+                             "reads version %d only"
+                             % (path, self.version, CTFS_VERSION))
+        if self.data[6] != 0:
+            raise ValueError("%s is encrypted (encryption byte %d)"
+                             % (path, self.data[6]))
+        if self.data[7] != 0:
+            raise ValueError("%s is sharded (max_shards %d); this reader does "
+                             "not implement the free-list root area"
+                             % (path, self.data[7]))
         self.block_size = struct.unpack_from("<I", self.data, 8)[0] or 4096
         self.max_entries = struct.unpack_from("<I", self.data, 12)[0] or 31
         self.path = path
@@ -213,7 +231,7 @@ class CtfsContainer:
     def entries(self) -> list[tuple[str, int, int]]:
         out = []
         for i in range(self.max_entries):
-            off = _HEADER_SIZE + _EXT_HEADER_SIZE + i * _FILE_ENTRY_SIZE
+            off = _HEADER_SIZE + i * _FILE_ENTRY_SIZE
             if off + _FILE_ENTRY_SIZE > len(self.data):
                 break
             size, map_block, name = struct.unpack_from("<QQQ", self.data, off)
@@ -229,7 +247,7 @@ class CtfsContainer:
         encoded = _b40_encode(name)
         found = None
         for i in range(self.max_entries):
-            off = _HEADER_SIZE + _EXT_HEADER_SIZE + i * _FILE_ENTRY_SIZE
+            off = _HEADER_SIZE + i * _FILE_ENTRY_SIZE
             if off + _FILE_ENTRY_SIZE > len(self.data):
                 break
             size, map_block, nm = struct.unpack_from("<QQQ", self.data, off)
@@ -239,12 +257,30 @@ class CtfsContainer:
         if found is None:
             raise KeyError("internal file not found: %s" % name)
         size, map_block = found
-        if size == 0:
-            return b""
         # floor, never round up — §5d: the incomplete final block of an
         # interrupted append must be unaddressable.
         whole_blocks = len(self.data) // self.block_size
-        if map_block == 0 or map_block >= whole_blocks:
+        # The layout is decided by MapBlock, never by Size (§2, "MapBlock has
+        # three forms").
+        if map_block == 0:
+            if size != 0:
+                raise ValueError("%s: %d bytes with no block (MapBlock 0)"
+                                 % (name, size))
+            return b""
+        if map_block & _CTFS_DIRECT:
+            data_block = map_block & ~_CTFS_DIRECT
+            if size > self.block_size:
+                raise ValueError("%s: a direct member of %d bytes cannot fit "
+                                 "one %d-byte block"
+                                 % (name, size, self.block_size))
+            if data_block == 0 or data_block >= whole_blocks:
+                raise ValueError("%s: direct data block %d out of bounds"
+                                 % (name, data_block))
+            block_off = data_block * self.block_size
+            return bytes(self.data[block_off:block_off + size])
+        if size == 0:
+            return b""
+        if map_block >= whole_blocks:
             raise ValueError("%s: mapping root block %d out of bounds"
                              % (name, map_block))
         usable = self.block_size // 8 - 1
@@ -286,11 +322,24 @@ class CtfsContainer:
             block_idx += 1
         return bytes(out)
 
-    def meta_flags(self) -> int:
+    def _meta_header(self) -> bytes:
         meta = self.read_internal("meta.dat")
         if meta[:4] != b"CTMD":
             raise ValueError("meta.dat does not start with CTMD")
-        return struct.unpack_from("<H", meta, 6)[0]
+        if len(meta) < 12:
+            raise ValueError("meta.dat is %d bytes, shorter than its 12-byte "
+                             "header" % len(meta))
+        version = struct.unpack_from("<H", meta, 4)[0]
+        if version != META_DAT_VERSION:
+            raise ValueError("meta.dat is version %d; this reader reads "
+                             "version %d only" % (version, META_DAT_VERSION))
+        return meta
+
+    def meta_flags(self) -> int:
+        return struct.unpack_from("<H", self._meta_header(), 6)[0]
+
+    def meta_flags_ext(self) -> int:
+        return struct.unpack_from("<I", self._meta_header(), 8)[0]
 
     @staticmethod
     def _offset_table(base: str, dat: bytes, off: bytes) -> list[int]:
