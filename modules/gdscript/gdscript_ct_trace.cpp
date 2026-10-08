@@ -929,8 +929,8 @@ void gdscript_ct_trace_await_resume(const void *p_call_state) {
 // wire format has no dedicated Warning kind, so push_warning rides the neutral
 // FFI_EVENT_TRACE_LOG_EVENT kind and carries its level in the event metadata for
 // a real event-log pane. (`ct-print --full` does not surface multi-stream io
-// metadata, but it DOES render the two events with distinct io kinds — ioError
-// vs ioStderr — and the message text, which already distinguish them.)
+// metadata, but it DOES render the two events with distinct io kinds — Error
+// vs TraceLogEvent — and the message text, which already distinguish them.)
 static const char *CT_PUSH_ERROR_TAG = "ct-push-error";
 static const char *CT_PUSH_WARNING_TAG = "ct-push-warning";
 

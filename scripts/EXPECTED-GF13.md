@@ -35,19 +35,19 @@ GF13 covers the three remaining features: string formatting, `assert`, and the
 
 Recorded as trace EVENTS (option (a)), not caller-frame steps. The recorder
 maps `push_error` -> `FFI_EVENT_ERROR` and `push_warning` ->
-`FFI_EVENT_TRACE_LOG_EVENT`; the multi-stream writer's `toIOEventKind` then
-renders them, via `ct-print --full`, as two DISTINCT `kind=="io"` events:
+`FFI_EVENT_TRACE_LOG_EVENT`; `ct-print --full` renders them as two DISTINCT
+`kind=="io"` events:
 
 | field      | push_warning         | push_error         |
 |------------|----------------------|--------------------|
-| `io_kind`  | `ioStderr`           | `ioError`          |
+| `io_kind`  | `TraceLogEvent`      | `Error`            |
 | `text`     | `gf13 warning`       | `gf13 error`       |
 | `metadata` | `ct-push-warning`*   | `ct-push-error`*   |
 
 The message is the `content` (surfaced as `text`), matching the engine's own
 `join_string` of the args. `push_error` uses the real error io kind; a warning
 has no dedicated wire kind so it rides the neutral trace-log kind (rendered
-`ioStderr`, which is also where Godot's own `WARN_PRINT` writes).
+`TraceLogEvent`).
 
 *The recorder ALSO writes a level tag into the event metadata for a real
 event-log pane, but `ct-print --full` does NOT surface multi-stream io metadata
@@ -87,8 +87,8 @@ Deterministic checksum: `8 + 3 + 4 + 11 + 3 = 29` → stdout `CT_GF13_RESULT=29`
 2. **assert is a recorded step**: a step exists at line 56 AND steps at the
    later lines 57/58/59/60 exist (a passing assert did not halt).
 3. **push_warning / push_error recorded as events**: exactly one io event with
-   `io_kind=="ioStderr"` and `text=="gf13 warning"`; exactly one with
-   `io_kind=="ioError"` and `text=="gf13 error"`.
+   `io_kind=="TraceLogEvent"` and `text=="gf13 warning"`; exactly one with
+   `io_kind=="Error"` and `text=="gf13 error"`.
 4. **Types table unchanged (scalar-only)**: `[None, Int, Float, Bool, String, Variant]`
    (None at TypeId 0). The format arrays `[i, s, f]` / `[a, b]` are temporaries,
    never captured, so no Array type is registered.

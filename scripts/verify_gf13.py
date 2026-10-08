@@ -42,14 +42,13 @@ EXPECTED_TYPES = ["None", "Int", "Float", "Bool", "String", "Variant"]
 
 # push_error / push_warning surface as events.dat special events (io events).
 # The recorder maps push_error -> FFI_EVENT_ERROR and push_warning ->
-# FFI_EVENT_TRACE_LOG_EVENT; the multi-stream writer's toIOEventKind then renders
-# them, via ct-print, as io_kind "ioError" and "ioStderr" respectively — two
-# DISTINCT kinds. The recorder also writes a level tag into the event metadata
+# FFI_EVENT_TRACE_LOG_EVENT; ct-print renders their event kinds as io_kind
+# "Error" and "TraceLogEvent" respectively — two DISTINCT kinds. The recorder also writes a level tag into the event metadata
 # ("ct-push-error"/"ct-push-warning") for a real event-log pane, but ct-print
 # does NOT surface multi-stream io metadata (GF10 documented the same), so the
 # verifier keys off io_kind + message text (both of which ct-print DOES surface).
-WARN_KIND = "ioStderr"
-ERR_KIND = "ioError"
+WARN_KIND = "TraceLogEvent"
+ERR_KIND = "Error"
 WARN_MSG = "gf13 warning"
 ERR_MSG = "gf13 error"
 
@@ -140,8 +139,8 @@ def verify(doc):
             raise VerifyError(f"no step at line {ln}: execution did not continue past the passing assert")
 
     # 3. push_warning / push_error — each recorded ONCE as an io event with the
-    #    right kind and message (text). push_warning -> ioStderr, push_error ->
-    #    ioError (two distinct kinds), each carrying its exact message.
+    #    right kind and message (text). push_warning -> TraceLogEvent, push_error
+    #    -> Error (two distinct kinds), each carrying its exact message.
     io = ios(doc)
     warns = [e for e in io if e.get("io_kind") == WARN_KIND and e.get("text") == WARN_MSG]
     errs = [e for e in io if e.get("io_kind") == ERR_KIND and e.get("text") == ERR_MSG]
@@ -163,8 +162,8 @@ def verify(doc):
     print(
         "GF13 verify OK: formatting pf='7/a/3.14' ff='x y' raw='a\\\\nb'(len4) "
         "tq='line1\\nline2'(len11) cc='a-x'; i=7 ok=true; assert step@55 + "
-        "continued 56/57/58/59; push_warning('gf13 warning',ioStderr) + "
-        "push_error('gf13 error',ioError); types [None,Int,Float,Bool,String,Variant]"
+        "continued 56/57/58/59; push_warning('gf13 warning',TraceLogEvent) + "
+        "push_error('gf13 error',Error); types [None,Int,Float,Bool,String,Variant]"
     )
 
 
