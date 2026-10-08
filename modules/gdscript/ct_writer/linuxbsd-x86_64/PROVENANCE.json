@@ -1,7 +1,7 @@
 {
-  "rev": "63b67093d877f852030ea0d102ecda6cb60064d6",
+  "rev": "051efd22b00ec3b88676fb07755a65c5a4ca8fde",
   "source": "github:metacraft-labs/codetracer-trace-format-nim",
   "built_by": "nix build .#ct-trace-writer (flake.nix)",
-  "archive_sha256": "3b2a443549d56d3d996fdf4c7e2fa93cde110e62e07c08ce043113e0b4c63624",
-  "header_sha256": "61a0ca403651c178a0106765aa9f693a5365cc174b53f24baf2ee7ddf58e3443"
+  "archive_sha256": "7c15a635a6cdab148769d79b1a0b933c355e3ac8179e1a136d1007bd966d58f4",
+  "header_sha256": "c001a204801164266dd10d301850892c2a161d53e582ea38c5b4ecd7f83004ae"
 }

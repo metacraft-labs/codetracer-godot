@@ -274,11 +274,11 @@
         "pre-commit-hooks": "pre-commit-hooks_3"
       },
       "locked": {
-        "lastModified": 1790879282,
-        "narHash": "sha256-E/L2XYYQM/2BI/irrA1apVcYWKp0JaR2gzbNQlV8204=",
+        "lastModified": 1791473481,
+        "narHash": "sha256-+3Q3qbwb2/EiLjzLynPGkXLXMwZBLEV8//KD/OIuAaM=",
         "owner": "metacraft-labs",
         "repo": "codetracer-trace-format-nim",
-        "rev": "63b67093d877f852030ea0d102ecda6cb60064d6",
+        "rev": "051efd22b00ec3b88676fb07755a65c5a4ca8fde",
         "type": "github"
       },
       "original": {

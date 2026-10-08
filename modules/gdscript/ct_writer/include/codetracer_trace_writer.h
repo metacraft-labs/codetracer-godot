@@ -103,6 +103,20 @@ const char* trace_writer_last_error(void);
  */
 void trace_writer_clear_last_error(void);
 
+/*
+ * How this library was compiled: `key:value` pairs joined by ';'.  A host
+ * library built by the repository's build_ffi.nims answers
+ * "app:staticlib;threads:off;mm:arc;release:on;processLock:on".
+ *
+ * The C ABI is safe to call from several host threads only when the library
+ * was built --threads:off with its process lock (one Nim heap, entered by one
+ * thread at a time); the same source built --threads:on crashes when a writer
+ * is freed after the thread that used it exited.  A host that did not build
+ * the archive itself can check this instead of trusting the build.  The
+ * string is static, never NULL, and never fails.
+ */
+const char* trace_writer_build_config(void);
+
 /* --------------------------------------------------------------------------
  * Lifecycle
  * -------------------------------------------------------------------------- */
@@ -156,6 +170,25 @@ int      trace_writer_container_ready(trace_writer_t handle);
 size_t   trace_writer_container_len(trace_writer_t handle);
 uint8_t* trace_writer_container_ptr(trace_writer_t handle);
 
+/*
+ * The container profile, chosen at close (ctfs-container.md §1e, §1f).
+ *
+ * The writer always records the FULL profile, streamed to its file as it
+ * goes.  With a non-zero threshold, trace_writer_close then converts the
+ * finished container: when the members of a compact container of it -- every
+ * zstd frame inflated -- total fewer than `raw_bytes` bytes, the compact
+ * container replaces the full one (in the file, or in the in-memory
+ * container).  0, the default, writes the full profile always.  The Rust
+ * CtfsTraceWriter's `with_compact_threshold` makes the same choice, and the
+ * two writers' compact containers are byte-identical.
+ *
+ * May be called at any time before trace_writer_close.  Returns 0, or
+ * non-zero for a NULL handle or a writer that is not in CTFS multi-stream
+ * mode.
+ */
+int      trace_writer_set_compact_threshold(trace_writer_t handle,
+                                            uint64_t raw_bytes);
+
 /* --------------------------------------------------------------------------
  * Tracing primitives
  * -------------------------------------------------------------------------- */
@@ -189,6 +222,27 @@ uint8_t* trace_writer_container_ptr(trace_writer_t handle);
  */
 int trace_writer_set_recording_id(trace_writer_t handle,
                                   const char* recording_id);
+
+/*
+ * The flag-gated meta.dat blocks (internal-files.md "Extended Fields"), each
+ * written when it is set and set before the first record, as filter
+ * provenance is.  tick_source / atomic_mode are TickSource / AtomicMode
+ * ordinals (an ordinal outside its enumeration is refused); a NULL string is
+ * written empty.  Returns 0 on success, non-zero on refusal
+ * (see trace_writer_last_error).
+ */
+int trace_writer_set_mcr_fields(trace_writer_t handle,
+    int tick_source, uint32_t total_threads, int atomic_mode,
+    uint64_t total_events, uint32_t total_checkpoints,
+    uint64_t start_time_unix_us,
+    const char* platform, const char* tick_granularity,
+    const char* tick_source_str, const char* atomic_mode_str,
+    const char* start_time_str, const char* hook_profile,
+    const char* const* hook_strategies, size_t hook_strategies_count);
+int trace_writer_set_replay_launch_fields(trace_writer_t handle,
+                                          int aslr_disabled);
+int trace_writer_set_layout_snapshot(trace_writer_t handle,
+    uint64_t layout_hash, const uint8_t* fingerprint, size_t fingerprint_len);
 
 void trace_writer_start(trace_writer_t handle, const char* path, int64_t line);
 /*
@@ -591,11 +645,11 @@ void trace_writer_register_special_event(trace_writer_t handle,
  * a session_manifest.jsonl / codetracer_spans.jsonl sidecar.  Spec:
  * codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md.
  *
- * Only the binary (multi-stream) backend supports spans.  Registering at
- * least one span sets meta.dat flag bit 13 (0x2000, FlagHasSpanStream) on the
- * finished container; a recording that registers none is byte-for-byte
- * unchanged.  NOTE that bit 13 is REJECTED by readers that predate it, so a
- * recorder should only emit spans once its consumers understand the bit.
+ * Only the binary (multi-stream) backend supports spans.  The first span
+ * creates spans.dat and spans.idx; a recording that registers none has
+ * neither.  meta.dat flag bit 13 (FlagHasSpanStream) stays clear: meta.dat is
+ * written at the first record, and a reader finds the stream by the presence
+ * of spans.dat.
  *
  * To publish an in-flight request, call once with SPAN_FLAG_OPEN set and
  * end_wall_ns / end_step zero, then call again on completion with the SAME
@@ -850,6 +904,59 @@ uint64_t trace_writer_next_step_index(trace_writer_t handle);
  */
 uint8_t* ct_spans_json(const char* path, int settled, size_t* out_len);
 
+/*
+ * The span-type index (spantype.ns) of the .ct container at `path`, as a JSON
+ * array of {"type_id", "name", "span_ids"} objects in the index's order.
+ * Returns NULL with *out_len = 0 on failure, including a container with no
+ * span-type index (see trace_writer_last_error).  Free with ct_free_buffer.
+ */
+uint8_t* ct_span_types_json(const char* path, size_t* out_len);
+
+/* --------------------------------------------------------------------------
+ * Line hits and the correlation index
+ *
+ * trace_writer_enable_linehits makes the writer record `linehits.tc`: from
+ * the call on, every step records its position and exec-record index, and the
+ * index is written at close. Call after trace_writer_begin_events and before
+ * the first step it should cover. Returns 0 on success, 1 on failure.
+ *
+ * The read functions take a container path and return a JSON document in
+ * *out_buf / *out_len, freed with ct_free_buffer. Each returns 0 with the
+ * document; 1 when the container has no such member, with nothing allocated
+ * (for the correlation index that means "not indexed", which is not an empty
+ * index); and -1 on failure, with trace_writer_last_error set. A malformed
+ * member is a failure, never an empty answer.
+ *
+ * An entry object is {"key":K,"kind":k,"flags":f,"identity":"<48 hex>",
+ * "wall_time_unix_ns":W,"monotonic_time_ns":M,"geid":G,"thread_id":T}, where
+ * key is the B-tree key of its bucket and identity the entry's 24 identity
+ * bytes in lowercase hex.
+ * -------------------------------------------------------------------------- */
+
+int trace_writer_enable_linehits(trace_writer_t handle);
+
+/* [{"position":P,"steps":[s,...]},...] in position order. */
+int ct_linehits_json(const char* path, uint8_t** out_buf, size_t* out_len);
+
+/* Every entry, in key order and bucket order. */
+int ct_correlation_index_json(const char* path, uint8_t** out_buf,
+    size_t* out_len);
+
+/* The confirmed kind-0 entries for (trace_id[16], span_id[8]), wire bytes. */
+int ct_correlation_lookup_span(const char* path,
+    const uint8_t* trace_id, size_t trace_id_len,
+    const uint8_t* span_id, size_t span_id_len,
+    uint8_t** out_buf, size_t* out_len);
+
+/* The confirmed kind-1 entries for (marker_id, key_value). */
+int ct_correlation_lookup_boundary(const char* path, uint64_t marker_id,
+    const uint8_t* key_value, size_t key_value_len,
+    uint8_t** out_buf, size_t* out_len);
+
+/* The marker labels in id order, each as lowercase hex of its bytes. */
+int ct_marker_labels_json(const char* path, uint8_t** out_buf,
+    size_t* out_len);
+
 /* --------------------------------------------------------------------------
  * Thread lifecycle events
  *
@@ -863,6 +970,27 @@ uint8_t* ct_spans_json(const char* path, int settled, size_t* out_len);
 void trace_writer_register_thread_start(trace_writer_t handle, uint64_t thread_id);
 void trace_writer_register_thread_exit(trace_writer_t handle, uint64_t thread_id);
 void trace_writer_register_thread_switch(trace_writer_t handle, uint64_t thread_id);
+
+/* --------------------------------------------------------------------------
+ * Exceptions
+ *
+ * Raise and Catch are step-stream events (`trace-events.md` tags 0x02 and
+ * 0x03); a call that exits by an exception carries it, as CBOR, in its call
+ * record's `exception`. The split-stream writer only: on the legacy writer
+ * each refuses by name through trace_writer_last_error.
+ * -------------------------------------------------------------------------- */
+
+/* An exception of the interned type `exception_type_id` is raised, with
+ * `message_len` bytes of message (`message` may be NULL when it is 0). */
+void trace_writer_register_raise(trace_writer_t handle, uint64_t exception_type_id,
+                                 const uint8_t* message, size_t message_len);
+/* An exception of the interned type `exception_type_id` is caught. */
+void trace_writer_register_catch(trace_writer_t handle, uint64_t exception_type_id);
+/* The innermost call exits by an exception: `exception_len` (> 0) bytes of
+ * CBOR, recorded as its call record's `exception`, with no return value. */
+void trace_writer_register_return_exception(trace_writer_t handle,
+                                            const uint8_t* exception_cbor,
+                                            size_t exception_len);
 
 /* --------------------------------------------------------------------------
  * meta.dat — write via trace writer handle
@@ -981,6 +1109,133 @@ int ct_value_write_char(value_encoder_t h, uint32_t codepoint, uint64_t type_id)
 int ct_value_write_bigint(value_encoder_t h, const uint8_t* data, size_t len, int negative, uint64_t type_id);
 
 const uint8_t* ct_value_get_bytes(value_encoder_t h, size_t* out_len);
+
+/* --------------------------------------------------------------------------
+ * Trace reader
+ *
+ * A reader handle is an opened `.ct` container.  It comes from a path
+ * (`ct_reader_open`, hosts with a filesystem only) or from bytes already in
+ * memory (`ct_reader_open_bytes`, every target, including freestanding
+ * wasm32).  Close it with `ct_reader_close`.
+ *
+ * Conventions, for every function below:
+ *   - A NULL handle is refused; the failure value is the one stated.
+ *   - Failures set trace_writer_last_error().
+ *   - A returned `uint8_t*` and every `*out_data` buffer is a heap copy the
+ *     caller frees with ct_free_buffer.  The JSON accessors (`ct_reader_step`,
+ *     `_values`, `_call`, `_call_for_step`, `_event`) return NULL on failure;
+ *     the name accessors return a non-NULL buffer even for an empty name
+ *     (`*out_len = 0`), so NULL from them is always a failure.
+ *   - A handle is not thread-safe; use one per thread or serialise calls.
+ * -------------------------------------------------------------------------- */
+
+typedef void* ct_reader_t;
+
+/* Open the container at `path`.  NULL on failure. */
+ct_reader_t ct_reader_open(const char* path);
+/* As ct_reader_open, reading paths.dat records as column-aware (Layout A)
+ * even when meta.dat bit 4 is clear.  An assertion by the caller, never a
+ * guess: on a trace whose records are not Layout A the open fails. */
+ct_reader_t ct_reader_open_assume_column_aware_paths(const char* path);
+/* Open a container held in memory.  The `len` bytes at `data` are copied,
+ * so the caller may free them as soon as this returns.  NULL on failure. */
+ct_reader_t ct_reader_open_bytes(const uint8_t* data, size_t len);
+/* Re-read a growing container at `path` into `h`.  0 on success. */
+int ct_reader_refresh(ct_reader_t h, const char* path);
+/* Close and free a handle.  NULL is a no-op. */
+void ct_reader_close(ct_reader_t h);
+
+/* Counts.  0 on failure. */
+uint64_t ct_reader_step_count(ct_reader_t h);
+uint64_t ct_reader_call_count(ct_reader_t h);
+uint64_t ct_reader_event_count(ct_reader_t h);
+uint64_t ct_reader_path_count(ct_reader_t h);
+uint64_t ct_reader_function_count(ct_reader_t h);
+uint64_t ct_reader_type_count(ct_reader_t h);
+uint64_t ct_reader_varname_count(ct_reader_t h);
+
+/* Interned names by id. */
+uint8_t* ct_reader_path(ct_reader_t h, uint64_t id, size_t* out_len);
+uint8_t* ct_reader_function(ct_reader_t h, uint64_t id, size_t* out_len);
+uint8_t* ct_reader_type_name(ct_reader_t h, uint64_t id, size_t* out_len);
+uint8_t* ct_reader_varname(ct_reader_t h, uint64_t id, size_t* out_len);
+
+/* meta.dat's program and working directory. */
+uint8_t* ct_reader_program(ct_reader_t h, size_t* out_len);
+uint8_t* ct_reader_workdir(ct_reader_t h, size_t* out_len);
+
+/* Records as JSON documents. */
+uint8_t* ct_reader_step(ct_reader_t h, uint64_t n, size_t* out_len);
+uint8_t* ct_reader_values(ct_reader_t h, uint64_t n, size_t* out_len);
+uint8_t* ct_reader_call(ct_reader_t h, uint64_t key, size_t* out_len);
+/* The innermost call enclosing step `step_id`. */
+uint8_t* ct_reader_call_for_step(ct_reader_t h, uint64_t step_id, size_t* out_len);
+uint8_t* ct_reader_event(ct_reader_t h, uint64_t index, size_t* out_len);
+
+/* Step N's source location.  0 on success; non-zero when the step's position
+ * is not one the trace's line-only address space can address. */
+int ct_reader_step_location(ct_reader_t h, uint64_t n,
+                            uint64_t* out_path_id, uint64_t* out_line);
+/* Steps [start_n, start_n + count) into caller buffers of `count` entries.
+ * Returns the number written, min(count, step_count - start_n), or
+ * UINT64_MAX on failure.  Columns are 0 on a line-only trace. */
+uint64_t ct_reader_step_locations(ct_reader_t h, uint64_t start_n, uint64_t count,
+                                  uint64_t* out_path_ids, uint64_t* out_lines);
+uint64_t ct_reader_step_locations_with_columns(
+    ct_reader_t h, uint64_t start_n, uint64_t count,
+    uint64_t* out_path_ids, uint64_t* out_lines, uint64_t* out_columns);
+/* The raw global_position_index of each step, uninterpreted. */
+uint64_t ct_reader_step_global_line_indices(ct_reader_t h, uint64_t start_n,
+                                            uint64_t count, uint64_t* out_glis);
+
+/* paths.dat per-file size tables.  The line-length accessors return 0 and
+ * write *out_value when a value is available, 1 otherwise; the _raw form
+ * ignores meta.dat bit 4.  ct_reader_line_count_raw is 0 for a file with no
+ * Layout A table.  ct_reader_path_table_kind: 0 bare record, 1 line count
+ * (bit 14), 2 per-line table (bit 4), 3 the conventional table; -1 for a
+ * NULL handle or an unknown file. */
+int ct_reader_line_length(ct_reader_t h, uint64_t file_id, uint32_t line_index0,
+                          uint32_t* out_value);
+int ct_reader_line_length_raw(ct_reader_t h, uint64_t file_id, uint32_t line_index0,
+                              uint32_t* out_value);
+uint64_t ct_reader_line_count_raw(ct_reader_t h, uint64_t file_id);
+int ct_reader_path_table_kind(ct_reader_t h, uint64_t file_id);
+
+/* meta.dat flags: 1 set, 0 clear, -1 for a NULL handle.
+ * ct_reader_column_aware_paths_suspected is a report, not a verdict: the
+ * trace declares line-only records, yet every one also parses as Layout A. */
+int ct_reader_has_column_aware_steps(ct_reader_t h);
+int ct_reader_column_aware_paths_suspected(ct_reader_t h);
+int ct_reader_supports_column_breakpoints(ct_reader_t h);
+int ct_reader_supports_column_motions(ct_reader_t h);
+
+/* Step N's variable values, one at a time.  `*out_data` is the value's CBOR.
+ * ct_reader_step_value returns 0 on success. */
+uint64_t ct_reader_step_value_count(ct_reader_t h, uint64_t n);
+int ct_reader_step_value(ct_reader_t h, uint64_t n, uint64_t value_idx,
+                         uint64_t* out_varname_id, uint64_t* out_type_id,
+                         uint8_t** out_data, size_t* out_data_len);
+
+/* Call `key`'s fields.  0 on success.  ct_reader_call_child returns the
+ * child's key, UINT64_MAX on failure; ct_reader_call_arg's `*out_data` is
+ * the argument's CBOR. */
+int ct_reader_call_fields(ct_reader_t h, uint64_t key,
+                          uint64_t* out_function_id, int64_t* out_parent_key,
+                          uint64_t* out_entry_step, uint64_t* out_exit_step,
+                          uint32_t* out_depth, uint64_t* out_children_count);
+uint64_t ct_reader_call_child(ct_reader_t h, uint64_t key, uint64_t child_idx);
+uint64_t ct_reader_call_arg_count(ct_reader_t h, uint64_t key);
+int ct_reader_call_arg(ct_reader_t h, uint64_t key, uint64_t arg_idx,
+                       uint64_t* out_varname_id,
+                       uint8_t** out_data, size_t* out_data_len);
+
+/* IO event `index`.  `*out_kind` is its EventLogKind (0-13).  0 on success.
+ * An empty metadata slot is NULL with length 0, not a failure. */
+int ct_reader_event_fields(ct_reader_t h, uint64_t index,
+                           uint8_t* out_kind, uint64_t* out_step_id,
+                           uint8_t** out_data, size_t* out_data_len);
+int ct_reader_event_metadata(ct_reader_t h, uint64_t index,
+                             uint8_t** out_data, size_t* out_data_len);
 
 #ifdef __cplusplus
 }
