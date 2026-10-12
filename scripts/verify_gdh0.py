@@ -175,9 +175,10 @@ _FILE_ENTRY_SIZE = 24
 _MAX_CHAIN_LEVELS = 5
 _CTFS_DIRECT = 1 << 63
 
-# meta.dat version 6 (`internal-files.md` §"Metadata (meta.dat)"): magic,
-# u16 version, u16 flags, then u32 flags_ext, always present.
-META_DAT_VERSION = 6
+# meta.dat version 7 (`internal-files.md` §"Metadata (meta.dat)"): magic,
+# u16 version, u16 flags, then u32 flags_ext, always present. The header is
+# version 6's; version 7 adds event kinds the events stream may carry.
+META_DAT_VERSION = 7
 META_FLAG_ALTERNATE_SOURCE_VIEWS = 1 << 5
 META_FLAG_EXT_SOURCE_RELOAD = 1 << 0
 

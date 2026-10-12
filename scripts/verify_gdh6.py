@@ -809,7 +809,7 @@ def gate_retrievable(ck: Checker, fixtures: list[dict],
     # refuses every marker.
     ck.ck(not (container.meta_flags() & META_FLAG_ALTERNATE_SOURCE_VIEWS),
           "meta.dat bit 5 (FlagHasAlternateSourceViews) is CLEAR, as version 6 "
-          "requires")
+          "and later require")
     ck.ck(bool(container.meta_flags_ext() & META_FLAG_EXT_SOURCE_RELOAD),
           "meta.dat flags_ext bit 0 (source reload) is SET: the recorder "
           "declared, before the first record, that a reload may arrive")

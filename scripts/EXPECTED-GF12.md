@@ -63,7 +63,7 @@ type-id maps. GF12 makes that CORRECT:
   correctness-preserving `g_ct_pending_owner` guard. STEP counts, call records and
   captured return/counter values are unaffected.)
 - Well-formed `.ct`: `ct-print --full` decodes it, every `call_entry` has
-  `entry_step ≤ exit_step`, and there are no exception (`sekRaise`) events.
+  `entry_step ≤ exit_step`, and there are no exception (`raise`) records.
 
 ## Honest non-determinism (NOT asserted)
 

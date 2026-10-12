@@ -82,20 +82,34 @@ def calls_of(doc):
     return [e for e in doc["events"] if e["kind"] == "call_entry"]
 
 
+THREAD_KINDS = ("thread_start", "thread_switch", "thread_exit")
+
+
 def is_thread_event(e):
-    return e.get("step_kind", "").startswith("sekThread")
+    return e["kind"] in THREAD_KINDS
+
+
+def exec_records_of(doc):
+    """Steps and the thread records between them, in exec-stream order.
+
+    `ct-print --full` lists a ThreadStart/ThreadSwitch/ThreadExit record under
+    its own kind, not as a step; its `step_index` is the exec-record index it
+    occupies, which places it among the steps around it."""
+    return sorted(
+        (e for e in doc["events"] if e["kind"] == "step" or is_thread_event(e)),
+        key=lambda e: e["step_index"],
+    )
 
 
 def walk_steps(doc):
-    """Yield (line, thread_id, step) for each non-thread-event step, tracking the
-    current thread from ThreadStart/ThreadSwitch markers (reliable attribution)."""
+    """Yield (line, thread_id, step) for each step, tracking the current thread
+    from the ThreadStart/ThreadSwitch records (reliable attribution)."""
     cur = MAIN_TID
-    for e in steps_of(doc):
-        sk = e.get("step_kind", "")
-        if sk in ("sekThreadStart", "sekThreadSwitch"):
+    for e in exec_records_of(doc):
+        if e["kind"] in ("thread_start", "thread_switch"):
             cur = e["thread_id"]
             continue
-        if sk == "sekThreadExit":
+        if e["kind"] == "thread_exit":
             continue
         yield e.get("line"), cur, e
 
@@ -164,8 +178,8 @@ def verify(doc):
         raise VerifyError(f"pool thread must run add_one {POOL_ADD_ONE}x, got {n_pool}")
 
     # --- 5. thread-lifecycle events present + ≥2 distinct non-main threads --
-    tevs = [e for e in steps_of(doc) if is_thread_event(e)]
-    nonmain_starts = [e for e in tevs if e.get("step_kind") == "sekThreadStart" and e["thread_id"] != MAIN_TID]
+    tevs = [e for e in doc["events"] if is_thread_event(e)]
+    nonmain_starts = [e for e in tevs if e["kind"] == "thread_start" and e["thread_id"] != MAIN_TID]
     if not nonmain_starts:
         raise VerifyError("no ThreadStart with a non-main thread id was emitted")
     nonmain_threads = {tid for _, tid, _ in walk_steps(doc) if tid != MAIN_TID}
@@ -201,9 +215,8 @@ def verify(doc):
     for c in calls_of(doc):
         if c["entry_step"] > c["exit_step"]:
             raise VerifyError(f"call {c.get('function')} entry_step>{c['exit_step']} (malformed)")
-    for e in steps_of(doc):
-        if e.get("step_kind") == "sekRaise":
-            raise VerifyError("unexpected exception (sekRaise) event in trace")
+    if any(e["kind"] == "raise" for e in doc["events"]):
+        raise VerifyError("unexpected exception (raise) record in trace")
 
     print(
         "GF12 verify OK: "
@@ -238,7 +251,7 @@ def tamper(doc, mode):
         # to the main thread, breaking thread-id distinctness.
         n = 0
         for e in doc["events"]:
-            if e["kind"] == "step" and e.get("step_kind", "").startswith("sekThread"):
+            if is_thread_event(e):
                 e["thread_id"] = MAIN_TID
                 n += 1
         if n == 0:

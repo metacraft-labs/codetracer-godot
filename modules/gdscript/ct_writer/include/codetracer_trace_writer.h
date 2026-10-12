@@ -72,7 +72,17 @@ enum FfiEventLogKind {
     FFI_EVENT_OPEN = 10,
     FFI_EVENT_ERROR = 11,
     FFI_EVENT_TRACE_LOG_EVENT = 12,
-    FFI_EVENT_EVM_EVENT = 13
+    FFI_EVENT_EVM_EVENT = 13,
+    FFI_EVENT_WRITE_STDERR = 14,
+    FFI_EVENT_EXEC = 15,
+    FFI_EVENT_READ_ENV = 16,
+    FFI_EVENT_WRITE_ENV = 17,
+    FFI_EVENT_STAT = 18,
+    FFI_EVENT_CREATE_DIR = 19,
+    FFI_EVENT_REMOVE_DIR = 20,
+    FFI_EVENT_REMOVE_FILE = 21,
+    FFI_EVENT_RENAME = 22,
+    FFI_EVENT_CHANGE_DIR = 23
 };
 
 /* --------------------------------------------------------------------------
@@ -630,7 +640,7 @@ void trace_writer_register_return_cbor(trace_writer_t handle,
     size_t cbor_len);
 
 /*
- * `kind` is the event's exact EventLogKind ordinal (0-13, trace-events.md
+ * `kind` is the event's exact EventLogKind ordinal (0-23, trace-events.md
  * §"EventLogKind (u8 enum)"): it is stored as given and read back as given.
  * An unassigned value is refused (trace_writer_last_error; close fails).
  */
@@ -1147,6 +1157,11 @@ void ct_reader_close(ct_reader_t h);
 
 /* Counts.  0 on failure. */
 uint64_t ct_reader_step_count(ct_reader_t h);
+/* The number of step records (AbsoluteStep, DeltaStep): the trace's step
+ * count.  ct_reader_step_count is the exec-record count, which the other
+ * streams are indexed by and which also counts raise, catch, thread,
+ * column-only and source-reload records. */
+uint64_t ct_reader_logical_step_count(ct_reader_t h);
 uint64_t ct_reader_call_count(ct_reader_t h);
 uint64_t ct_reader_event_count(ct_reader_t h);
 uint64_t ct_reader_path_count(ct_reader_t h);
@@ -1229,7 +1244,7 @@ int ct_reader_call_arg(ct_reader_t h, uint64_t key, uint64_t arg_idx,
                        uint64_t* out_varname_id,
                        uint8_t** out_data, size_t* out_data_len);
 
-/* IO event `index`.  `*out_kind` is its EventLogKind (0-13).  0 on success.
+/* IO event `index`.  `*out_kind` is its EventLogKind (0-23).  0 on success.
  * An empty metadata slot is NULL with length 0, not a failure. */
 int ct_reader_event_fields(ct_reader_t h, uint64_t index,
                            uint8_t* out_kind, uint64_t* out_step_id,

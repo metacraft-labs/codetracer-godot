@@ -39,10 +39,10 @@ CODETRACER="${CODETRACER:-$REPO/../codetracer}"
 FIXTURES="$CODETRACER/src/db-backend/tests/fixtures/gdscript"
 [[ -d "$FIXTURES" ]] || die "no GDScript fixture directory at $FIXTURES (set CODETRACER)"
 
-# Every recording's meta.dat is version 6, and one made without a reload agent
+# Every recording's meta.dat is version 7, and one made without a reload agent
 # does not declare source reloads: flags_ext is 0
 # (codetracer-trace-format-spec/internal-files.md §"Extended flags").
-EXPECTED_META_VERSION=6
+EXPECTED_META_VERSION=7
 
 corpus_require_tools
 corpus_ensure_engine

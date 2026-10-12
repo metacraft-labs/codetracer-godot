@@ -12,7 +12,7 @@
 # The producer is scripts/verify_gdh6.py, the GDH-M6 gate driver: it records
 # both runs over the patchable engine and grades them. The recordings are
 # installed only if EVERY GDH-M6 gate is green over them and their meta.dat
-# headers are the ones the format prescribes: version 6 for both, and both
+# headers are the ones the format prescribes: version 7 for both, and both
 # declaring source reloads (flags_ext bit 0), because both runs are made with a
 # reload agent attached; the control simply never reloads.
 #
@@ -70,7 +70,7 @@ CONTROL="$WORK/run/control/trace/gdscript_trace.ct"
 [[ -f "$RELOADED" && -f "$CONTROL" ]] || die "the driver did not leave both recordings under $WORK/run"
 for arm in RELOADED CONTROL; do
 	read -r v flags_ext < <(meta_dat_version "${!arm}")
-	[[ "$v" == 6 ]] || die "$arm recording: meta.dat v$v, expected 6"
+	[[ "$v" == 7 ]] || die "$arm recording: meta.dat v$v, expected 7"
 	(( flags_ext & 1 )) || die "$arm recording: meta.dat flags_ext $flags_ext does not declare source reloads (bit 0)"
 done
 
@@ -78,4 +78,4 @@ mkdir -p "$FIXTURES/gdh7_reloaded" "$FIXTURES/gdh7_control"
 cp "$RELOADED" "$FIXTURES/gdh7_reloaded/gdscript_trace.ct"
 for n in 1 2 3; do cp "$PROGRAMS/probe_v$n.gd" "$FIXTURES/gdh7_reloaded/probe_v$n.gd"; done
 cp "$CONTROL" "$FIXTURES/gdh7_control/gdscript_trace.ct"
-log "installed gdh7_reloaded and gdh7_control (meta.dat v6, source reloads declared) into $FIXTURES"
+log "installed gdh7_reloaded and gdh7_control (meta.dat v7, source reloads declared) into $FIXTURES"
